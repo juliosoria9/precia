@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>Comprobación de seguridad - Desguaces Ejemplo</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script src="https://www.google.com/recaptcha/api.js" async defer></script>
+  <link rel="stylesheet" href="/static/css/antibot.css?v=3">
+</head>
+<body>
+  <div class="contenedor">
+    <img src="/static/img/logo.svg" alt="Desguaces Ejemplo" width=180>
+    <h1>Hemos detectado tr&aacute;fico inusual desde tu conexi&oacute;n</h1>
+    <p>Para seguir navegando, verifica que no eres un robot.
+    <form action="/__antibot/verificar" method="POST">
+      <input type="hidden" name="volver" value="/buscar?q=1K0698151">
+      <div class="g-recaptcha" data-sitekey="6LcEJEMPLOAAAAAAABBBBBBCCCCCCDDDDDD" data-callback="enviar"></div>
+      <noscript>Activa JavaScript para continuar.</noscript>
+    </form>
+  </div>
+</body>
+</html>
