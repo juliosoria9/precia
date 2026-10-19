@@ -87,3 +87,15 @@ Alimenta la memoria §3 («método de validación del código generado»).
 - **Qué pasó:** se crea este cuaderno para apuntar avances, fallos y aprendizajes de cara a la memoria final, además del vault.
 - **Causa / contexto:** petición de Julio: «haz un cuaderno de bitácora donde apuntes los avances, fallos, qué haces y eso, además del vault, para hacer después la memoria».
 - **Para la memoria:** §3 · S01
+
+### 2026-10-19 16:47 · ✅ Avance · Repositorio en GitHub
+- **Qué pasó:** el código se sube al repositorio **privado** https://github.com/juliosoria9/precia (commit inicial `5832b70`).
+- **Causa / contexto:** privado porque PrecIA es una herramienta de uso personal y no un servicio abierto (riesgo *Innoweb*, nota legal). Se puede abrir más adelante. El vault de Obsidian queda fuera del repo, en local.
+- **Qué se hizo:** antes de subir, búsqueda de secretos en los ficheros preparados para el commit (sin coincidencias).
+- **Para la memoria:** §3 (control de versiones) · S01
+
+### 2026-10-19 16:48 · 📏 Medida · Primera CI en GitHub Actions en verde
+- **Qué pasó:** ruff, mypy estricto y pytest pasan en GitHub Actions en 16 s. Es la primera validación fuera del portátil.
+- **Qué se hizo:** GitHub avisó de que `actions/checkout@v4` y `setup-python@v5` usan Node 20, que está obsoleto; se suben a `v5` y `v6`.
+- **Lección:** la CI detecta problemas del entorno (versiones obsoletas) que en local no se ven.
+- **Para la memoria:** §3 (validación), §7 · S01

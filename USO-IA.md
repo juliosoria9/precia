@@ -18,6 +18,7 @@ El enunciado exige documentar en cada entrega todo uso de IA. Este fichero se ge
 | 2026-10-19 | Montar el vault de Obsidian del proyecto | Claude Code | 14 notas base a partir de la memoria, plantilla de sesión y configuración | Pendiente de revisión |
 | 2026-10-19 | `CLAUDE.md` con protocolo de diario de sesión | Claude Code | Fichero completo | Pendiente de revisión |
 | 2026-10-19 | Esqueleto del repositorio | Claude Code | `pyproject.toml`, paquetes de la memoria §6, test de humo, CI, este fichero | Pendiente de revisión |
+| 2026-10-19 | Commit inicial, repositorio privado en GitHub y CI | Claude Code | Commit, `gh repo create`, actualización de las acciones de la CI (Node 20 obsoleto) | Repositorio y push aceptados por Julio; cambio de la CI pendiente de revisión |
 | 2026-10-19 | Revisión adversarial del montaje | Claude Code (workflow, 3 subagentes de solo lectura) | 16 hallazgos (fidelidad a la memoria, protocolo del diario, esqueleto) | Aceptados y corregidos por Claude; pendiente de revisión |
 
 ### Prompts relevantes
