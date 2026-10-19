@@ -1,0 +1,24 @@
+# Entorno
+.venv/
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Herramientas
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Datos locales de la herramienta (base de datos, caché de páginas).
+# Anclados a la raíz para no ignorar subpaquetes de src/ ni fixtures de tests/.
+/*.sqlite3
+/*.db
+/datos/
+/cache/
