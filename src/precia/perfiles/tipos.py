@@ -43,3 +43,15 @@ class InformeValidacion:
     campos_encontrados: dict[str, int] = field(default_factory=dict)
     """Campo → en cuántas fichas se encontró."""
     problemas: tuple[str, ...] = ()
+
+
+class ErrorPerfil(Exception):
+    """Base de los errores del paquete. El mensaje se puede enseñar al usuario."""
+
+
+class ConfiguracionFallida(ErrorPerfil):
+    """El configurador no ha conseguido un perfil que valide en la tienda."""
+
+
+class ReparacionFallida(ErrorPerfil):
+    """El perfil propuesto por el reparador no valida: se conserva el anterior."""
