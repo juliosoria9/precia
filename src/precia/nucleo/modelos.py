@@ -210,6 +210,9 @@ class Ajustes:
     presupuesto_mensual_usd: Decimal = Decimal("10")
     tope_llamadas_busqueda: int = 20
     google_activado: bool = False
+    # ADR-017 (decisión de Julio): el robots.txt se ignora por defecto. Nunca afecta a los
+    # CAPTCHA ni a los anti-bot, que siempre paran la tienda.
+    respetar_robots: bool = False
     retardo_dominio_s: float = 2.0
     user_agent: str = "PrecIA/0.1 (proyecto universitario; uso personal)"
 

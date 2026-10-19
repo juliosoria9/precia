@@ -138,6 +138,7 @@ def crear_app(
             "ruta": request.url.path,
             "es_htmx": _es_htmx(request),
             "google_activado": datos.ajustes().google_activado,
+            "respetar_robots": datos.ajustes().respetar_robots,
         }
         return plantillas.TemplateResponse(
             request, plantilla, {**base, **contexto}, status_code=estado
@@ -361,6 +362,11 @@ def _ajustes_desde_formulario(formulario: Parametros, actuales: Ajustes) -> Ajus
             primero(formulario, "google_activado") == "on"
             if "enviado" in formulario
             else actuales.google_activado
+        ),
+        respetar_robots=(
+            primero(formulario, "respetar_robots") == "on"
+            if "enviado" in formulario
+            else actuales.respetar_robots
         ),
         retardo_dominio_s=float(
             entero(

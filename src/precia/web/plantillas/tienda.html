@@ -42,7 +42,7 @@
 <section>
   <h2>Versiones del perfil</h2>
   {% if not tienda.versiones %}
-  <p class="tarjeta tenue">Esta tienda no tiene perfil{% if not tienda.robots_permite %} porque su robots.txt prohíbe la búsqueda: PrecIA no la visita{% endif %}.</p>
+  <p class="tarjeta tenue">Esta tienda no tiene perfil{% if not tienda.robots_permite and respetar_robots %} porque su robots.txt prohíbe la búsqueda: PrecIA no la visita{% endif %}.</p>
   {% endif %}
   <ol class="linea-tiempo">
     {% for v in tienda.versiones | reverse %}

@@ -123,7 +123,7 @@ class FuenteReal:
         config.ruta_bd.parent.mkdir(parents=True, exist_ok=True)
         self._almacen = Almacen(config.ruta_bd, reloj=reloj)
         self._navegador: Navegador | None = None
-        self._clave_navegador: tuple[str, float] | None = None
+        self._clave_navegador: tuple[str, float, bool] | None = None
         self._usos: dict[Navegador, int] = {}
         """Búsquedas en vuelo por navegador (el actual y los sustituidos que aún se usan)."""
         self._candado = asyncio.Lock()
@@ -173,7 +173,7 @@ class FuenteReal:
         búsqueda en vuelo: cerrarlo le cortaría Chromium a media descarga y, peor, su
         descargador volvería a arrancar otro Chromium que ya no cerraría nadie.
         """
-        clave = (ajustes.user_agent, ajustes.retardo_dominio_s)
+        clave = (ajustes.user_agent, ajustes.retardo_dominio_s, ajustes.respetar_robots)
         async with self._candado:
             if self._navegador is not None and self._clave_navegador != clave:
                 viejo, self._navegador = self._navegador, None
@@ -188,6 +188,7 @@ class FuenteReal:
                     limitador=LimitadorDominio(ajustes.retardo_dominio_s),
                     cache=CachePaginas(self._config.ruta_cache, TTL_CACHE_S),
                     validador=self._validador,
+                    respetar_robots=ajustes.respetar_robots,
                 )
                 self._clave_navegador = clave
             navegador = self._navegador

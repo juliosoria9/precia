@@ -61,7 +61,7 @@
           {% for t in tiendas %}
           <label class="chip{% if not t.robots_permite %} chip-aviso{% endif %}">
             <input type="checkbox" name="tiendas" value="{{ t.dominio }}"{% if c and t.dominio in c.tiendas %} checked{% endif %}>
-            <span>{{ t.nombre }}{% if not t.robots_permite %} · robots.txt lo prohíbe{% endif %}</span>
+            <span>{{ t.nombre }}{% if not t.robots_permite %} · robots.txt lo prohíbe{% if not respetar_robots %} · se ignora{% endif %}{% endif %}</span>
           </label>
           {% endfor %}
         </div>

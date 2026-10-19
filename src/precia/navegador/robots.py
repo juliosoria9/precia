@@ -9,6 +9,9 @@ las tiendas como `Disallow: /*?order=` no se respetarían.
 - Gana la regla más larga que coincide; a igual longitud, `Allow`.
 - Un 4xx significa que no hay robots.txt (se permite todo); un 5xx o un error de red, que no se
   puede saber (se prohíbe todo). Un 429 se trata como 5xx: la web pide que bajemos el ritmo.
+- Excepción al RFC: si la respuesta es un desafío anti-bot (p. ej. un 403 de Cloudflare, caso
+  real de oscaro.es), no es que no haya robots.txt, es un muro. Se prohíbe todo y se recuerda el
+  motivo para que el navegador lo trate como `Bloqueado` aunque se ignore el robots.txt (ADR-017).
 """
 
 import asyncio
@@ -20,6 +23,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from urllib.parse import quote, urlsplit
 
+from precia.navegador.bloqueo import detectar_bloqueo
 from precia.navegador.tipos import Descargador, ErrorNavegador
 
 MAXIMO_BYTES = 500 * 1024
@@ -131,6 +135,7 @@ class ServicioRobots:
         self._reloj = reloj
         self._cache: dict[str, _Entrada] = {}
         self._candados: dict[str, asyncio.Lock] = {}
+        self._bloqueos: dict[str, str] = {}
 
     async def permitido(self, url: str) -> bool:
         """`url` ya validada. Indica si nuestro User-Agent puede pedirla."""
@@ -138,6 +143,11 @@ class ServicioRobots:
         ruta = (partes.path or "/") + (f"?{partes.query}" if partes.query else "")
         reglas = await self._reglas(f"{partes.scheme}://{partes.netloc}")
         return reglas.permite(ruta)
+
+    def bloqueo(self, url: str) -> str | None:
+        """Motivo si el robots.txt de ese origen respondió con un desafío anti-bot."""
+        partes = urlsplit(url)
+        return self._bloqueos.get(f"{partes.scheme}://{partes.netloc}")
 
     def retardo(self, dominio: str) -> float | None:
         """Crawl-delay de los robots.txt ya leídos para ese host (sin esquema ni puerto)."""
@@ -163,6 +173,11 @@ class ServicioRobots:
             pagina = await self._descargador.descargar(f"{origen}/robots.txt")
         except ErrorNavegador:
             return PROHIBIR_TODO, min(self._ttl, TTL_ERROR_S)
+        motivo = detectar_bloqueo(pagina)
+        if motivo is not None:
+            self._bloqueos[origen] = motivo
+            return PROHIBIR_TODO, min(self._ttl, TTL_ERROR_S)
+        self._bloqueos.pop(origen, None)
         if 200 <= pagina.estado < 300:
             return analizar_robots(pagina.html, self._token), self._ttl
         if 400 <= pagina.estado < 500 and pagina.estado != 429:

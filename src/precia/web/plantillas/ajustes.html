@@ -54,6 +54,11 @@
       </label>
     </div>
     <label class="interruptor">
+      <input type="checkbox" name="respetar_robots" value="on"{% if a.respetar_robots %} checked{% endif %}>
+      <span>Respetar el robots.txt de las tiendas</span>
+      <small>Desactivado por decisión del usuario (ADR-017): se visita aunque el robots.txt lo prohíba y el progreso de cada búsqueda lo indica. Su Crawl-delay se respeta siempre, y un CAPTCHA o anti-bot para la tienda en cualquier caso.</small>
+    </label>
+    <label class="interruptor">
       <input type="checkbox" name="google_activado" value="on"{% if a.google_activado %} checked{% endif %}>
       <span>Activar el módulo propio de Google</span>
       <small>Las condiciones de servicio de Google prohíben el acceso automatizado a sus resultados (ADR-006). Si se activa, se detiene ante cualquier CAPTCHA y no intenta evadir protecciones.</small>

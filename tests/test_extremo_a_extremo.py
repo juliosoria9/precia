@@ -79,7 +79,10 @@ class TransporteTienda:
             if self.robots is None:
                 return RespuestaCruda(404, {"content-type": "text/plain"}, io.BytesIO(b""))
             cuerpo = self.robots.encode()
-            return RespuestaCruda(200, {"content-type": "text/plain"}, io.BytesIO(cuerpo))
+            estado = self.estados.get(url, 200)
+            # Un desafío anti-bot (Cloudflare) llega como HTML con un 403, no como texto.
+            tipo_robots = "text/plain" if estado < 400 else "text/html; charset=utf-8"
+            return RespuestaCruda(estado, {"content-type": tipo_robots}, io.BytesIO(cuerpo))
         html = self.paginas.get(url)
         if html is None:
             html, estado = "<html><body><h1>No encontrada</h1></body></html>", 404
@@ -263,9 +266,10 @@ def test_perfil_roto_en_clasico_no_llama_a_la_ia(montar: Any) -> None:
     assert tienda is not None and tienda.estado is EstadoPerfil.ROTO
 
 
-def test_robots_que_prohibe_la_busqueda_omite_la_tienda(montar: Any) -> None:
+def test_robots_que_prohibe_la_busqueda_omite_la_tienda_si_se_respeta(montar: Any) -> None:
     transporte = TransporteTienda(paginas_sitio(), robots="User-agent: *\nDisallow: /buscar\n")
     m = montar(transporte)
+    m.fuente.guardar_ajustes(replace(m.fuente.ajustes(), respetar_robots=True))
     m.alta()
     m.fuente.almacen.guardar_perfil(perfil())
     html = m.buscar().texto
@@ -273,6 +277,32 @@ def test_robots_que_prohibe_la_busqueda_omite_la_tienda(montar: Any) -> None:
     assert BUSQUEDA not in transporte.pedidas and transporte.fichas == []
     tienda = m.fuente.tienda(DOMINIO)
     assert tienda is not None and not tienda.robots_permite
+
+
+def test_por_defecto_se_ignora_el_robots_y_se_avisa(montar: Any) -> None:
+    # ADR-017: decisión de Julio. Se busca igual, pero el progreso lo enseña.
+    transporte = TransporteTienda(paginas_sitio(), robots="User-agent: *\nDisallow: /buscar\n")
+    m = montar(transporte)
+    assert not m.fuente.ajustes().respetar_robots
+    m.alta()
+    m.fuente.almacen.guardar_perfil(perfil())
+    html = m.buscar().texto
+    assert "se ignora por decisión del usuario (ADR-017)" in html
+    assert BUSQUEDA in transporte.pedidas and transporte.fichas
+    assert "/productos/" in html
+
+
+def test_un_robots_con_desafio_anti_bot_bloquea_aunque_se_ignore(montar: Any) -> None:
+    # Caso real (oscaro.es): el propio robots.txt devuelve el desafío de Cloudflare con un 403.
+    transporte = TransporteTienda(
+        paginas_sitio(), robots=CAPTCHA, estados={f"{TIENDA}/robots.txt": 403}
+    )
+    m = montar(transporte)
+    m.alta()
+    m.fuente.almacen.guardar_perfil(perfil())
+    html = m.buscar().texto
+    assert "Bloqueo (CAPTCHA o anti-bot): no se evade" in html
+    assert BUSQUEDA not in transporte.pedidas and transporte.fichas == []
 
 
 def test_bloqueo_se_para_y_no_se_evade(montar: Any) -> None:

@@ -32,6 +32,8 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Protocol
+from urllib.parse import urlsplit
 
 from precia.almacen.sqlite import Almacen, ErrorAlmacen
 from precia.emparejado.agrupador import agrupar
@@ -65,7 +67,7 @@ from precia.nucleo.modelos import (
     Tienda,
 )
 from precia.perfiles.configurador import configurar, parece_listado
-from precia.perfiles.protocolos import Navegador
+from precia.perfiles.protocolos import Navegador as NavegadorDePerfiles
 from precia.perfiles.reparador import reparar
 from precia.perfiles.tipos import ConfiguracionFallida, Perfil, ReparacionFallida
 from precia.perfiles.validador import de_la_tienda, url_de_busqueda
@@ -79,6 +81,7 @@ BLOQUEO = "Bloqueo (CAPTCHA o anti-bot): no se evade"
 SIN_IA = "IA no disponible"
 MAX_DETALLE = 300
 PERMITE = "Permite la búsqueda"
+IGNORADO = "Lo prohíbe; se ignora por decisión del usuario (ADR-017)"
 INESPERADO = "Error inesperado: la tienda se salta en esta búsqueda (detalle en el registro)"
 
 registro = logging.getLogger(__name__)
@@ -106,7 +109,7 @@ class _NavegadorVigilado:
     que lo prohíbe todo saldría como «no se encuentra la búsqueda» en vez de como omitida.
     """
 
-    def __init__(self, navegador: Navegador) -> None:
+    def __init__(self, navegador: NavegadorDePerfiles) -> None:
         self._navegador = navegador
         self.intentos = 0
         self.prohibidas = 0
@@ -142,6 +145,12 @@ class _ExtractorVigilado:
         except ErrorIA as error:
             self.error = error
             raise
+
+
+class Navegador(NavegadorDePerfiles, Protocol):
+    """Lo que necesita el orquestador del navegador: lo de `perfiles` y si se ignoró robots."""
+
+    def robots_ignorado(self, dominio: str) -> bool: ...
 
 
 @dataclass
@@ -489,8 +498,13 @@ class _EnTienda:
             return None
         if not nuevo:
             self._paso_perfil(perfil)
-        self.robots = (PERMITE, True)
-        self.pasos.insert(0, Paso("robots.txt", EstadoPaso.OK, PERMITE))
+        if self.o._navegador.robots_ignorado(urlsplit(url).hostname or self.dominio):
+            # ADR-017: el usuario decidió ignorar el robots.txt; se visita, pero se enseña.
+            self.robots = (IGNORADO, False)
+            self.pasos.insert(0, Paso("robots.txt", EstadoPaso.AVISO, IGNORADO))
+        else:
+            self.robots = (PERMITE, True)
+            self.pasos.insert(0, Paso("robots.txt", EstadoPaso.OK, PERMITE))
         if not 200 <= pagina.estado < 300:
             self.paso(
                 "búsqueda", EstadoPaso.ERROR, f"La tienda responde con el estado {pagina.estado}"

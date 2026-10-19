@@ -223,3 +223,21 @@ def test_evaluacion_no_promete_casos_que_no_se_guardan() -> None:
 class FuenteSinEvaluacion(FuenteDemo):
     def evaluacion(self) -> list[ResultadoEvaluacion]:
         return []
+
+
+# --- ADR-017: respetar o ignorar el robots.txt ------------------------------------------------
+
+
+def test_ajustes_guardan_si_se_respeta_el_robots(cliente: ClienteASGI) -> None:
+    origen = {"Origin": "http://127.0.0.1:8000"}
+    assert 'name="respetar_robots"' in cliente.get("/ajustes").texto
+    cliente.post("/ajustes", {"enviado": "1", "respetar_robots": "on"}, cabeceras=origen)
+    assert 'name="respetar_robots" value="on" checked' in cliente.get("/ajustes").texto
+    cliente.post("/ajustes", {"enviado": "1"}, cabeceras=origen)
+    assert 'name="respetar_robots" value="on" checked' not in cliente.get("/ajustes").texto
+
+
+def test_robots_ignorado_no_dice_que_la_tienda_no_se_visite(cliente: ClienteASGI) -> None:
+    # Por defecto (ADR-017) se ignora: la etiqueta «robots.txt lo prohíbe» informa, no excluye.
+    html = cliente.get("/").texto
+    assert "robots.txt lo prohíbe · se ignora" in html

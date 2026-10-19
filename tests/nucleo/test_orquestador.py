@@ -417,6 +417,19 @@ def test_robots_que_prohibe_la_busqueda_omite_la_tienda() -> None:
     assert r.grupos == ()
 
 
+def test_robots_ignorado_se_avisa_en_el_progreso() -> None:
+    # ADR-017: se visita aunque el robots.txt lo prohíba, pero el usuario lo ve en el progreso.
+    navegador = NavegadorFalso(paginas_sitio(), ignorados=frozenset({f"www.{DOMINIO}"}))
+    m = montar(nuevo_almacen(perfil()), navegador)
+    r = m.buscar(modo=Modo.CLASICO)
+    paso = progreso(r).pasos[0]
+    assert paso.nombre == "robots.txt" and paso.estado is EstadoPaso.AVISO
+    assert "ignora" in paso.detalle and "ADR-017" in paso.detalle
+    assert ofertas(r)
+    tienda = m.almacen.tienda(DOMINIO)
+    assert tienda is not None and not tienda.robots_permite
+
+
 class NavegadorProhibido:
     """Todo lo prohíbe el robots.txt: el configurador no llega a ninguna página."""
 

@@ -236,6 +236,11 @@ class NavegadorFalso:
     errores: Mapping[str, Exception] = field(default_factory=dict)
     redirecciones: Mapping[str, str] = field(default_factory=dict)
     pedidas: list[tuple[str, bool]] = field(default_factory=list)
+    ignorados: frozenset[str] = frozenset()
+    """Dominios cuyo robots.txt prohibía lo visitado, pero se ha ignorado (ADR-017)."""
+
+    def robots_ignorado(self, dominio: str) -> bool:
+        return dominio in self.ignorados
 
     async def obtener(self, url: str, *, js: bool = False) -> Pagina:
         url = await validar_con_dns_publico(url)
