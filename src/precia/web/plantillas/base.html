@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="referrer" content="no-referrer">
+  {#- HTMX endurecido: sin eval, sin ejecutar <script> de las respuestas, sin estilos en línea
+      (la CSP los bloquearía) y solo peticiones al mismo origen. -#}
+  <meta name="htmx-config" content='{"allowEval":false,"allowScriptTags":false,"includeIndicatorStyles":false,"selfRequestsOnly":true,"historyCacheSize":0,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"422","swap":true},{"code":"404","swap":true},{"code":"[45]..","swap":false,"error":true}]}'>
+  <title>{% block titulo %}PrecIA{% endblock %} · PrecIA</title>
+  <link rel="stylesheet" href="/estaticos/estilos.css">
+  <link rel="icon" href="/estaticos/icono.svg" type="image/svg+xml">
+  <script src="/estaticos/htmx.min.js" defer></script>
+</head>
+<body>
+  <a class="saltar" href="#contenido">Saltar al contenido</a>
+  <div class="marco">
+    <header class="lateral">
+      <a class="marca" href="/">
+        <img src="/estaticos/icono.svg" alt="" width="28" height="28">
+        <span>Prec<b>IA</b></span>
+      </a>
+      <nav aria-label="Principal">
+        <ul>
+          {% for href, nombre in NAVEGACION %}
+          {% set activo = (href == "/" and ruta in ("/", "/buscar")) or (href != "/" and ruta.startswith(href)) %}
+          <li><a href="{{ href }}"{% if activo %} aria-current="page"{% endif %}>{{ nombre }}</a></li>
+          {% endfor %}
+        </ul>
+      </nav>
+      <p class="lateral-pie">v{{ VERSION }} · solo en local</p>
+    </header>
+
+    <main id="contenido">
+      {% if es_demo %}
+      <p class="aviso-demo" role="note">
+        <span class="insignia insignia-demo">DEMO</span>
+        Datos de ejemplo: tiendas <code>.example</code> y precios inventados. Los datos reales llegan con los hitos H1-H6.
+      </p>
+      {% endif %}
+      {% block contenido %}{% endblock %}
+    </main>
+  </div>
+</body>
+</html>

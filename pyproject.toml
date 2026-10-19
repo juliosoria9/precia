@@ -10,7 +10,11 @@ readme = "README.md"
 requires-python = ">=3.13"
 # Dependencias de ejecución: se añaden en el hito que las usa y solo si están
 # aprobadas en el vault (nota «06 - Tecnologías y Dependencias»).
-dependencies = []
+dependencies = [
+    "fastapi>=0.148",
+    "uvicorn>=0.54",
+    "jinja2>=3.1",
+]
 
 [project.optional-dependencies]
 dev = [
@@ -23,7 +27,7 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-precia = ["py.typed"]
+precia = ["py.typed", "web/plantillas/*.html", "web/estaticos/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

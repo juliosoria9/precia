@@ -15,6 +15,7 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
 
+python -m precia.web                  # interfaz web en http://127.0.0.1:8000 (datos de ejemplo)
 pytest                                # tests
 ruff check . ; ruff format --check .  # lint y formato
 mypy                                  # tipos

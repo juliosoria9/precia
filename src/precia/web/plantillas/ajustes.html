@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block titulo %}Ajustes{% endblock %}
+{% block contenido %}
+{% set a = ajustes %}
+<section class="cabecera">
+  <h1>Ajustes</h1>
+  <p class="sub">Proveedor de IA, límites de gasto y normas de cortesía al visitar las tiendas.</p>
+</section>
+
+{% if guardado %}<p class="mensaje mensaje-ok" role="status">Ajustes guardados.</p>{% endif %}
+{% if error %}<p class="mensaje mensaje-error" role="alert">{{ error }}</p>{% endif %}
+
+<form class="formulario" method="post" action="/ajustes">
+  <input type="hidden" name="enviado" value="1">
+  <section class="tarjeta">
+    <h2>Proveedor de IA</h2>
+    <div class="opciones-tarjeta">
+      <label class="opcion">
+        <input type="radio" name="proveedor" value="api"{% if a.proveedor == "api" %} checked{% endif %}>
+        <span><strong>API externa (Claude)</strong><small>Rápido y sin GPU. Envía a Anthropic el texto de páginas públicas, nunca datos personales.</small></span>
+      </label>
+      <label class="opcion">
+        <input type="radio" name="proveedor" value="ollama"{% if a.proveedor == "ollama" %} checked{% endif %}>
+        <span><strong>Modelo local (Ollama)</strong><small>Coste 0 y nada sale del portátil. Necesita la GPU (RTX 4070, 8 GB).</small></span>
+      </label>
+    </div>
+    <div class="campo-fila">
+      <label>Modelo de la API <input name="modelo_api" value="{{ a.modelo_api }}" maxlength="80" required></label>
+      <label>Modelo local <input name="modelo_local" value="{{ a.modelo_local }}" maxlength="80" required></label>
+    </div>
+    <p class="tenue">La clave de la API se lee de la variable de entorno <code>ANTHROPIC_API_KEY</code>: nunca se guarda aquí.</p>
+  </section>
+
+  <section class="tarjeta">
+    <h2>Límites de gasto</h2>
+    <div class="campo-fila">
+      <label>Presupuesto mensual
+        <span class="con-sufijo"><input name="presupuesto_mensual_usd" value="{{ a.presupuesto_mensual_usd }}" inputmode="decimal" required maxlength="10"><span>$</span></span>
+      </label>
+      <label>Tope de llamadas por búsqueda
+        <input name="tope_llamadas_busqueda" type="number" min="1" max="100" value="{{ a.tope_llamadas_busqueda }}" required>
+      </label>
+    </div>
+  </section>
+
+  <section class="tarjeta">
+    <h2>Cortesía con las tiendas</h2>
+    <div class="campo-fila">
+      <label>Espera mínima entre peticiones al mismo dominio
+        <span class="con-sufijo"><input name="retardo_dominio_s" type="number" min="1" max="60" value="{{ a.retardo_dominio_s | int }}" required><span>s</span></span>
+      </label>
+      <label class="crece">User-Agent (honesto e identificable)
+        <input name="user_agent" value="{{ a.user_agent }}" maxlength="200" required>
+      </label>
+    </div>
+    <label class="interruptor">
+      <input type="checkbox" name="google_activado" value="on"{% if a.google_activado %} checked{% endif %}>
+      <span>Activar el módulo propio de Google</span>
+      <small>Las condiciones de servicio de Google prohíben el acceso automatizado a sus resultados (ADR-006). Si se activa, se detiene ante cualquier CAPTCHA y no intenta evadir protecciones.</small>
+    </label>
+  </section>
+
+  <div class="acciones">
+    <button class="boton boton-primario" type="submit">Guardar ajustes</button>
+  </div>
+</form>
+{% endblock %}

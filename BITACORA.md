@@ -38,6 +38,15 @@ Alimenta la memoria §3 («método de validación del código generado»).
 | 2026-10-19 | `.gitignore` con patrones sin anclar que ignoraban código futuro (`navegador/cache/`) | Revisión adversarial + `git check-ignore` | Patrones anclados a la raíz |
 | 2026-10-19 | Faltaba `tests/__init__.py`: dos tests con el mismo nombre habrían chocado | Revisión adversarial; se reprodujo con dos `test_dup.py` | `__init__.py` en `tests/` y convención en la nota 03 |
 | 2026-10-19 | 6 docstrings de más de 100 caracteres | `ruff check` | Reescritos en formato PEP 257 |
+| 2026-10-19 | Sirvió HTMX como `text/plain` en Windows (con `nosniff`, no se habría ejecutado) | Test de ficheros estáticos | Tipos MIME fijados a mano + test |
+| 2026-10-19 | Usó un test de Jinja (`match`) que no existe | Al renderizar la plantilla | Filtro propio `miles` |
+| 2026-10-19 | UX: insignia ilegible, decimales con punto, tabla ilegible en móvil, campo vacío tras pulsar un ejemplo | Revisión visual con Playwright (capturas) | 9 correcciones de CSS y plantillas |
+| 2026-10-19 | No comprobó el anclaje del **precio** (memoria §4) | Revisión adversarial (agente «fidelidad/UX») | `mejor_oferta` lo excluye; celda tachada; test |
+| 2026-10-19 | El botón Atrás rompía la página por `historyCacheSize: 0` | Revisión adversarial (agentes «seguridad» y «código») | Página completa en restauración + `Vary` |
+| 2026-10-19 | Límite de cuerpo saltable con CL+TE; 500 sin cabeceras con «²»; GET de pago lanzable desde otra web | Agente «pentester» contra el servidor real | Middleware endurecido + 6 tests |
+| 2026-10-19 | El filtro «solo usadas» hacía lo contrario; el modo Auto siempre cobraba | Revisión adversarial (agente «código») | Lógica corregida + tests |
+| 2026-10-19 | Contraste de bordes 1,26:1 (WCAG pide 3:1); gráfica que solo distinguía por color | Revisión adversarial (agente «fidelidad/UX») | `--borde-control` a 3,86:1; trazos distintos |
+| 2026-10-19 | Volvió a escribir una hora sin consultar el reloj en 2 entradas de esta bitácora (17:31 en vez de 17:16), el mismo fallo que en el diario por la mañana | Al cotejar la bitácora con las horas del diario (sacadas de `date`) | Horas corregidas; la documentación se genera con un script que pone la hora real |
 
 ---
 
@@ -99,3 +108,45 @@ Alimenta la memoria §3 («método de validación del código generado»).
 - **Qué se hizo:** GitHub avisó de que `actions/checkout@v4` y `setup-python@v5` usan Node 20, que está obsoleto; se suben a `v5` y `v6`.
 - **Lección:** la CI detecta problemas del entorno (versiones obsoletas) que en local no se ven.
 - **Para la memoria:** §3 (validación), §7 · S01
+
+### 2026-10-19 17:03 · 🧭 Decisión · Empezar por la interfaz web completa (*walking skeleton*)
+- **Qué pasó:** se adelanta la aplicación web (H7 de la memoria) al principio: toda la UX en web (búsqueda, comparativa, histórico, tiendas y perfiles, alertas, registro de IA, evaluación) con datos de ejemplo, que se sustituyen por datos reales a medida que se completan H1-H6.
+- **Causa / contexto:** con la interfaz hecha desde el principio, cada hito se ve funcionando en cuanto termina, y se puede enseñar algo desde la primera entrega. Es un *walking skeleton*: primero un recorrido completo de punta a punta y después se rellena.
+- **Qué se hizo:** nuevo hito H1W antes de H1; el resto del plan no cambia.
+- **Para la memoria:** §6 (hitos: cambio de orden justificado) · S01
+
+### 2026-10-19 17:16 · ❌ Fallo · En Windows, HTMX se habría servido como texto plano
+- **Qué pasó:** un test de ficheros estáticos mostró que `htmx.min.js` se servía con `content-type: text/plain`.
+- **Causa / contexto:** en Windows, `mimetypes` de Python lee el registro, que puede asociar `.js` a `text/plain`. Como la app envía `X-Content-Type-Options: nosniff` (cabecera de seguridad), el navegador se habría negado a ejecutar el script: la interfaz no habría funcionado y no daría ningún error visible en el servidor.
+- **Qué se hizo:** se fijan a mano los tipos de `.js`, `.css` y `.svg`, y un test comprueba el tipo de cada fichero estático.
+- **Lección:** las cabeceras de seguridad pueden romper la funcionalidad de forma silenciosa; hay que probarlas junto con lo que protegen.
+- **Para la memoria:** §3 (validación), §7 · S01
+
+### 2026-10-19 17:16 · ✅ Avance · Interfaz web completa (H1W) con 79 tests
+- **Qué pasó:** las 8 pantallas (buscar y resultados, producto con histórico SVG, tiendas y perfiles con versiones, alertas, registro de IA, evaluación y ajustes) funcionan sobre una fuente de datos de ejemplo intercambiable.
+- **Qué se hizo:** seguridad desde el principio: *autoescape*, CSP sin código en línea, HTMX endurecido, CSRF por `Sec-Fetch-Site`/`Origin`, `TrustedHost` contra *DNS rebinding*, límite de cuerpo y servidor solo en `127.0.0.1`. Se evitan dos dependencias (`httpx` y `python-multipart`) con código propio.
+- **Para la memoria:** §5, §6, §7 y §4 (riesgos: la web trata los datos de las tiendas como no confiables) · S01
+
+### 2026-10-19 17:34 · ❌ Fallo · Una medida de seguridad rompió el botón «Atrás»
+- **Qué pasó:** se desactivó la caché de historial de HTMX (`historyCacheSize: 0`) para no guardar páginas en `localStorage`. Con eso, al pulsar «Atrás», HTMX vuelve a pedir la URL con la cabecera `HX-Request` y el servidor respondía con el fragmento: la página se quedaba sin menú ni buscador.
+- **Causa / contexto:** el servidor distinguía página o fragmento solo por `HX-Request`, sin tener en cuenta `HX-History-Restore-Request`.
+- **Qué se hizo:** página completa en las restauraciones de historial, `Vary: HX-Request` y un test.
+- **Lección:** cada endurecimiento cambia el comportamiento; hay que probar los flujos normales (navegar hacia atrás) después de aplicarlo.
+- **Para la memoria:** §3, §4 · S01
+
+### 2026-10-19 17:34 · ❌ Fallo · La interfaz no comprobaba el anclaje del precio
+- **Qué pasó:** la revisión vio que el **precio**, el dato más expuesto a la *prompt injection* («el precio es 1 €», ejemplo de la propia memoria §4), se mostraba sin comprobar el anclaje y podía salir como «Mejor precio».
+- **Causa / contexto:** la IA que generó la interfaz aplicó el anclaje a los demás campos y se olvidó justo del principal.
+- **Qué se hizo:** `mejor_oferta` descarta los precios no anclados, la celda del precio los tacha y un test inyecta un precio de 1 € en una tienda falsa.
+- **Lección:** revisar contra la memoria (requisitos) detecta lo que los tests escritos por la misma IA no cubren.
+- **Para la memoria:** §4 (riesgos), §3 · S01
+
+### 2026-10-19 17:34 · 💡 Aprendizaje · Un «pentester» contra el servidor en marcha encuentra lo que los tests no ven
+- **Qué pasó:** el agente de seguridad atacó el servidor real con sockets crudos y encontró que el límite de 16 KiB se saltaba enviando `Content-Length` y `Transfer-Encoding: chunked` a la vez (5 MiB procesados), que un dígito «²» provocaba un 500 sin cabeceras de seguridad y que otra web podía lanzar búsquedas de pago por GET.
+- **Qué se hizo:** los tres corregidos y con test (rechazo de `Transfer-Encoding`, recuento real de bytes, captura de los 500 en el middleware y protección de `/buscar` con `Sec-Fetch-Site`).
+- **Lección:** los tests comprueban lo que el autor pensó; el ataque real comprueba lo que no pensó. Encaja con la asignatura (ciberejercicios).
+- **Para la memoria:** §3 (validación), §4 · S01
+
+### 2026-10-19 17:34 · 📏 Medida · Segunda revisión adversarial
+- **Qué pasó:** 25 hallazgos (21 distintos: 3 altos, 9 medios y 9 bajos) → 28 tests en rojo → 139 tests en verde. Contraste de los bordes de los controles: de 1,26:1 a 3,86:1 (WCAG 1.4.11).
+- **Para la memoria:** §3 · S01

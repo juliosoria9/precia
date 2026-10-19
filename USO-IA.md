@@ -19,11 +19,16 @@ El enunciado exige documentar en cada entrega todo uso de IA. Este fichero se ge
 | 2026-10-19 | `CLAUDE.md` con protocolo de diario de sesión | Claude Code | Fichero completo | Pendiente de revisión |
 | 2026-10-19 | Esqueleto del repositorio | Claude Code | `pyproject.toml`, paquetes de la memoria §6, test de humo, CI, este fichero | Pendiente de revisión |
 | 2026-10-19 | Commit inicial, repositorio privado en GitHub y CI | Claude Code | Commit, `gh repo create`, actualización de las acciones de la CI (Node 20 obsoleto) | Repositorio y push aceptados por Julio; cambio de la CI pendiente de revisión |
+| 2026-10-19 | Interfaz web completa H1W (8 pantallas) con datos de ejemplo | Claude Code | Modelos, fuente de ejemplo, app FastAPI, middleware de seguridad, plantillas, CSS, gráfica SVG, 139 tests | Pendiente de revisión |
+| 2026-10-19 | Revisión visual en el navegador | Claude Code + Playwright | Capturas en escritorio, móvil, claro y oscuro; 9 correcciones de UX | Aceptadas por Claude; pendiente de revisión |
+| 2026-10-19 | Revisión adversarial de H1W | Claude Code (workflow, 3 subagentes: pentester, código, fidelidad/UX) | 25 hallazgos (21 distintos) reproducidos con 28 tests en rojo y corregidos | Pendiente de revisión |
 | 2026-10-19 | Revisión adversarial del montaje | Claude Code (workflow, 3 subagentes de solo lectura) | 16 hallazgos (fidelidad a la memoria, protocolo del diario, esqueleto) | Aceptados y corregidos por Claude; pendiente de revisión |
 
 ### Prompts relevantes
 
 - «Hay que hacer el proyecto. Empieza conectando el vault y añade el CLAUDE.md que, conforme vaya haciendo cosas en la sesión, vaya escribiendo qué hace.»
+- «Ahora haz un cuaderno de bitácora donde apuntes los avances, fallos, qué haces y eso, además del vault, para hacer después la memoria.»
+- «Según el planning que hay que hacer, yo lo haría versión web, igual es más fácil de ver, se ve más bonito» + «hacer todo el proyecto web, al menos la UX, para que sea más simple y fácil de ver».
 
 ### Aceptado, modificado y descartado
 

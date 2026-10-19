@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block titulo %}{{ tienda.nombre }}{% endblock %}
+{% block contenido %}
+<nav class="migas" aria-label="Migas"><a href="/tiendas">Tiendas</a> › {{ tienda.nombre }}</nav>
+<section class="cabecera cabecera-fila">
+  <div>
+    <h1>{{ tienda.nombre }}</h1>
+    <p class="tenue">{{ tienda.dominio }}</p>
+  </div>
+  {% with estado = tienda.estado %}{% include "_estado_perfil.html" %}{% endwith %}
+</section>
+
+<section class="tarjeta">
+  <dl class="datos datos-fila">
+    <div><dt>robots.txt</dt><dd class="{{ '' if tienda.robots_permite else 'texto-error' }}">{{ tienda.robots }}</dd></div>
+    <div><dt>Última visita</dt><dd>{{ tienda.ultima_visita | fecha_hora if tienda.ultima_visita else "Nunca" }}</dd></div>
+    <div><dt>Bloqueos / CAPTCHA</dt><dd>{{ tienda.bloqueos }}</dd></div>
+  </dl>
+  {% if tienda.estado.value == "pendiente_revision" %}
+  <p class="mensaje mensaje-aviso">El 🤖 configurador ha generado este perfil y el sistema lo ha validado, pero <strong>falta tu revisión</strong> antes de fijarlo.</p>
+  {% elif tienda.estado.value == "roto" %}
+  <p class="mensaje mensaje-error">El perfil ha dejado de funcionar. En modo Auto o IA, el 🤖 reparador propone una versión nueva y, mientras tanto, se usa el extractor de respaldo.</p>
+  {% endif %}
+  <div class="acciones">
+    <button class="boton boton-primario" type="button" disabled title="Disponible en el hito H4">Revisar y fijar perfil</button>
+    <button class="boton boton-secundario" type="button" disabled title="Disponible en el hito H4">Volver a validar</button>
+  </div>
+</section>
+
+<section>
+  <h2>Versiones del perfil</h2>
+  {% if not tienda.versiones %}
+  <p class="tarjeta tenue">Esta tienda no tiene perfil{% if not tienda.robots_permite %} porque su robots.txt prohíbe la búsqueda: PrecIA no la visita{% endif %}.</p>
+  {% endif %}
+  <ol class="linea-tiempo">
+    {% for v in tienda.versiones | reverse %}
+    {% set anterior = tienda.versiones[v.numero - 2] if v.numero > 1 else None %}
+    <li class="tarjeta version">
+      <header>
+        <h3>v{{ v.numero }}{% if loop.first %} <span class="insignia insignia-tenue">actual</span>{% endif %}</h3>
+        <span class="tenue">{{ v.fecha | fecha_hora }} · {{ v.autor }}</span>
+        <span class="insignia {{ 'insignia-ok' if v.validado else 'insignia-error' }}">{{ "Validado" if v.validado else "Falla" }}</span>
+      </header>
+      {% if v.nota %}<p>{{ v.nota }}</p>{% endif %}
+      <p class="tenue">URL de búsqueda: <code>{{ v.url_busqueda }}</code></p>
+      <div class="tabla-contenedor">
+        <table class="tabla tabla-compacta">
+          <thead><tr><th scope="col">Campo</th><th scope="col">Selector CSS</th></tr></thead>
+          <tbody>
+            {% for campo, selector in v.selectores.items() %}
+            {% set cambiado = anterior and anterior.selectores.get(campo) != selector %}
+            <tr{% if cambiado %} class="fila-cambio"{% endif %}>
+              <td>{{ campo }}</td>
+              <td><code>{{ selector }}</code>{% if cambiado %} <span class="insignia insignia-ia">cambia</span> <del class="tenue"><code>{{ anterior.selectores.get(campo) }}</code></del>{% endif %}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </li>
+    {% endfor %}
+  </ol>
+</section>
+{% endblock %}

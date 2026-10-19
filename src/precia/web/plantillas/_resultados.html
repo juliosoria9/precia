@@ -1,0 +1,140 @@
+{%- macro origen(valor) -%}
+  {%- if valor.origen.value == "ia" -%}<span class="origen origen-ia" title="Extraído por el extractor de respaldo con IA">🤖 IA</span>
+  {%- elif valor.origen.value == "jsonld" -%}<span class="origen origen-jsonld" title="Datos estructurados schema.org/Product">JSON-LD</span>
+  {%- else -%}<span class="origen origen-perfil" title="Selectores del perfil de la tienda">Perfil</span>
+  {%- endif -%}
+{%- endmacro -%}
+
+{%- set iconos = {"ok": "✓", "ia": "🤖", "aviso": "!", "error": "✕", "omitido": "–"} -%}
+{%- set aviso_anclaje = "Descartado: el valor no aparece literalmente en la página (posible prompt injection)" -%}
+
+{% if error %}
+<div class="mensaje mensaje-error" role="alert">{{ error }}</div>
+{% elif resultado %}
+{% set r = resultado %}
+<div class="resumen tarjeta">
+  <div class="resumen-dato"><strong>{{ r.grupos | length }}</strong><span>productos</span></div>
+  <div class="resumen-dato"><strong>{{ r.grupos | map(attribute="ofertas") | map("length") | sum }}</strong><span>ofertas</span></div>
+  <div class="resumen-dato"><strong>{{ r.duracion_s | decimal }} s</strong><span>tiempo</span></div>
+  <div class="resumen-dato"><strong>{{ r.llamadas_ia }}</strong><span>llamadas a la IA</span></div>
+  <div class="resumen-dato"><strong>{{ r.coste_ia_usd | dolares }}</strong><span>coste de IA</span></div>
+  <div class="resumen-dato"><span class="insignia insignia-modo">Modo {{ {"clasico": "clásico", "auto": "auto", "ia": "IA"}[r.consulta.modo.value] }}</span></div>
+</div>
+
+<details class="progreso tarjeta">
+  <summary>Qué ha hecho en cada tienda <span class="ayuda-en-linea">({{ r.progreso | length }})</span></summary>
+  <ul class="progreso-lista">
+    {% for t in r.progreso %}
+    <li>
+      <span class="progreso-tienda">{{ t.tienda }}</span>
+      <ol class="pasos">
+        {% for p in t.pasos %}
+        <li class="paso paso-{{ p.estado.value }}" title="{{ p.detalle }}">
+          <span class="paso-icono" aria-hidden="true">{{ iconos[p.estado.value] }}</span>
+          <span class="paso-nombre">{{ p.nombre }}</span>
+          <span class="paso-detalle">{{ p.detalle }}</span>
+        </li>
+        {% endfor %}
+      </ol>
+    </li>
+    {% endfor %}
+  </ul>
+</details>
+
+{% if es_htmx %}
+{#- Anuncio corto para lectores de pantalla (la región viva está fuera de #resultados). -#}
+<p id="anuncio" hx-swap-oob="innerHTML">{{ r.grupos | length }} productos y {{ r.grupos | map(attribute="ofertas") | map("length") | sum }} ofertas para «{{ r.consulta.texto }}»</p>
+{% endif %}
+
+{% for t in r.progreso %}{% for p in t.pasos if p.nombre == "descubrir" %}
+<p class="mensaje mensaje-aviso">Google: {{ p.detalle }}. Solo se ha buscado en las tiendas elegidas.</p>
+{% endfor %}{% endfor %}
+
+{% if r.consulta.filtro and r.consulta.modo.value != "clasico" %}
+<p class="mensaje">🤖 Filtro aplicado: «{{ r.consulta.filtro }}»</p>
+{% elif r.consulta.filtro %}
+<p class="mensaje mensaje-aviso">El filtro en lenguaje natural necesita la IA: en modo clásico no se aplica.</p>
+{% endif %}
+
+{% if not r.grupos %}
+<div class="vacio tarjeta">
+  <h2>Sin resultados para «{{ r.consulta.texto }}»</h2>
+  <p>Prueba con una referencia OEM (por ejemplo <a href="/buscar?texto=1K0698151">1K0698151</a>), con menos palabras o con todas las tiendas.</p>
+</div>
+{% endif %}
+
+{% set columnas = CAMPOS | selectattr("clave", "in", r.consulta.campos) | rejectattr("clave", "equalto", "precio") | list %}
+{% for g in r.grupos %}
+{% set mejor = g.mejor_oferta %}
+<article class="grupo tarjeta">
+  <header class="grupo-cabecera">
+    <div>
+      <h2>{{ g.nombre }}</h2>
+      <p class="grupo-meta">
+        {% if g.referencia_oem %}<span class="insignia insignia-oem">OEM {{ g.referencia_oem }}</span>{% endif %}
+        <span class="criterio">Emparejado: {{ g.criterio }}</span>
+      </p>
+    </div>
+    {% if mejor %}
+    <div class="mejor">
+      <span class="mejor-etiqueta">Mejor precio</span>
+      <strong class="mejor-precio">{{ mejor.precio | euros }}</strong>
+      <span class="mejor-tienda">en {{ mejor.tienda }}</span>
+    </div>
+    {% endif %}
+  </header>
+  <div class="tabla-contenedor">
+    <table class="tabla tabla-apilable">
+      <thead>
+        <tr>
+          <th scope="col">Tienda</th>
+          <th scope="col">Producto</th>
+          {% if "precio" in r.consulta.campos %}<th scope="col" class="num">Precio</th>{% endif %}
+          {% for campo in columnas %}<th scope="col">{{ campo.etiqueta }}</th>{% endfor %}
+          <th scope="col">Origen</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for o in g.ofertas | sort(attribute="precio") %}
+        {#- Origen principal de la fila (el del precio); las celdas con otro origen lo indican. -#}
+        {% set principal = o.campos.get("precio") or (o.campos.values() | first if o.campos else none) %}
+        <tr{% if mejor and o == mejor %} class="fila-mejor"{% endif %}>
+          <td class="celda-tienda" data-etiqueta="Tienda">{{ o.tienda }}</td>
+          <td class="celda-producto" data-etiqueta="Producto"><a href="{{ o.url | url_segura }}" rel="noopener noreferrer nofollow" target="_blank">{{ o.titulo }}</a></td>
+          {% if "precio" in r.consulta.campos %}
+          <td class="num" data-etiqueta="Precio">
+            {% if o.precio_anclado %}<span class="precio">{{ o.precio | euros }}</span>
+            {% else %}<del class="no-anclado" title="{{ aviso_anclaje }}">{{ o.precio | euros }}</del> <span class="insignia insignia-error" title="{{ aviso_anclaje }}">no anclado</span>{% endif %}
+          </td>
+          {% endif %}
+          {% for campo in columnas %}
+          {% set v = o.campos.get(campo.clave) %}
+          <td data-etiqueta="{{ campo.etiqueta }}">
+            {% if v and v.anclado %}{{ v.valor }}{% if principal and v.origen != principal.origen %} {{ origen(v) }}{% endif %}
+            {% elif v %}<del class="no-anclado" title="{{ aviso_anclaje }}">{{ v.valor }}</del> <span class="insignia insignia-error" title="{{ aviso_anclaje }}">no anclado</span>
+            {% else %}<span class="tenue" title="{{ 'Solo se obtiene con la IA' if r.consulta.modo.value == 'clasico' else 'Sin dato' }}">—</span>{% endif %}
+          </td>
+          {% endfor %}
+          <td data-etiqueta="Origen">{% if principal %}{{ origen(principal) }}{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <footer class="grupo-pie">
+    <a class="boton boton-secundario" href="/productos/{{ g.id }}">Histórico y alertas →</a>
+  </footer>
+</article>
+{% endfor %}
+
+{% if r.descartados %}
+<details class="descartados tarjeta">
+  <summary>Descartados <span class="ayuda-en-linea">({{ r.descartados | length }})</span></summary>
+  <ul>
+    {% for d in r.descartados %}
+    <li><span class="tenue">{{ d.tienda }}</span> · {{ d.titulo }} → <em>{{ d.motivo }}</em></li>
+    {% endfor %}
+  </ul>
+</details>
+{% endif %}
+{% endif %}

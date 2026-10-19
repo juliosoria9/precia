@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block titulo %}Tiendas{% endblock %}
+{% block contenido %}
+<section class="cabecera">
+  <h1>Tiendas y perfiles</h1>
+  <p class="sub">Cada tienda tiene un <strong>perfil</strong>: la URL de búsqueda y los selectores CSS para leer sus fichas. Lo genera el 🤖 configurador una sola vez, el sistema lo valida y después se usa <strong>sin IA</strong>. Si la tienda cambia su HTML, el 🤖 reparador propone una versión nueva, que <strong>no se fija hasta que la revisas</strong>: «Reparado» quiere decir reparado por la IA y confirmado por ti.</p>
+</section>
+
+<div class="rejilla-tiendas">
+  {% for t in tiendas %}
+  {% set v = t.version_actual %}
+  <a class="tarjeta tarjeta-enlace tienda" href="/tiendas/{{ t.dominio }}">
+    <header>
+      <h2>{{ t.nombre }}</h2>
+      {% with estado = t.estado %}{% include "_estado_perfil.html" %}{% endwith %}
+    </header>
+    <p class="tenue">{{ t.dominio }}</p>
+    <dl class="datos">
+      <div><dt>robots.txt</dt><dd class="{{ '' if t.robots_permite else 'texto-error' }}">{{ t.robots }}</dd></div>
+      <div><dt>Perfil</dt><dd>{% if v %}v{{ v.numero }} · {{ v.autor }}{% else %}—{% endif %}</dd></div>
+      <div><dt>Última visita</dt><dd>{{ t.ultima_visita | fecha_hora if t.ultima_visita else "Nunca" }}</dd></div>
+      <div><dt>Bloqueos / CAPTCHA</dt><dd>{{ t.bloqueos }}</dd></div>
+    </dl>
+  </a>
+  {% endfor %}
+</div>
+
+<section class="tarjeta nota">
+  <h2>Añadir una tienda</h2>
+  <p>Al buscar en una tienda nueva, el 🤖 configurador lee una página de resultados y una ficha, propone los selectores y el sistema los <strong>valida ejecutándolos</strong>. El perfil queda <em>pendiente de revisión</em> hasta que lo confirmas.</p>
+  <p class="tenue">Disponible en el hito H4.</p>
+</section>
+{% endblock %}

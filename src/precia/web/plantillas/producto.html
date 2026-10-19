@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block titulo %}{{ grupo.nombre }}{% endblock %}
+{% block contenido %}
+{% set mejor = grupo.mejor_oferta %}
+<nav class="migas" aria-label="Migas"><a href="/">Buscar</a> › {{ grupo.nombre }}</nav>
+<section class="cabecera cabecera-fila">
+  <div>
+    <h1>{{ grupo.nombre }}</h1>
+    <p class="grupo-meta">
+      {% if grupo.referencia_oem %}<span class="insignia insignia-oem">OEM {{ grupo.referencia_oem }}</span>{% endif %}
+      <span class="criterio">Emparejado: {{ grupo.criterio }}</span>
+    </p>
+  </div>
+  {% if mejor %}
+  <div class="mejor">
+    <span class="mejor-etiqueta">Mejor precio hoy</span>
+    <strong class="mejor-precio">{{ mejor.precio | euros }}</strong>
+    <span class="mejor-tienda">en {{ mejor.tienda }}</span>
+  </div>
+  {% endif %}
+</section>
+
+<section class="tarjeta">
+  <h2>Histórico de precio <span class="ayuda-en-linea">(últimos 30 días)</span></h2>
+  <figure class="figura-grafica">
+    {{ grafica }}
+    <figcaption>
+      <ul class="leyenda">
+        {% for s in series %}
+        {#- La muestra repite color y trazo de la línea: el color no es la única pista (WCAG 1.4.1). -#}
+        <li><svg class="muestra" viewBox="0 0 28 8" aria-hidden="true"><line class="serie serie-{{ loop.index0 % 6 }}" x1="1" y1="4" x2="27" y2="4"/></svg>{{ s.tienda }}
+          {% if s.puntos %}<span class="tenue">· hoy {{ (s.puntos | sort(attribute="fecha") | last).precio | euros }}</span>
+          {% else %}<span class="tenue">· sin histórico</span>{% endif %}</li>
+        {% endfor %}
+      </ul>
+    </figcaption>
+  </figure>
+</section>
+
+<div class="rejilla-2">
+  <section class="tarjeta">
+    <h2>Ofertas actuales</h2>
+    <div class="tabla-contenedor">
+      <table class="tabla">
+        <thead><tr><th scope="col">Tienda</th><th scope="col">Marca</th><th scope="col">Estado</th><th scope="col" class="num">Precio</th></tr></thead>
+        <tbody>
+          {% for o in grupo.ofertas | sort(attribute="precio") %}
+          <tr{% if o == mejor %} class="fila-mejor"{% endif %}>
+            <td class="celda-tienda"><a href="/tiendas/{{ o.tienda }}">{{ o.tienda }}</a></td>
+            <td>{{ o.campos["marca"].valor }}</td>
+            <td>{{ o.campos["estado"].valor }}</td>
+            <td class="num precio">{{ o.precio | euros }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="tarjeta">
+    <h2>Avisarme si baja de…</h2>
+    <form class="formulario" method="post" action="/alertas"
+          hx-post="/alertas" hx-target="#lista-alertas">
+      <input type="hidden" name="producto_id" value="{{ grupo.id }}">
+      <div id="error-alerta">{% if error %}<div class="mensaje mensaje-error" role="alert">{{ error }}</div>{% endif %}</div>
+      <div class="campo-fila">
+        <label>Precio objetivo
+          <span class="con-sufijo"><input name="umbral" inputmode="decimal" required maxlength="12" placeholder="30,00"
+            pattern="[0-9]{1,3}(\.[0-9]{3})*([.,][0-9]{1,2})?" title="Un importe en euros, por ejemplo 30,50"><span>€</span></span>
+        </label>
+        <label>Aviso por
+          <select name="canal">
+            <option value="telegram">Telegram</option>
+            <option value="email">Email</option>
+          </select>
+        </label>
+        <button class="boton boton-primario" type="submit">Crear alerta</button>
+      </div>
+    </form>
+    <div id="lista-alertas">{% include "_lista_alertas.html" %}</div>
+  </section>
+</div>
+{% endblock %}
