@@ -50,7 +50,12 @@
 <p class="mensaje mensaje-aviso">Google: {{ p.detalle }}. Solo se ha buscado en las tiendas elegidas.</p>
 {% endfor %}{% endfor %}
 
-{% if r.consulta.filtro and r.consulta.modo.value != "clasico" %}
+{#- Sin IA (no hay clave o ha fallado) el filtro no se aplica, aunque el modo sea Auto o IA. -#}
+{% set filtro = namespace(sin_ia="") %}
+{% for t in r.progreso %}{% for p in t.pasos if p.nombre == "filtro" %}{% set filtro.sin_ia = p.detalle %}{% endfor %}{% endfor %}
+{% if r.consulta.filtro and filtro.sin_ia %}
+<p class="mensaje mensaje-aviso">{{ filtro.sin_ia }}: «{{ r.consulta.filtro }}».</p>
+{% elif r.consulta.filtro and r.consulta.modo.value != "clasico" %}
 <p class="mensaje">🤖 Filtro aplicado: «{{ r.consulta.filtro }}»</p>
 {% elif r.consulta.filtro %}
 <p class="mensaje mensaje-aviso">El filtro en lenguaje natural necesita la IA: en modo clásico no se aplica.</p>
@@ -59,7 +64,7 @@
 {% if not r.grupos %}
 <div class="vacio tarjeta">
   <h2>Sin resultados para «{{ r.consulta.texto }}»</h2>
-  <p>Prueba con una referencia OEM (por ejemplo <a href="/buscar?texto=1K0698151">1K0698151</a>), con menos palabras o con todas las tiendas.</p>
+  <p>Prueba con una referencia OEM{% if es_demo %} (por ejemplo <a href="/buscar?texto=1K0698151">1K0698151</a>){% endif %}, con menos palabras o con todas las tiendas.{% if not tiendas %} Todavía no hay tiendas: <a href="/tiendas">añade una</a>.{% endif %}</p>
 </div>
 {% endif %}
 
@@ -122,7 +127,12 @@
     </table>
   </div>
   <footer class="grupo-pie">
+    {#- Un precio no anclado nunca entra en el histórico: sin ninguno, el enlace daría un 404. -#}
+    {% if g.ofertas | selectattr("precio_anclado") | first %}
     <a class="boton boton-secundario" href="/productos/{{ g.id }}">Histórico y alertas →</a>
+    {% else %}
+    <span class="tenue">Ningún precio aparece en su página: no se guarda en el histórico.</span>
+    {% endif %}
   </footer>
 </article>
 {% endfor %}

@@ -12,24 +12,29 @@ import json
 import math
 import sqlite3
 import threading
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import fields, replace
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Self
+from typing import Any, NamedTuple, Self
 
 from precia.nucleo.modelos import (
     CLAVES_CAMPOS,
     Ajustes,
     Alerta,
     EstadoPerfil,
+    GrupoProducto,
     LlamadaIA,
+    Modo,
+    Oferta,
+    OrigenDato,
     PuntoHistorico,
     SerieHistorico,
     Tienda,
+    ValorCampo,
     VersionPerfil,
 )
 from precia.perfiles.tipos import Perfil
@@ -119,6 +124,16 @@ MIGRACIONES: tuple[str, ...] = (
         valor TEXT NOT NULL
     ) STRICT;
     """,
+    # 2: la ficha de un producto en la web enseña la última oferta de cada tienda con sus campos
+    # (origen y anclaje incluidos), no solo el precio. Las filas antiguas quedan con valores
+    # vacíos y se leen igual.
+    """
+    ALTER TABLE precios ADD COLUMN titulo TEXT NOT NULL DEFAULT '';
+    ALTER TABLE precios ADD COLUMN campos TEXT NOT NULL DEFAULT '{}';
+    ALTER TABLE precios ADD COLUMN disponible INTEGER NOT NULL DEFAULT 1
+        CHECK (disponible IN (0, 1));
+    ALTER TABLE productos ADD COLUMN criterio TEXT NOT NULL DEFAULT '';
+    """,
 )
 
 # Solo para diagnóstico y tests: los nombres de PRAGMA no se pueden parametrizar.
@@ -139,6 +154,11 @@ MAX_ETIQUETA_IA = 100
 MAX_RESULTADO_IA = 500
 MAX_AJUSTE_TEXTO = 500
 MAX_LIMITE_LLAMADAS = 10_000
+MAX_VALOR_CAMPO = 5_000
+"""Lo que admite `extraccion.ficha` en un valor (`MAX_VALOR`)."""
+MAX_CRITERIO = 200
+_ORIGENES = frozenset(o.value for o in OrigenDato)
+MAX_TEXTO_BUSQUEDA = 500
 # Caracteres de `str(Decimal)`: sobra para cualquier precio o coste real (28 cifras de precisión).
 MAX_IMPORTE = 50
 MAX_ENTERO = 2**63 - 1
@@ -167,6 +187,15 @@ class PerfilNoEncontrado(ErrorAlmacen, LookupError):
 
 class ProductoNoEncontrado(ErrorAlmacen, LookupError):
     """No se ha guardado nunca un precio de ese producto."""
+
+
+class BusquedaGuardada(NamedTuple):
+    texto: str
+    modo: Modo
+    fecha: datetime
+    llamadas_ia: int
+    coste_ia_usd: Decimal
+    duracion_s: float
 
 
 def _texto(valor: object, campo: str, maximo: int, *, vacio: bool = False) -> str:
@@ -456,7 +485,17 @@ class Almacen:
         url: str,
         precio: Decimal,
         fecha: datetime,
+        *,
+        titulo: str = "",
+        campos: Mapping[str, ValorCampo] | None = None,
+        disponible: bool = True,
+        criterio: str = "",
     ) -> None:
+        """Una oferta en el histórico. `titulo`, `campos` y `criterio` son los que enseña la web.
+
+        Solo se admiten los campos declarados en `nucleo.modelos.CAMPOS` (nota 08: no se guarda
+        nada que el usuario no haya pedido, como el nombre de un vendedor particular).
+        """
         _texto(producto_id, "producto_id", MAX_PRODUCTO_ID)
         _texto(nombre, "nombre", MAX_NOMBRE_PRODUCTO)
         if referencia_oem is not None:
@@ -465,18 +504,82 @@ class Almacen:
         _texto(url, "url", MAX_URL)
         importe = _importe(precio, "precio")
         instante = _fecha(fecha, "fecha")
+        _texto(titulo, "titulo", MAX_NOMBRE_PRODUCTO, vacio=True)
+        _texto(criterio, "criterio", MAX_CRITERIO, vacio=True)
+        texto_campos = _codificar_campos(campos or {})
         with self._transaccion() as con:
             con.execute(
-                "INSERT INTO productos (id, nombre, referencia_oem) VALUES (?, ?, ?)"
+                "INSERT INTO productos (id, nombre, referencia_oem, criterio) VALUES (?, ?, ?, ?)"
                 " ON CONFLICT (id) DO UPDATE SET nombre = excluded.nombre,"
-                " referencia_oem = COALESCE(excluded.referencia_oem, productos.referencia_oem)",
-                (producto_id, nombre, referencia_oem),
+                " referencia_oem = COALESCE(excluded.referencia_oem, productos.referencia_oem),"
+                " criterio = CASE WHEN excluded.criterio = '' THEN productos.criterio"
+                " ELSE excluded.criterio END",
+                (producto_id, nombre, referencia_oem, criterio),
             )
             con.execute(
-                "INSERT INTO precios (producto_id, tienda, url, precio, fecha, dia)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                (producto_id, tienda, url, importe, instante, fecha.date().isoformat()),
+                "INSERT INTO precios (producto_id, tienda, url, precio, fecha, dia, titulo,"
+                " campos, disponible) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    producto_id,
+                    tienda,
+                    url,
+                    importe,
+                    instante,
+                    fecha.date().isoformat(),
+                    titulo,
+                    texto_campos,
+                    int(bool(disponible)),
+                ),
             )
+
+    def ultimas_ofertas(self, producto_id: str) -> list[Oferta]:
+        """Las ofertas de la última visita a cada tienda para el producto, por orden de tienda.
+
+        Un grupo puede tener varias ofertas de la misma tienda (dos fichas parecidas): se
+        devuelven todas las de su último guardado, una por URL, y no las de visitas anteriores.
+        """
+        filas = self._consultar(
+            "SELECT p.tienda, p.url, p.precio, p.titulo, p.campos, p.disponible,"
+            " o.nombre AS producto FROM precios p JOIN productos o ON o.id = p.producto_id"
+            " WHERE p.producto_id = ? AND p.fecha = ("
+            " SELECT MAX(q.fecha) FROM precios q WHERE q.producto_id = p.producto_id"
+            " AND q.tienda = p.tienda) AND p.id = ("
+            " SELECT MAX(r.id) FROM precios r WHERE r.producto_id = p.producto_id"
+            " AND r.tienda = p.tienda AND r.fecha = p.fecha AND r.url = p.url)"
+            " ORDER BY p.tienda, p.id",
+            (producto_id,),
+        )
+        return [
+            Oferta(
+                tienda=f["tienda"],
+                url=f["url"],
+                # Las filas de antes de la migración 2 no tienen título: el del producto.
+                titulo=f["titulo"] or f["producto"],
+                precio=Decimal(f["precio"]),
+                campos=_decodificar_campos(f["campos"]),
+                disponible=bool(f["disponible"]),
+            )
+            for f in filas
+        ]
+
+    def producto(self, producto_id: str) -> GrupoProducto | None:
+        """El producto con la última oferta de cada tienda, o `None` si no se ha guardado."""
+        with self._cerrojo:
+            filas = self._consultar(
+                "SELECT nombre, referencia_oem, criterio FROM productos WHERE id = ?",
+                (producto_id,),
+            )
+            ofertas = self.ultimas_ofertas(producto_id)
+        if not filas or not ofertas:
+            return None
+        fila = filas[0]
+        return GrupoProducto(
+            id=producto_id,
+            nombre=fila["nombre"],
+            referencia_oem=fila["referencia_oem"],
+            criterio=fila["criterio"],
+            ofertas=tuple(ofertas),
+        )
 
     def historico(self, producto_id: str) -> list[SerieHistorico]:
         """Una serie por tienda (por orden alfabético) con el último precio de cada día."""
@@ -498,6 +601,59 @@ class Almacen:
     def producto_nombre(self, producto_id: str) -> str | None:
         filas = self._consultar("SELECT nombre FROM productos WHERE id = ?", (producto_id,))
         return str(filas[0]["nombre"]) if filas else None
+
+    # --- Búsquedas ---
+
+    def registrar_busqueda(
+        self,
+        texto: str,
+        modo: Modo,
+        fecha: datetime,
+        llamadas_ia: int,
+        coste_ia_usd: Decimal,
+        duracion_s: float,
+    ) -> None:
+        """Métricas de una búsqueda (para la evaluación): nunca los datos de las tiendas."""
+        if (
+            not isinstance(duracion_s, int | float)
+            or isinstance(duracion_s, bool)
+            or not math.isfinite(duracion_s)
+            or duracion_s < 0
+        ):
+            raise DatoNoValido("duracion_s: se espera un número finito y no negativo")
+        fila = (
+            _texto(texto, "texto", MAX_TEXTO_BUSQUEDA),
+            Modo(modo).value,
+            _fecha(fecha, "fecha"),
+            _entero(llamadas_ia, "llamadas_ia"),
+            _importe(coste_ia_usd, "coste_ia_usd"),
+            float(duracion_s),
+        )
+        with self._transaccion() as con:
+            con.execute(
+                "INSERT INTO busquedas (texto, modo, fecha, llamadas_ia, coste_ia_usd,"
+                " duracion_s) VALUES (?, ?, ?, ?, ?, ?)",
+                fila,
+            )
+
+    def busquedas(self, limite: int = 50) -> list[BusquedaGuardada]:
+        """Las últimas `limite` búsquedas, de la más reciente a la más antigua."""
+        if _entero(limite, "limite") == 0 or limite > MAX_LIMITE_LLAMADAS:
+            raise DatoNoValido(f"limite: entre 1 y {MAX_LIMITE_LLAMADAS}")
+        filas = self._consultar(
+            "SELECT * FROM busquedas ORDER BY fecha DESC, id DESC LIMIT ?", (limite,)
+        )
+        return [
+            BusquedaGuardada(
+                texto=f["texto"],
+                modo=Modo(f["modo"]),
+                fecha=datetime.fromisoformat(f["fecha"]),
+                llamadas_ia=f["llamadas_ia"],
+                coste_ia_usd=Decimal(f["coste_ia_usd"]),
+                duracion_s=f["duracion_s"],
+            )
+            for f in filas
+        ]
 
     # --- Alertas ---
 
@@ -621,6 +777,59 @@ class Almacen:
             )
             for f in filas
         ]
+
+
+def _codificar_campos(campos: Mapping[str, ValorCampo]) -> str:
+    datos: dict[str, dict[str, object]] = {}
+    for clave, valor in campos.items():
+        if clave not in CLAVES_CAMPOS:
+            raise DatoNoValido(f"campos: campo desconocido {clave!r}")
+        if not isinstance(valor, ValorCampo):
+            raise DatoNoValido(f"campos[{clave}]: se espera un ValorCampo")
+        confianza = valor.confianza
+        if (
+            not isinstance(confianza, int | float)
+            or isinstance(confianza, bool)
+            or not math.isfinite(confianza)
+            or not 0 <= confianza <= 1
+        ):
+            raise DatoNoValido(f"campos[{clave}]: la confianza va de 0 a 1")
+        datos[clave] = {
+            "valor": _texto(valor.valor, f"campos[{clave}]", MAX_VALOR_CAMPO),
+            "origen": OrigenDato(valor.origen).value,
+            "anclado": bool(valor.anclado),
+            "confianza": float(confianza),
+        }
+    return json.dumps(datos, ensure_ascii=False)
+
+
+def _decodificar_campos(texto: str) -> dict[str, ValorCampo]:
+    error = ErrorAlmacen("Campos de una oferta corruptos en la base de datos")
+    try:
+        datos = json.loads(texto)
+    except json.JSONDecodeError as e:
+        raise error from e
+    if not isinstance(datos, dict):
+        raise error
+    campos: dict[str, ValorCampo] = {}
+    for clave, valor in datos.items():
+        if clave not in CLAVES_CAMPOS or not isinstance(valor, dict):
+            raise error
+        texto_valor = valor.get("valor")
+        anclado = valor.get("anclado")
+        confianza = valor.get("confianza")
+        origen = valor.get("origen")
+        if (
+            not isinstance(texto_valor, str)
+            or not isinstance(origen, str)
+            or origen not in _ORIGENES
+            or not isinstance(anclado, bool)
+            or not isinstance(confianza, int | float)
+            or isinstance(confianza, bool)
+        ):
+            raise error
+        campos[clave] = ValorCampo(texto_valor, OrigenDato(origen), anclado, float(confianza))
+    return campos
 
 
 def _validar_perfil(perfil: Perfil) -> None:

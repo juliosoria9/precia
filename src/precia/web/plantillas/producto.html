@@ -8,7 +8,7 @@
     <h1>{{ grupo.nombre }}</h1>
     <p class="grupo-meta">
       {% if grupo.referencia_oem %}<span class="insignia insignia-oem">OEM {{ grupo.referencia_oem }}</span>{% endif %}
-      <span class="criterio">Emparejado: {{ grupo.criterio }}</span>
+      {% if grupo.criterio %}<span class="criterio">Emparejado: {{ grupo.criterio }}</span>{% endif %}
     </p>
   </div>
   {% if mejor %}
@@ -47,8 +47,10 @@
           {% for o in grupo.ofertas | sort(attribute="precio") %}
           <tr{% if o == mejor %} class="fila-mejor"{% endif %}>
             <td class="celda-tienda"><a href="/tiendas/{{ o.tienda }}">{{ o.tienda }}</a></td>
-            <td>{{ o.campos["marca"].valor }}</td>
-            <td>{{ o.campos["estado"].valor }}</td>
+            {#- No todas las tiendas dan marca o estado: la celda queda con un guion. -#}
+            {% for clave in ("marca", "estado") %}{% set v = o.campos.get(clave) %}
+            <td>{% if v and v.anclado %}{{ v.valor }}{% elif v %}<del class="no-anclado" title="No aparece en la página">{{ v.valor }}</del>{% else %}<span class="tenue">—</span>{% endif %}</td>
+            {% endfor %}
             <td class="num precio">{{ o.precio | euros }}</td>
           </tr>
           {% endfor %}

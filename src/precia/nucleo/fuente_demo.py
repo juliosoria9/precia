@@ -5,14 +5,20 @@ ninguna tienda real. Aun así, el comportamiento imita el diseño de la memoria,
 interfaz enseñe la diferencia entre modos: en modo clásico la tienda con el perfil roto no da
 datos y no se gasta nada en IA; en modo IA el reparador la recupera, el filtro semántico descarta
 accesorios y algún valor se rechaza por no estar anclado en la página.
+
+Las tiendas que se dan de alta y los perfiles que se revisan quedan solo en la memoria de esta
+fuente: la demo nunca visita ninguna tienda ni guarda nada en disco.
 """
 
 import re
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
+from precia.navegador.url import validar_url
+from precia.nucleo.dominios import dominio_de_tienda
+from precia.nucleo.fuente_datos import RevisionNoValida, TiendaNoExiste, TiendaYaExiste
 from precia.nucleo.modelos import (
     Ajustes,
     Alerta,
@@ -415,6 +421,16 @@ _LLAMADAS: tuple[LlamadaIA, ...] = (
 )
 
 
+async def _resolver_demo(host: str) -> list[str]:
+    # La demo no visita ninguna tienda: basta con comprobar la sintaxis del dominio, sin
+    # preguntar al DNS (los tests y la demo no usan la red). Es una IP pública cualquiera.
+    return ["93.184.215.14"]
+
+
+async def _validar_sin_dns(url: str) -> str:
+    return await validar_url(url, resolver=_resolver_demo)
+
+
 def _normalizar(texto: str) -> str:
     sin_tildes = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
     return sin_tildes.lower()
@@ -440,6 +456,7 @@ class FuenteDemo:
 
     es_demo: bool = True
     _ajustes: Ajustes = field(default_factory=Ajustes)
+    _tiendas: list[Tienda] = field(default_factory=lambda: list(TIENDAS))
     _alertas: list[Alerta] = field(
         default_factory=lambda: [
             Alerta(
@@ -456,7 +473,9 @@ class FuenteDemo:
     )
 
     async def buscar(self, consulta: ConsultaBusqueda) -> ResultadoBusqueda:
-        tiendas = [t for t in TIENDAS if not consulta.tiendas or t.dominio in consulta.tiendas]
+        tiendas = [
+            t for t in self._tiendas if not consulta.tiendas or t.dominio in consulta.tiendas
+        ]
         visitables = {t.dominio for t in tiendas if t.robots_permite}
         # Auto: la IA solo entra si falla la vía clásica (perfil roto) o hay filtro que aplicar.
         falla_algo = any(t.estado is EstadoPerfil.ROTO for t in tiendas if t.robots_permite)
@@ -558,6 +577,12 @@ class FuenteDemo:
         if not t.robots_permite:
             return ProgresoTienda(t.dominio, (Paso("robots.txt", EstadoPaso.OMITIDO, t.robots),))
         version = t.version_actual
+        if version is None:
+            # Tienda dada de alta en la demo: no se configura porque no se visita nada.
+            sin_perfil = Paso(
+                "perfil", EstadoPaso.OMITIDO, "Sin perfil: en la demo no se configuran tiendas"
+            )
+            return ProgresoTienda(t.dominio, (sin_perfil,))
         robots = Paso("robots.txt", EstadoPaso.OK, t.robots)
         busqueda = Paso("búsqueda", EstadoPaso.OK, "Resultados descargados (caché 6 h)")
         if t.estado is EstadoPerfil.ROTO:
@@ -598,10 +623,43 @@ class FuenteDemo:
         )
 
     def tiendas(self) -> list[Tienda]:
-        return list(TIENDAS)
+        return list(self._tiendas)
 
     def tienda(self, dominio: str) -> Tienda | None:
-        return next((t for t in TIENDAS if t.dominio == dominio), None)
+        return next((t for t in self._tiendas if t.dominio == dominio), None)
+
+    async def alta_tienda(self, dominio: str, nombre: str) -> Tienda:
+        normalizado = await dominio_de_tienda(dominio, validador=_validar_sin_dns)
+        if self.tienda(normalizado) is not None:
+            raise TiendaYaExiste(f"La tienda {normalizado} ya está dada de alta.")
+        tienda = Tienda(
+            normalizado,
+            nombre.strip() or normalizado,
+            EstadoPerfil.SIN_PERFIL,
+            "Aún no se ha visitado",
+            True,
+            None,
+            0,
+        )
+        self._tiendas.append(tienda)
+        return tienda
+
+    def revisar_perfil(self, dominio: str, version: int) -> Tienda:
+        tienda = self.tienda(dominio)
+        if tienda is None:
+            raise TiendaNoExiste(f"No hay ninguna tienda {dominio}.")
+        actual = tienda.version_actual
+        if actual is None:
+            raise RevisionNoValida("La tienda no tiene perfil que revisar.")
+        if version != actual.numero:
+            raise RevisionNoValida(f"Solo se puede fijar la versión actual (v{actual.numero}).")
+        if tienda.estado is not EstadoPerfil.PENDIENTE_REVISION:
+            raise RevisionNoValida(f"La versión v{actual.numero} ya está revisada.")
+        revisada = replace(actual, autor=f"{actual.autor} · revisado por ti")
+        estado = EstadoPerfil.REPARADO if "reparador" in actual.autor else EstadoPerfil.ACTIVO
+        nueva = replace(tienda, estado=estado, versiones=(*tienda.versiones[:-1], revisada))
+        self._tiendas[self._tiendas.index(tienda)] = nueva
+        return nueva
 
     def producto(self, id_producto: str) -> GrupoProducto | None:
         p = next((p for p in CATALOGO if p.id == id_producto), None)
@@ -660,3 +718,6 @@ class FuenteDemo:
 
     def evaluacion(self) -> list[ResultadoEvaluacion]:
         return []
+
+    async def cerrar(self) -> None:
+        """No hay nada que cerrar: la demo no abre navegador ni base de datos."""

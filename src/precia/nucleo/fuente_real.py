@@ -1,0 +1,309 @@
+"""Fuente de datos real: el almacén SQLite y el orquestador detrás de la interfaz `FuenteDatos`.
+
+La web no cambia respecto a la demo. Lo caro se crea tarde: el navegador (y con él Chromium) en
+la primera búsqueda, y se vuelve a crear si cambian el User-Agent o la espera entre peticiones.
+El servicio de IA se monta en cada búsqueda con los ajustes de ese momento (proveedor, modelo,
+presupuesto y tope), así que un cambio en «Ajustes» vale desde la búsqueda siguiente.
+
+Sin clave de la API (y con el proveedor `api`) no hay IA: los modos Auto e IA funcionan como el
+clásico y la búsqueda lo dice. La clave nunca se muestra: ni en los avisos ni en los errores.
+"""
+
+import asyncio
+from collections.abc import Callable
+from dataclasses import replace
+from datetime import datetime
+from decimal import Decimal
+
+from precia.almacen.sqlite import Almacen, DatoNoValido, TiendaDuplicada
+from precia.ia.claude import ProveedorClaude
+from precia.ia.ollama import ProveedorOllama
+from precia.ia.servicio import ServicioIA
+from precia.ia.tipos import ErrorIA, IANoDisponible, ProveedorIA
+from precia.navegador.cache import CachePaginas
+from precia.navegador.chromium import DescargadorChromium
+from precia.navegador.cortesia import LimitadorDominio
+from precia.navegador.http import DescargadorHTTP
+from precia.navegador.navegador import Navegador
+from precia.navegador.robots import ServicioRobots
+from precia.navegador.tipos import Descargador
+from precia.navegador.url import Validador, validar_url
+from precia.nucleo.config import Config
+from precia.nucleo.dominios import dominio_de_tienda, normalizar_dominio
+from precia.nucleo.fuente_datos import (
+    ErrorFuente,
+    RevisionNoValida,
+    TiendaNoExiste,
+    TiendaYaExiste,
+)
+from precia.nucleo.modelos import (
+    Ajustes,
+    Alerta,
+    ConsultaBusqueda,
+    GrupoProducto,
+    ResultadoBusqueda,
+    ResultadoEvaluacion,
+    ResumenIA,
+    SerieHistorico,
+    Tienda,
+)
+from precia.nucleo.orquestador import MAX_FICHAS, Orquestador, estado_de
+
+TTL_CACHE_S = 6 * 3600.0
+MAX_LLAMADAS_RESUMEN = 500
+MAX_NOMBRE_TIENDA = 200
+COMPONENTES = {
+    "configurador": "Configurador de perfiles",
+    "reparador": "Reparador de perfiles",
+    "extractor": "Extractor de respaldo",
+    "emparejado": "Emparejado y filtro semántico",
+    "clasificador": "Clasificador de resultados",
+}
+"""Nombre que enseña la web para cada componente que registra el servicio de IA."""
+RESULTADOS = {
+    "ok": "Válida",
+    "salida_no_valida": "Rechazada: JSON fuera del esquema",
+    "rechazo": "Rechazada por el modelo",
+    "no_disponible": "IA no disponible",
+    "error": "Error del proveedor",
+}
+
+CrearDescargadores = Callable[[Ajustes], tuple[Descargador, Descargador | None]]
+"""Descargador HTTP y, si lo hay, Chromium, con el User-Agent de los ajustes."""
+CrearProveedor = Callable[[Ajustes], tuple[ProveedorIA | None, str]]
+"""Proveedor de IA según los ajustes, o `None` y el motivo por el que no hay IA."""
+
+
+def _ahora() -> datetime:
+    # Hora local con zona: las fechas de la web se leen en la hora del portátil, y el almacén
+    # cuenta el gasto del mes con la misma convención que las llamadas (ver `almacen._mes`).
+    return datetime.now().astimezone()
+
+
+def proveedor_desde_ajustes(config: Config, ajustes: Ajustes) -> tuple[ProveedorIA | None, str]:
+    """El proveedor que piden los ajustes, o `None` con el motivo (para el aviso de la web)."""
+    if ajustes.proveedor == "ollama":
+        return ProveedorOllama(modelo=ajustes.modelo_local), ""
+    if not config.clave_api:
+        return None, "falta la clave ANTHROPIC_API_KEY en el entorno o en .env"
+    try:
+        return ProveedorClaude(config.clave_api, modelo=ajustes.modelo_api), ""
+    except IANoDisponible:
+        # El mensaje de ProveedorClaude no lleva la clave, pero aquí no hace falta ni citarlo.
+        return None, "la clave ANTHROPIC_API_KEY no tiene un formato válido"
+    except ErrorIA as error:
+        # Un modelo sin tarifa conocida: sin coste no se puede respetar el presupuesto.
+        return None, str(error)
+
+
+class FuenteReal:
+    """Implementa `FuenteDatos` con datos reales (memoria §6)."""
+
+    es_demo = False
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        crear_descargadores: CrearDescargadores | None = None,
+        crear_proveedor: CrearProveedor | None = None,
+        validador: Validador = validar_url,
+        reloj: Callable[[], datetime] = _ahora,
+        max_fichas: int = MAX_FICHAS,
+    ) -> None:
+        """`validador` es el anti-SSRF de todo el flujo; solo se cambia en los tests."""
+        self._config = config
+        self._validador = validador
+        self._reloj = reloj
+        self._max_fichas = max_fichas
+        self._crear_descargadores = crear_descargadores or self._descargadores_reales
+        self._crear_proveedor: CrearProveedor = crear_proveedor or (
+            lambda ajustes: proveedor_desde_ajustes(config, ajustes)
+        )
+        config.ruta_bd.parent.mkdir(parents=True, exist_ok=True)
+        self._almacen = Almacen(config.ruta_bd, reloj=reloj)
+        self._navegador: Navegador | None = None
+        self._clave_navegador: tuple[str, float] | None = None
+        self._usos: dict[Navegador, int] = {}
+        """Búsquedas en vuelo por navegador (el actual y los sustituidos que aún se usan)."""
+        self._candado = asyncio.Lock()
+
+    @property
+    def almacen(self) -> Almacen:
+        return self._almacen
+
+    # --- Búsqueda ---------------------------------------------------------------------------
+
+    async def buscar(self, consulta: ConsultaBusqueda) -> ResultadoBusqueda:
+        ajustes = self.ajustes()
+        navegador = await self._tomar_navegador(ajustes)
+        try:
+            return await self._buscar(consulta, ajustes, navegador)
+        finally:
+            await self._soltar_navegador(navegador)
+
+    async def _buscar(
+        self, consulta: ConsultaBusqueda, ajustes: Ajustes, navegador: Navegador
+    ) -> ResultadoBusqueda:
+        proveedor, motivo = self._crear_proveedor(ajustes)
+        servicio = None
+        if proveedor is not None:
+            servicio = ServicioIA(
+                proveedor,
+                self._almacen,
+                presupuesto_mes_usd=ajustes.presupuesto_mensual_usd,
+                tope_llamadas=ajustes.tope_llamadas_busqueda,
+                reloj=self._reloj,
+            )
+        orquestador = Orquestador(
+            self._almacen,
+            navegador,
+            servicio,
+            max_fichas=self._max_fichas,
+            validador=self._validador,
+            reloj=self._reloj,
+            motivo_sin_ia=motivo,
+        )
+        return await orquestador.buscar(consulta)
+
+    async def _tomar_navegador(self, ajustes: Ajustes) -> Navegador:
+        """El navegador para una búsqueda; hay que devolverlo con `_soltar_navegador`.
+
+        Si los ajustes han cambiado, el navegador viejo no se cierra mientras lo use otra
+        búsqueda en vuelo: cerrarlo le cortaría Chromium a media descarga y, peor, su
+        descargador volvería a arrancar otro Chromium que ya no cerraría nadie.
+        """
+        clave = (ajustes.user_agent, ajustes.retardo_dominio_s)
+        async with self._candado:
+            if self._navegador is not None and self._clave_navegador != clave:
+                viejo, self._navegador = self._navegador, None
+                if not self._usos.get(viejo):
+                    await viejo.cerrar()
+            if self._navegador is None:
+                http, chromium = self._crear_descargadores(ajustes)
+                self._navegador = Navegador(
+                    http=http,
+                    chromium=chromium,
+                    robots=ServicioRobots(http, ajustes.user_agent),
+                    limitador=LimitadorDominio(ajustes.retardo_dominio_s),
+                    cache=CachePaginas(self._config.ruta_cache, TTL_CACHE_S),
+                    validador=self._validador,
+                )
+                self._clave_navegador = clave
+            navegador = self._navegador
+            self._usos[navegador] = self._usos.get(navegador, 0) + 1
+            return navegador
+
+    async def _soltar_navegador(self, navegador: Navegador) -> None:
+        async with self._candado:
+            quedan = self._usos.get(navegador, 0) - 1
+            if quedan > 0:
+                self._usos[navegador] = quedan
+                return
+            self._usos.pop(navegador, None)
+            if navegador is not self._navegador:
+                # Lo habían sustituido unos ajustes nuevos: era la última búsqueda que lo usaba.
+                await navegador.cerrar()
+
+    def _descargadores_reales(self, ajustes: Ajustes) -> tuple[Descargador, Descargador | None]:
+        # Chromium no arranca hasta que una tienda lo necesita (`necesita_js`).
+        http = DescargadorHTTP(ajustes.user_agent, validador=self._validador)
+        chromium = DescargadorChromium(ajustes.user_agent, validador=self._validador)
+        return http, chromium
+
+    async def cerrar(self) -> None:
+        async with self._candado:
+            # Al apagar se cierran todos, también los que aún usaba una búsqueda sin terminar.
+            pendientes = dict.fromkeys([*self._usos, self._navegador])
+            self._usos.clear()
+            self._navegador = None
+            for navegador in pendientes:
+                if navegador is not None:
+                    await navegador.cerrar()
+        self._almacen.cerrar()
+
+    # --- Tiendas ----------------------------------------------------------------------------
+
+    def tiendas(self) -> list[Tienda]:
+        return self._almacen.tiendas()
+
+    def tienda(self, dominio: str) -> Tienda | None:
+        normalizado = normalizar_dominio(dominio)
+        return self._almacen.tienda(normalizado) if normalizado else None
+
+    async def alta_tienda(self, dominio: str, nombre: str) -> Tienda:
+        normalizado = await dominio_de_tienda(dominio, validador=self._validador)
+        nombre = nombre.strip() or normalizado
+        if len(nombre) > MAX_NOMBRE_TIENDA or not nombre.isprintable():
+            raise ErrorFuente(
+                f"El nombre de la tienda tiene que tener de 1 a {MAX_NOMBRE_TIENDA} caracteres."
+            )
+        try:
+            return self._almacen.alta_tienda(normalizado, nombre)
+        except TiendaDuplicada as error:
+            raise TiendaYaExiste(f"La tienda {normalizado} ya está dada de alta.") from error
+        except DatoNoValido as error:
+            raise ErrorFuente("El nombre de la tienda no es válido.") from error
+
+    def revisar_perfil(self, dominio: str, version: int) -> Tienda:
+        normalizado = normalizar_dominio(dominio)
+        tienda = self._almacen.tienda(normalizado) if normalizado else None
+        if tienda is None or normalizado is None:
+            raise TiendaNoExiste(f"No hay ninguna tienda {dominio}.")
+        vigente = self._almacen.perfil_vigente(normalizado)
+        if vigente is None:
+            raise RevisionNoValida("La tienda no tiene perfil que revisar.")
+        if version != vigente.version:
+            raise RevisionNoValida(f"Solo se puede fijar la versión actual (v{vigente.version}).")
+        if vigente.revisado:
+            raise RevisionNoValida(f"La versión v{vigente.version} ya está revisada.")
+        self._almacen.marcar_revisado(normalizado, version)
+        return self._almacen.actualizar_tienda(
+            normalizado, estado=estado_de(replace(vigente, revisado=True))
+        )
+
+    # --- Productos y alertas ----------------------------------------------------------------
+
+    def producto(self, id_producto: str) -> GrupoProducto | None:
+        return self._almacen.producto(id_producto)
+
+    def historico(self, id_producto: str) -> list[SerieHistorico]:
+        return self._almacen.historico(id_producto)
+
+    def alertas(self) -> list[Alerta]:
+        return self._almacen.alertas()
+
+    def crear_alerta(self, id_producto: str, umbral: Decimal, canal: str) -> Alerta:
+        return self._almacen.crear_alerta(id_producto, umbral, canal)
+
+    # --- IA, ajustes y evaluación -----------------------------------------------------------
+
+    def resumen_ia(self) -> ResumenIA:
+        ahora = self._reloj()
+        llamadas = tuple(
+            replace(
+                c,
+                componente=COMPONENTES.get(c.componente, c.componente),
+                resultado=RESULTADOS.get(c.resultado, c.resultado),
+            )
+            for c in self._almacen.llamadas(MAX_LLAMADAS_RESUMEN)
+            if (c.fecha.year, c.fecha.month) == (ahora.year, ahora.month)
+        )
+        por_componente: dict[str, int] = {}
+        for c in llamadas:
+            por_componente[c.componente] = por_componente.get(c.componente, 0) + 1
+        return ResumenIA(
+            llamadas=llamadas,
+            gasto_mes_usd=self._almacen.gasto_mes_usd(),
+            presupuesto_mes_usd=self.ajustes().presupuesto_mensual_usd,
+            por_componente=por_componente,
+        )
+
+    def ajustes(self) -> Ajustes:
+        return self._almacen.leer_ajustes()
+
+    def guardar_ajustes(self, ajustes: Ajustes) -> None:
+        self._almacen.guardar_ajustes(ajustes)
+
+    def evaluacion(self) -> list[ResultadoEvaluacion]:
+        return []

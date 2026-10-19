@@ -6,6 +6,9 @@
   <p class="sub">Cada tienda tiene un <strong>perfil</strong>: la URL de búsqueda y los selectores CSS para leer sus fichas. Lo genera el 🤖 configurador una sola vez, el sistema lo valida y después se usa <strong>sin IA</strong>. Si la tienda cambia su HTML, el 🤖 reparador propone una versión nueva, que <strong>no se fija hasta que la revisas</strong>: «Reparado» quiere decir reparado por la IA y confirmado por ti.</p>
 </section>
 
+{% if not tiendas %}
+<p class="tarjeta tenue">Todavía no hay ninguna tienda. Añade la primera con el formulario de abajo.</p>
+{% endif %}
 <div class="rejilla-tiendas">
   {% for t in tiendas %}
   {% set v = t.version_actual %}
@@ -25,9 +28,22 @@
   {% endfor %}
 </div>
 
-<section class="tarjeta nota">
+<section class="tarjeta nota" id="alta">
   <h2>Añadir una tienda</h2>
-  <p>Al buscar en una tienda nueva, el 🤖 configurador lee una página de resultados y una ficha, propone los selectores y el sistema los <strong>valida ejecutándolos</strong>. El perfil queda <em>pendiente de revisión</em> hasta que lo confirmas.</p>
-  <p class="tenue">Disponible en el hito H4.</p>
+  <p>Escribe su dominio. En la primera búsqueda en modo Auto o IA, el 🤖 configurador lee una página de resultados y una ficha, propone los selectores y el sistema los <strong>valida ejecutándolos</strong>. El perfil queda <em>pendiente de revisión</em> hasta que lo confirmas. En modo clásico, una tienda sin perfil no se visita.</p>
+  {% if error %}<p class="mensaje mensaje-error" role="alert">{{ error }}</p>{% endif %}
+  <form class="formulario" method="post" action="/tiendas">
+    <div class="campo-fila">
+      <label>Dominio
+        <input name="dominio" required maxlength="253" autocomplete="off" spellcheck="false"
+               placeholder="tienda.es" value="{{ dominio or '' }}">
+      </label>
+      <label>Nombre (opcional)
+        <input name="nombre" maxlength="100" autocomplete="off" placeholder="Recambios Ejemplo" value="{{ nombre or '' }}">
+      </label>
+      <button class="boton boton-primario" type="submit">Añadir tienda</button>
+    </div>
+  </form>
+  {% if es_demo %}<p class="tenue">En la demo la tienda solo se guarda en memoria y no se visita.</p>{% endif %}
 </section>
 {% endblock %}

@@ -16,10 +16,13 @@ MAX_TEXTO = 200
 MAX_FILTRO = 300
 MAX_TIENDAS = 50
 MAX_CAMPOS_FORMULARIO = 100
+MAX_DOMINIO = 253
+MAX_NOMBRE_TIENDA = 100
 IMPORTE_MAXIMO = Decimal(1_000_000)
 # [0-9] y no \d: \d acepta dígitos de otros alfabetos («٣٠»).
 _IMPORTE = re.compile(r"[0-9]{1,6}([.,][0-9]{1,2})?")
 _IMPORTE_MILES = re.compile(r"[0-9]{1,3}(\.[0-9]{3})+(,[0-9]{1,2})?")
+_VERSION = re.compile(r"[0-9]{1,9}")
 _VERDADERO = frozenset({"on", "true", "1", "si", "sí"})
 
 Parametros = Mapping[str, Sequence[str]]
@@ -94,3 +97,26 @@ def consulta_desde_parametros(parametros: Parametros) -> ConsultaBusqueda:
         filtro=filtro,
     )
     return replace(consulta, campos=campos) if campos else consulta
+
+
+def datos_de_alta(formulario: Parametros) -> tuple[str, str]:
+    """Dominio y nombre del formulario «Añadir tienda». El dominio lo valida después la fuente."""
+    dominio = primero(formulario, "dominio").strip()
+    if not dominio:
+        raise ErrorFormulario("Escribe el dominio de la tienda, por ejemplo «tienda.es».")
+    if len(dominio) > MAX_DOMINIO:
+        raise ErrorFormulario(f"El dominio no puede pasar de {MAX_DOMINIO} caracteres.")
+    nombre = primero(formulario, "nombre").strip()
+    if len(nombre) > MAX_NOMBRE_TIENDA or not nombre.isprintable():
+        raise ErrorFormulario(
+            f"El nombre de la tienda puede tener hasta {MAX_NOMBRE_TIENDA} caracteres visibles."
+        )
+    return dominio, nombre
+
+
+def leer_version(texto: str) -> int:
+    """Número de versión de un perfil («1», «12»...). Solo dígitos ASCII y un tamaño razonable."""
+    limpio = texto.strip()
+    if not _VERSION.fullmatch(limpio) or int(limpio) < 1:
+        raise ErrorFormulario("La versión del perfil no es válida.")
+    return int(limpio)

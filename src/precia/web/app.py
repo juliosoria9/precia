@@ -1,16 +1,19 @@
 """Aplicación web de PrecIA (FastAPI + Jinja2 + HTMX).
 
-La web solo habla con una `FuenteDatos`. En el hito H1W es la `FuenteDemo`; desde H2 será la
-fuente real, sin tocar rutas ni plantillas.
+La web solo habla con una `FuenteDatos`: la `FuenteDemo` (datos de ejemplo, en memoria) o la
+`FuenteReal` (orquestador + SQLite). `crear_app` recibe la fuente ya hecha y la cierra al apagar;
+`aplicacion_desde_config` elige cuál según la configuración (`--demo` o `PRECIA_DEMO`).
 """
 
 import mimetypes
 import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -23,16 +26,20 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from precia import __version__
 from precia.nucleo import formato
-from precia.nucleo.fuente_datos import FuenteDatos
+from precia.nucleo.config import Config
+from precia.nucleo.fuente_datos import ErrorFuente, FuenteDatos
 from precia.nucleo.fuente_demo import FuenteDemo
+from precia.nucleo.fuente_real import FuenteReal
 from precia.nucleo.modelos import CAMPOS, Ajustes, Modo
 from precia.seguimiento.graficas import grafica_historico
 from precia.web.formularios import (
     ErrorFormulario,
     Parametros,
     consulta_desde_parametros,
+    datos_de_alta,
     leer_formulario,
     leer_importe,
+    leer_version,
     primero,
 )
 from precia.web.seguridad import MiddlewareSeguridad
@@ -101,13 +108,24 @@ def crear_app(
 ) -> FastAPI:
     datos: FuenteDatos = fuente if fuente is not None else FuenteDemo()
     plantillas = Jinja2Templates(env=_entorno())
+
+    @asynccontextmanager
+    async def ciclo_de_vida(_: FastAPI) -> AsyncIterator[None]:
+        # Al apagar se cierran el navegador (Chromium) y la base de datos de la fuente real.
+        try:
+            yield
+        finally:
+            await datos.cerrar()
+
     app = FastAPI(
         title="PrecIA",
         version=__version__,
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=ciclo_de_vida,
     )
+    app.state.fuente = datos
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(hosts))
     app.add_middleware(MiddlewareSeguridad)
     app.mount("/estaticos", StaticFiles(directory=RAIZ / "estaticos"), name="estaticos")
@@ -161,11 +179,16 @@ def crear_app(
             # Solo tiendas conocidas: desde H2 cada tienda es un dominio que se visita, y
             # aceptar cualquiera abriría la puerta a SSRF (169.254.169.254, localhost...).
             conocidas = {t.dominio for t in contexto["tiendas"]}
-            consulta = replace(
-                consulta, tiendas=tuple(t for t in consulta.tiendas if t in conocidas)
-            )
-            contexto["consulta"] = consulta
-            contexto["resultado"] = await datos.buscar(consulta)
+            elegidas = tuple(t for t in consulta.tiendas if t in conocidas)
+            if consulta.tiendas and not elegidas:
+                # Una lista vacía significa «todas»: pedir solo tiendas que no existen no puede
+                # acabar visitando todas las tiendas (y gastando IA en cada una).
+                contexto["error"] = "Ninguna de las tiendas elegidas está dada de alta."
+                estado = 422
+            else:
+                consulta = replace(consulta, tiendas=elegidas)
+                contexto["consulta"] = consulta
+                contexto["resultado"] = await datos.buscar(consulta)
         plantilla = "_resultados.html" if _es_htmx(request) else "inicio.html"
         respuesta = pagina(request, plantilla, contexto, estado)
         # La misma URL devuelve página o fragmento según HX-Request: que ninguna caché los mezcle.
@@ -183,12 +206,49 @@ def crear_app(
     async def tiendas(request: Request) -> HTMLResponse:
         return pagina(request, "tiendas.html", {"tiendas": datos.tiendas()})
 
+    @app.post("/tiendas", response_class=HTMLResponse)
+    async def alta_tienda(request: Request) -> Response:
+        formulario: Parametros = {}
+        try:
+            formulario = leer_formulario(await request.body())
+            dominio, nombre = datos_de_alta(formulario)
+            # La fuente valida el dominio (sintaxis y anti-SSRF) antes de guardarlo.
+            nueva = await datos.alta_tienda(dominio, nombre)
+        except (ErrorFormulario, ErrorFuente) as error:
+            contexto = {
+                "tiendas": datos.tiendas(),
+                "error": str(error),
+                "dominio": primero(formulario, "dominio")[:300],
+                "nombre": primero(formulario, "nombre")[:300],
+            }
+            return pagina(request, "tiendas.html", contexto, 422)
+        return RedirectResponse(f"/tiendas/{quote(nueva.dominio)}?alta=1", status_code=303)
+
     @app.get("/tiendas/{dominio}", response_class=HTMLResponse)
     async def tienda(request: Request, dominio: str) -> HTMLResponse:
         encontrada = datos.tienda(dominio)
         if encontrada is None:
             raise HTTPException(404)
-        return pagina(request, "tienda.html", {"tienda": encontrada})
+        contexto = {
+            "tienda": encontrada,
+            "alta": request.query_params.get("alta") == "1",
+            "revisado": request.query_params.get("revisado") == "1",
+        }
+        return pagina(request, "tienda.html", contexto)
+
+    @app.post("/tiendas/{dominio}/revisar", response_class=HTMLResponse)
+    async def revisar_perfil(request: Request, dominio: str) -> Response:
+        encontrada = datos.tienda(dominio)
+        if encontrada is None:
+            raise HTTPException(404)
+        try:
+            formulario = leer_formulario(await request.body())
+            version = leer_version(primero(formulario, "version"))
+            revisada = datos.revisar_perfil(encontrada.dominio, version)
+        except (ErrorFormulario, ErrorFuente) as error:
+            actual = datos.tienda(encontrada.dominio) or encontrada
+            return pagina(request, "tienda.html", {"tienda": actual, "error": str(error)}, 422)
+        return RedirectResponse(f"/tiendas/{quote(revisada.dominio)}?revisado=1", status_code=303)
 
     @app.get("/alertas", response_class=HTMLResponse)
     async def alertas(request: Request) -> HTMLResponse:
@@ -254,6 +314,12 @@ def crear_app(
     return app
 
 
+def aplicacion_desde_config(config: Config) -> FastAPI:
+    """La aplicación con la fuente que pide la configuración: la demo o los datos reales."""
+    fuente: FuenteDatos = FuenteDemo() if config.demo else FuenteReal(config)
+    return crear_app(fuente)
+
+
 def _ajustes_desde_formulario(formulario: Parametros, actuales: Ajustes) -> Ajustes:
     """Los campos que no vienen en el formulario conservan su valor actual."""
 
@@ -307,6 +373,3 @@ def _ajustes_desde_formulario(formulario: Parametros, actuales: Ajustes) -> Ajus
         ),
         user_agent=texto("user_agent", "User-Agent", actuales.user_agent),
     )
-
-
-app = crear_app()

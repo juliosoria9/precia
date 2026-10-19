@@ -1,7 +1,16 @@
+from dataclasses import replace
+
 import pytest
 
 from precia.nucleo.fuente_demo import FuenteDemo
-from precia.nucleo.modelos import SerieHistorico
+from precia.nucleo.modelos import (
+    ConsultaBusqueda,
+    OrigenDato,
+    ResultadoBusqueda,
+    ResultadoEvaluacion,
+    SerieHistorico,
+    ValorCampo,
+)
 from precia.web.app import crear_app
 from tests.asgi import ClienteASGI
 
@@ -176,3 +185,41 @@ def test_google_desactivado_no_se_puede_marcar(cliente: ClienteASGI) -> None:
 def test_google_pedido_pero_desactivado_avisa_en_los_resultados(cliente: ClienteASGI) -> None:
     html = cliente.get("/buscar?texto=freno&descubrir=on", cabeceras={"HX-Request": "true"}).texto
     assert "mensaje-aviso" in html and "Google" in html
+
+
+class FuenteSinPreciosAnclados(FuenteDemo):
+    """Un grupo cuyos precios no aparecen en la página: no entra en el histórico."""
+
+    async def buscar(self, consulta: ConsultaBusqueda) -> ResultadoBusqueda:
+        resultado = await super().buscar(consulta)
+        grupo = resultado.grupos[0]
+        ofertas = tuple(
+            replace(
+                o,
+                campos={
+                    **o.campos,
+                    "precio": ValorCampo(str(o.precio), OrigenDato.IA, anclado=False),
+                },
+            )
+            for o in grupo.ofertas
+        )
+        return replace(resultado, grupos=(replace(grupo, id="txt-sin-historico", ofertas=ofertas),))
+
+
+def test_grupo_sin_precios_anclados_no_enlaza_a_un_historico_que_no_existe() -> None:
+    # El orquestador nunca guarda un precio no anclado: el enlace llevaría a un 404.
+    html = ClienteASGI(crear_app(FuenteSinPreciosAnclados())).get("/buscar?texto=pastillas").texto
+    assert "/productos/txt-sin-historico" not in html
+    assert "no se guarda en el histórico" in html
+
+
+def test_evaluacion_no_promete_casos_que_no_se_guardan() -> None:
+    # Todavía no se guarda ningún caso etiquetado: la página no puede decir lo contrario.
+    html = ClienteASGI(crear_app(FuenteSinEvaluacion())).get("/evaluacion").texto
+    assert "desde H2" not in html
+    assert "H8" in html
+
+
+class FuenteSinEvaluacion(FuenteDemo):
+    def evaluacion(self) -> list[ResultadoEvaluacion]:
+        return []

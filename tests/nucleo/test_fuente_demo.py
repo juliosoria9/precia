@@ -1,10 +1,19 @@
 import asyncio
 from decimal import Decimal
 
+import pytest
+
+from precia.nucleo.fuente_datos import (
+    DominioNoValido,
+    RevisionNoValida,
+    TiendaNoExiste,
+    TiendaYaExiste,
+)
 from precia.nucleo.fuente_demo import FuenteDemo
 from precia.nucleo.modelos import (
     ConsultaBusqueda,
     EstadoPaso,
+    EstadoPerfil,
     Modo,
     OrigenDato,
     ResultadoBusqueda,
@@ -151,3 +160,77 @@ def test_hay_ofertas_con_origenes_mezclados() -> None:
     assert any(
         len({v.origen for v in o.campos.values()}) > 1 for g in resultado.grupos for o in g.ofertas
     )
+
+
+# --- Alta de tiendas y revisión del perfil (en memoria) -----------------------------------------
+
+
+def test_alta_de_una_tienda_normaliza_el_dominio_y_nace_sin_perfil() -> None:
+    fuente = FuenteDemo()
+    tienda = asyncio.run(fuente.alta_tienda(" WWW.Nueva-Tienda.ES ", "Nueva Tienda"))
+    assert (tienda.dominio, tienda.nombre) == ("nueva-tienda.es", "Nueva Tienda")
+    assert tienda.estado is EstadoPerfil.SIN_PERFIL and tienda.versiones == ()
+    assert fuente.tienda("nueva-tienda.es") == tienda
+    assert tienda in fuente.tiendas()
+    # Cada fuente tiene sus tiendas: el alta no cambia los datos de ejemplo del módulo.
+    assert FuenteDemo().tienda("nueva-tienda.es") is None
+
+
+def test_alta_sin_nombre_usa_el_dominio() -> None:
+    tienda = asyncio.run(FuenteDemo().alta_tienda("nueva-tienda.es", "  "))
+    assert tienda.nombre == "nueva-tienda.es"
+
+
+@pytest.mark.parametrize("dominio", ["localhost", "169.254.169.254", "otra.es#x.es", "a b.es"])
+def test_alta_rechaza_dominios_no_validos(dominio: str) -> None:
+    with pytest.raises(DominioNoValido):
+        asyncio.run(FuenteDemo().alta_tienda(dominio, "x"))
+
+
+def test_alta_de_una_tienda_que_ya_existe() -> None:
+    with pytest.raises(TiendaYaExiste):
+        asyncio.run(FuenteDemo().alta_tienda("www.recambiosnorte.example", "Otra vez"))
+
+
+def test_tienda_nueva_sale_sin_perfil_en_la_busqueda() -> None:
+    fuente = FuenteDemo()
+    asyncio.run(fuente.alta_tienda("nueva-tienda.es", "Nueva"))
+    resultado = asyncio.run(fuente.buscar(ConsultaBusqueda("pastillas", modo=Modo.CLASICO)))
+    progreso = next(p for p in resultado.progreso if p.tienda == "nueva-tienda.es")
+    assert [(p.nombre, p.estado) for p in progreso.pasos] == [("perfil", EstadoPaso.OMITIDO)]
+
+
+def test_revisar_el_perfil_pendiente_lo_fija() -> None:
+    fuente = FuenteDemo()
+    tienda = fuente.revisar_perfil("desguacesur.example", 1)
+    assert tienda.estado is EstadoPerfil.ACTIVO
+    assert tienda.version_actual is not None
+    assert "revisado por" in tienda.version_actual.autor
+    assert fuente.tienda("desguacesur.example") == tienda
+
+
+@pytest.mark.parametrize(
+    ("dominio", "version", "error"),
+    [
+        ("desguacesur.example", 2, RevisionNoValida),
+        ("recambiosnorte.example", 1, RevisionNoValida),
+        ("autodescuento.example", 1, RevisionNoValida),
+        ("no-existe.example", 1, TiendaNoExiste),
+    ],
+)
+def test_revisar_un_perfil_que_no_se_puede_fijar(
+    dominio: str, version: int, error: type[Exception]
+) -> None:
+    with pytest.raises(error):
+        FuenteDemo().revisar_perfil(dominio, version)
+
+
+def test_revisar_dos_veces_no_vale() -> None:
+    fuente = FuenteDemo()
+    fuente.revisar_perfil("desguacesur.example", 1)
+    with pytest.raises(RevisionNoValida):
+        fuente.revisar_perfil("desguacesur.example", 1)
+
+
+def test_cerrar_no_hace_nada_en_la_demo() -> None:
+    asyncio.run(FuenteDemo().cerrar())

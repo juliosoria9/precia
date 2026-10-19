@@ -15,6 +15,6 @@
     <li>Cada precio se guarda en el histórico (SQLite).</li>
     <li>Si el mejor precio queda por debajo del objetivo, se envía el aviso una sola vez hasta que vuelva a subir.</li>
   </ol>
-  <p class="tenue">El planificador y los avisos llegan en el hito H7. Ahora mismo son datos de ejemplo.</p>
+  <p class="tenue">El planificador y los avisos llegan en el hito H7.{% if es_demo %} Ahora mismo son datos de ejemplo.{% else %} De momento las alertas se guardan, pero todavía no se envía ningún aviso.{% endif %}</p>
 </section>
 {% endblock %}

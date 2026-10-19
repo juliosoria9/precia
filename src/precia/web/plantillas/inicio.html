@@ -16,12 +16,16 @@
            value="{{ c.texto if c else '' }}">
     <button class="boton boton-primario" type="submit">Buscar</button>
   </div>
+  {% if not tiendas %}
+  <p class="mensaje mensaje-aviso">Todavía no hay tiendas en las que buscar. <a href="/tiendas">Añade una tienda</a> y PrecIA preparará su perfil en la primera búsqueda.</p>
+  {% elif es_demo %}
   <p class="ejemplos">Prueba:
     {% for ejemplo in ["1K0698151", "pastillas freno", "disco freno", "filtro aceite", "escobillas"] %}
     {#- Enlace normal (sin HTMX) para que el cuadro de búsqueda también muestre el ejemplo. -#}
     <a class="chip-enlace" href="/buscar?texto={{ ejemplo | urlencode }}">{{ ejemplo }}</a>
     {% endfor %}
   </p>
+  {% endif %}
 
   <details class="opciones"{% if c %} open{% endif %}>
     <summary>Opciones de búsqueda</summary>

@@ -16,14 +16,26 @@
     <div><dt>Última visita</dt><dd>{{ tienda.ultima_visita | fecha_hora if tienda.ultima_visita else "Nunca" }}</dd></div>
     <div><dt>Bloqueos / CAPTCHA</dt><dd>{{ tienda.bloqueos }}</dd></div>
   </dl>
-  {% if tienda.estado.value == "pendiente_revision" %}
-  <p class="mensaje mensaje-aviso">El 🤖 configurador ha generado este perfil y el sistema lo ha validado, pero <strong>falta tu revisión</strong> antes de fijarlo.</p>
+  {% if error %}<p class="mensaje mensaje-error" role="alert">{{ error }}</p>{% endif %}
+  {% if alta %}<p class="mensaje mensaje-ok" role="status">Tienda añadida. Su perfil lo crea el 🤖 configurador en la primera búsqueda en modo Auto o IA.</p>{% endif %}
+  {% if revisado %}<p class="mensaje mensaje-ok" role="status">Perfil revisado y fijado.</p>{% endif %}
+  {% set actual = tienda.version_actual %}
+  {% set pendiente = actual and tienda.estado.value == "pendiente_revision" %}
+  {% if pendiente %}
+  <p class="mensaje mensaje-aviso">La IA ha generado la versión v{{ actual.numero }} de este perfil y el sistema la ha validado, pero <strong>falta tu revisión</strong> antes de fijarla. Comprueba abajo su URL de búsqueda y sus selectores.</p>
   {% elif tienda.estado.value == "roto" %}
-  <p class="mensaje mensaje-error">El perfil ha dejado de funcionar. En modo Auto o IA, el 🤖 reparador propone una versión nueva y, mientras tanto, se usa el extractor de respaldo.</p>
+  <p class="mensaje mensaje-error">El perfil ha dejado de funcionar. En modo Auto o IA, el 🤖 reparador propone una versión nueva, que queda pendiente de tu revisión.</p>
   {% endif %}
   <div class="acciones">
-    <button class="boton boton-primario" type="button" disabled title="Disponible en el hito H4">Revisar y fijar perfil</button>
-    <button class="boton boton-secundario" type="button" disabled title="Disponible en el hito H4">Volver a validar</button>
+    {% if pendiente %}
+    <form method="post" action="/tiendas/{{ tienda.dominio | urlencode }}/revisar">
+      <input type="hidden" name="version" value="{{ actual.numero }}">
+      <button class="boton boton-primario" type="submit">Revisar y fijar perfil v{{ actual.numero }}</button>
+    </form>
+    {% else %}
+    <button class="boton boton-primario" type="button" disabled title="{{ 'El perfil actual ya está revisado' if actual else 'La tienda aún no tiene perfil' }}">Revisar y fijar perfil</button>
+    {% endif %}
+    <button class="boton boton-secundario" type="button" disabled title="Todavía no se puede lanzar desde la web">Volver a validar</button>
   </div>
 </section>
 

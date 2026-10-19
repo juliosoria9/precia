@@ -6,8 +6,10 @@ from precia.nucleo.modelos import Modo
 from precia.web.formularios import (
     ErrorFormulario,
     consulta_desde_parametros,
+    datos_de_alta,
     leer_formulario,
     leer_importe,
+    leer_version,
 )
 
 
@@ -87,3 +89,37 @@ def test_importe_con_puntos_de_miles(entrada: str, esperado: str) -> None:
 def test_importe_mal_formado_o_con_digitos_no_ascii_falla(entrada: str) -> None:
     with pytest.raises(ErrorFormulario):
         leer_importe(entrada)
+
+
+def test_datos_de_alta_recorta_espacios() -> None:
+    assert datos_de_alta({"dominio": [" tienda.es "], "nombre": [" Mi tienda "]}) == (
+        "tienda.es",
+        "Mi tienda",
+    )
+    assert datos_de_alta({"dominio": ["tienda.es"]}) == ("tienda.es", "")
+
+
+@pytest.mark.parametrize(
+    "formulario",
+    [
+        {},
+        {"dominio": ["  "]},
+        {"dominio": ["a" * 254]},
+        {"dominio": ["t.es"], "nombre": ["x\x00y"]},
+        {"dominio": ["t.es"], "nombre": ["n" * 101]},
+    ],
+)
+def test_datos_de_alta_no_validos(formulario: dict[str, list[str]]) -> None:
+    with pytest.raises(ErrorFormulario):
+        datos_de_alta(formulario)
+
+
+@pytest.mark.parametrize(("texto", "version"), [("1", 1), (" 12 ", 12), ("007", 7)])
+def test_leer_version(texto: str, version: int) -> None:
+    assert leer_version(texto) == version
+
+
+@pytest.mark.parametrize("texto", ["", "0", "-1", "1.5", "²", "٣", "1" * 10, "v1"])
+def test_leer_version_no_valida(texto: str) -> None:
+    with pytest.raises(ErrorFormulario):
+        leer_version(texto)

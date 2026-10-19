@@ -263,3 +263,15 @@ def test_numeros_con_digitos_unicode_dan_422_y_no_500(cliente: ClienteASGI) -> N
     for campo in ("tope_llamadas_busqueda", "retardo_dominio_s"):
         respuesta = cliente.post("/ajustes", {campo: "²"}, cabeceras={"Origin": ORIGEN})
         assert respuesta.estado == 422
+
+
+def test_pedir_solo_tiendas_desconocidas_no_busca_en_todas() -> None:
+    # Quitar las desconocidas dejaba la lista vacía, que para la fuente significa «todas»: una
+    # URL con una tienda que no existe (o ya borrada) visitaba todas las tiendas y gastaba IA.
+    espia = FuenteEspia()
+    respuesta = ClienteASGI(crear_app(espia)).get(
+        "/buscar?texto=freno&tiendas=169.254.169.254&tiendas=no-dada-de-alta.es"
+    )
+    assert espia.consultas == []
+    assert respuesta.estado == 422
+    assert "Ninguna de las tiendas elegidas está dada de alta" in respuesta.texto
