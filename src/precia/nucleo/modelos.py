@@ -205,7 +205,7 @@ class LlamadaIA:
 @dataclass(slots=True)
 class Ajustes:
     proveedor: str = "api"
-    modelo_api: str = "claude-haiku"
+    modelo_api: str = "claude-haiku-5-5"
     modelo_local: str = "qwen2.5:7b-instruct-q4_K_M"
     presupuesto_mensual_usd: Decimal = Decimal("10")
     tope_llamadas_busqueda: int = 20
