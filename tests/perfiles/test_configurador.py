@@ -452,21 +452,27 @@ def test_el_reintento_ve_lo_que_propuso_la_ia() -> None:
 
 def test_los_formularios_de_la_portada_tienen_tope() -> None:
     # Una portada con decenas de «buscadores» no puede multiplicar las descargas (cada plantilla
-    # se prueba por HTTP y otra vez con Chromium).
+    # que responde se prueba por HTTP y otra vez con Chromium; las que dan 404, solo por HTTP).
     formularios = "".join(
         f'<form action="/buscar{n}"><input type="search" name="q"></form>' for n in range(40)
     )
     portada = pagina(PORTADA, f"<html><body>{formularios}</body></html>")
     plantillas = plantillas_de_formularios(portada, DOMINIO)
     assert plantillas == [f"{TIENDA}/buscar{n}?q={{consulta}}" for n in range(MAX_FORMULARIOS)]
+    # Los 40 responden (sin ser un listado): el peor caso, dos descargas por plantilla.
+    sin_resultados = "<html><body>Sin resultados</body></html>"
+    paginas = {f"{TIENDA}/buscar{n}?q=faro+golf": sin_resultados for n in range(40)}
     navegador = NavegadorFalso(
-        {PORTADA: portada.html}, paginas_js={}, redirecciones={f"https://{DOMINIO}/": PORTADA}
+        {PORTADA: portada.html, **paginas},
+        paginas_js={},
+        redirecciones={f"https://{DOMINIO}/": PORTADA},
     )
     motivo, peticiones = fallo(navegador, [])
     assert "búsqueda" in motivo
     # Como último recurso se pide una propuesta a la IA (aquí no responde): una sola petición.
     assert [p.esquema for p in peticiones] == [ESQUEMA_PLANTILLAS]
-    assert len(navegador.pedidas) == 1 + 2 * (MAX_FORMULARIOS + len(PATRONES))
+    # La portada, los formularios por HTTP y con Chromium y los patrones (404) solo por HTTP.
+    assert len(navegador.pedidas) == 1 + 2 * MAX_FORMULARIOS + len(PATRONES)
 
 
 @pytest.mark.parametrize(
@@ -528,3 +534,57 @@ def test_precio_de_otra_parte_de_la_ficha_se_rechaza_y_se_reintenta() -> None:
     assert "12,00 €" in peticiones[3].datos
     motivo, _ = fallo(redirigida(), [LISTADO_OK, engano, LISTADO_OK, engano])
     assert "12,00 €" in motivo
+
+
+# --- Retroalimentación y resumen de la página (prueba de generalidad, desguacesdli.com) -------
+
+
+def test_el_reintento_dice_que_selectores_no_aparecen_en_la_pagina() -> None:
+    # Las clases típicas de WooCommerce que la IA propuso sin haberlas visto en la página.
+    inventado = {
+        **LISTADO_OK,
+        "sel_titulo": "h2.woocommerce-loop-product__title",
+        "sel_enlace": "a.woocommerce-LoopProduct-link @href",
+    }
+    perfil, peticiones = ejecutar(redirigida(), [inventado, LISTADO_OK, CAMPOS_OK])
+    assert perfil.sel_titulo == LISTADO_OK["sel_titulo"]
+    reintento = peticiones[1].datos
+    assert (
+        "sel_titulo ('h2.woocommerce-loop-product__title') no aparece en ninguna parte de la "
+        "página: usa clases e id que estén en el HTML"
+    ) in reintento
+    assert "sel_enlace ('a.woocommerce-LoopProduct-link @href') no aparece" in reintento
+    # sel_resultado sí encaja: no se señala.
+    assert "sel_resultado ('#resultados > li.producto') no aparece" not in reintento
+    assert "sel_resultado encuentra 4 elementos" in reintento
+
+
+def test_las_instrucciones_explican_el_marcador_de_elementos_omitidos() -> None:
+    _, (listado, ficha) = ejecutar(redirigida(), [LISTADO_OK, CAMPOS_OK])
+    for peticion in (listado, ficha):
+        assert "elementos similares omitidos" in peticion.instrucciones
+
+
+def test_en_la_ficha_los_relacionados_no_quitan_sitio_al_producto() -> None:
+    # Una ficha grande con muchos productos relacionados al final: en el resumen de la ficha no
+    # se reserva sitio para ellos (eso es para el listado), así que el producto principal entra.
+    relleno = "".join(f'<div class="nota-{i}">Nota {i} de la tienda</div>' for i in range(450))
+    relacionados = (
+        '<ul class="relacionados">'
+        + "".join(
+            f'<li class="rel"><a href="/p/rel-{i}"><img src="/f/rel-{i}.jpg" alt="Relacionado {i}">'
+            f'</a><a class="nombre-rel" href="/p/rel-{i}">Producto relacionado número {i}</a>'
+            f'<span class="precio">{i},00 €</span><p class="extracto">{"texto " * 30}</p></li>'
+            for i in range(40)
+        )
+        + "</ul>"
+    )
+    sitio = paginas_sitio()
+    ficha = sitio[PRODUCTOS[0].url]
+    sitio[PRODUCTOS[0].url] = ficha.replace(
+        '<h1 class="titulo-producto">', relleno + '<h1 class="titulo-producto">'
+    ).replace("</body>", relacionados + "</body>")
+    navegador = NavegadorFalso(sitio, redirecciones={f"https://{DOMINIO}/": PORTADA})
+    _, (_, peticion_ficha) = ejecutar(navegador, [LISTADO_OK, CAMPOS_OK])
+    assert PRODUCTOS[0].referencia in peticion_ficha.datos
+    assert "elementos similares omitidos" in peticion_ficha.datos

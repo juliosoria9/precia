@@ -3,13 +3,15 @@ patrones → 🤖 IA, y el perfil `api_*` de WooCommerce y Shopify sin llamar a 
 
 import asyncio
 import time
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from precia.ia.simulado import Guion
 from precia.ia.tipos import IANoDisponible, PresupuestoAgotado
-from precia.navegador.tipos import Bloqueado
+from precia.navegador.tipos import Bloqueado, Pagina
 from precia.perfiles.configurador import AUTOR, COMPONENTE, configurar
 from precia.perfiles.descubrimiento import (
     ESQUEMA_PLANTILLAS,
@@ -22,6 +24,7 @@ from precia.perfiles.descubrimiento import (
     PATRONES,
     enlace_opensearch,
     leer_plantillas_ia,
+    parece_listado,
     plantilla_opensearch,
     plantillas_de_enlaces,
     resumen_portada,
@@ -32,6 +35,7 @@ from precia.perfiles.tipos import (
     ConfiguracionFallida,
     Perfil,
 )
+from precia.perfiles.validador import url_de_busqueda
 from tests.navegador.falsos import validar_con_dns_publico
 from tests.perfiles.plataformas import (
     SHOPIFY,
@@ -549,3 +553,127 @@ def test_formulario_que_envia_a_otra_web_no_es_una_pista_para_la_ia() -> None:
         NavegadorFalso(sitio), [{"plantillas": ["/buscar?q={consulta}"]}], dominio=f"www.{DOMINIO}"
     )
     assert peticiones == []
+
+
+# --- Sin repetir con Chromium lo que no puede cambiar ------------------------------------------
+
+BOOKS = "books.toscrape.com"
+BOOKS_PORTADA = f"https://{BOOKS}/"
+BOOKS_HTML = (
+    Path(__file__).parent.parent / "fixtures" / "reales" / "books_portada.html"
+).read_text(encoding="utf-8")
+
+
+@dataclass
+class NavegadorConEstados(NavegadorFalso):
+    """El sitio falso, pero algunas URL responden con un estado HTTP concreto (y una página)."""
+
+    estados: dict[str, int] = field(default_factory=dict)
+
+    async def obtener(self, url: str, *, js: bool = False) -> Pagina:
+        respuesta = await super().obtener(url, js=js)
+        estado = self.estados.get(respuesta.url)
+        if estado is None:
+            return respuesta
+        return pagina(respuesta.url, "<html><body><h1>Error</h1></body></html>", estado=estado)
+
+
+def test_books_real_sin_buscador_no_repite_con_chromium_los_404() -> None:
+    # Prueba real del 2026-10-20: books.toscrape.com no tiene buscador. Su portada ignora los
+    # parámetros (`/?s=...` da la portada con un 200) y lo demás da 404. Antes se repetían con
+    # Chromium las seis rutas habituales y el tope de 12 peticiones se agotaba sin preguntar.
+    woo = f"{BOOKS_PORTADA}?s=sapiens&post_type=product"
+    navegador = NavegadorFalso({BOOKS_PORTADA: BOOKS_HTML, woo: BOOKS_HTML}, paginas_js={})
+    sesion_ia, proveedor = sesion({COMPONENTE: [{"plantillas": ["/catalogue/?q={consulta}"]}]})
+    with pytest.raises(ConfiguracionFallida):
+        asyncio.run(
+            configurar(BOOKS, navegador, sesion_ia, "sapiens", validador=validar_con_dns_publico)
+        )
+    rutas = [url_de_busqueda(f"https://{BOOKS}{p}", "sapiens") for p in PATRONES]
+    propuesta = f"https://{BOOKS}/catalogue/?q=sapiens"
+    assert navegador.pedidas == [
+        (BOOKS_PORTADA, False),
+        # La portada sigue mirándose con Chromium: sin formulario de búsqueda en el HTML, el
+        # buscador puede montarlo un script (books llama a `search.init()`).
+        (BOOKS_PORTADA, True),
+        *((ruta, False) for ruta in rutas),
+        (woo, True),  # Dio 200: con JavaScript podría pintar los resultados.
+        (propuesta, False),
+    ]
+    assert len(proveedor.peticiones) == 1
+
+
+# La lista va escrita a mano: con `sorted(ESTADOS_DEFINITIVOS)`, quitar un estado del conjunto
+# quitaba también su caso y el test seguía en verde.
+@pytest.mark.parametrize("estado", [400, 404, 410, 414, 501])
+def test_estado_definitivo_por_http_no_se_repite_con_chromium(estado: int) -> None:
+    sitio = paginas_sitio(formulario=False, busqueda=None)
+    sitio[PORTADA] = SIN_BUSCADOR
+    primera = url_de_busqueda(TIENDA + PATRONES[0], CONSULTA)
+    sitio[primera] = html_listado()  # Con Chromium sería un listado, pero no se llega a pedir.
+    navegador = NavegadorConEstados(sitio, paginas_js={}, estados={primera: estado})
+    fallo_con(navegador, [{"plantillas": []}], dominio=f"www.{DOMINIO}")
+    assert (primera, False) in navegador.pedidas
+    assert (primera, True) not in navegador.pedidas
+
+
+# Un rechazo que no llega como `Bloqueado` (página grande o con señales de producto) tampoco se
+# repite con Chromium: insistir con un navegador real ante un «no» se parece a evadirlo (regla 5).
+@pytest.mark.parametrize("estado", [401, 403, 429, 451])
+def test_rechazo_por_http_no_se_repite_con_chromium(estado: int) -> None:
+    sitio = paginas_sitio(formulario=False, busqueda=None)
+    sitio[PORTADA] = SIN_BUSCADOR
+    primera = url_de_busqueda(TIENDA + PATRONES[0], CONSULTA)
+    sitio[primera] = html_listado()
+    navegador = NavegadorConEstados(sitio, paginas_js={}, estados={primera: estado})
+    fallo_con(navegador, [{"plantillas": []}], dominio=f"www.{DOMINIO}")
+    assert (primera, False) in navegador.pedidas
+    assert (primera, True) not in navegador.pedidas
+
+
+@pytest.mark.parametrize("estado", [200, 500, 502, 503, 504])
+def test_otros_estados_por_http_si_se_repiten_con_chromium(estado: int) -> None:
+    # Un 200 que no es un listado puede ser una tienda que pinta los resultados con JavaScript;
+    # un 5xx puede ser pasajero. Los bloqueos (403, 429...) ni llegan aquí: el navegador para.
+    sitio = paginas_sitio(formulario=False, busqueda=None)
+    sitio[PORTADA] = SIN_BUSCADOR
+    primera = url_de_busqueda(TIENDA + PATRONES[0], CONSULTA)
+    sitio[primera] = SIN_BUSCADOR
+    navegador = NavegadorConEstados(sitio, paginas_js={}, estados={primera: estado})
+    fallo_con(navegador, [{"plantillas": []}], dominio=f"www.{DOMINIO}")
+    assert (primera, True) in navegador.pedidas
+
+
+def test_un_404_con_resultados_pintados_no_es_un_listado() -> None:
+    # Por eso no se repite con Chromium: aunque el JavaScript pintara resultados sobre la página
+    # de error (el truco del 404.html de algunas SPA), el estado del documento sigue siendo 404.
+    listado = pagina(BUSQUEDA, html_listado(), estado=404)
+    assert not parece_listado(listado, DOMINIO, CONSULTA, portada=None)
+
+
+def test_404_de_la_propuesta_de_la_ia_tampoco_se_repite() -> None:
+    sitio = paginas_sitio(formulario=False, busqueda=None)
+    sitio[PORTADA] = SIN_BUSCADOR
+    navegador = NavegadorFalso(sitio, paginas_js={})
+    fallo_con(navegador, [{"plantillas": ["/contacto?q={consulta}"]}], dominio=f"www.{DOMINIO}")
+    assert (f"{TIENDA}/contacto?q=faro+golf", False) in navegador.pedidas
+    assert all(not js for url, js in navegador.pedidas if url != PORTADA)
+
+
+@pytest.mark.parametrize(
+    "respuesta",
+    [None, descriptor(url_os(f"{TIENDA}/sugerir?q={{searchTerms}}", "application/json"))],
+    ids=["descriptor-404", "solo-sugerencias"],
+)
+def test_descriptor_opensearch_que_no_vale_no_se_pide_otra_vez(respuesta: str | None) -> None:
+    # La portada declara OpenSearch, pero el descriptor da 404 o no trae una plantilla HTML, y no
+    # hay formularios ni enlaces: se mira la portada con Chromium, que trae el mismo `<link>` en
+    # la cabecera. Ese descriptor ya se pidió y no dio nada: pedirlo otra vez es el mismo fallo.
+    sitio = paginas_sitio(formulario=False, busqueda=None)
+    sitio[PORTADA] = con_cabeza(SIN_BUSCADOR, ENLACE_OPENSEARCH)
+    if respuesta is not None:
+        sitio[DESCRIPTOR] = respuesta
+    navegador = NavegadorFalso(sitio, paginas_js={})
+    fallo_con(navegador, [{"plantillas": []}], dominio=f"www.{DOMINIO}")
+    assert (PORTADA, True) in navegador.pedidas
+    assert navegador.urls.count(DESCRIPTOR) == 1

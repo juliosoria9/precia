@@ -397,3 +397,32 @@ def test_importes_de_maquina_que_no_son_ambiguos() -> None:
     assert leer_importe("1.5") == Precio(Decimal("1.5"), "EUR", "1.5")
     assert leer_importe("1500.000") == Precio(Decimal("1500.000"), "EUR", "1500.000")
     assert leer_importe(Decimal("1.095")) == Precio(Decimal("1.095"), "EUR", "1.095")
+
+
+def test_nombre_y_marca_en_un_enlace_son_su_texto_y_no_la_url() -> None:
+    # Caso real (webscraper.io): `<a href="/…/product/31" itemprop="name">Packard 255 G2</a>`.
+    # Por la regla de los microdatos el valor de un `<a>` es su `href`, pero `name` y `brand`
+    # son texto: una ruta no es el nombre de nada.
+    html = _microdatos(
+        '<a href="/p/31" itemprop="name">Faro Golf</a>'
+        '<a href="/marca/hella" itemprop="brand">Hella</a>'
+        '<div itemprop="brand" itemscope itemtype="https://schema.org/Brand">'
+        '<a href="/marca/valeo" itemprop="name">Valeo</a></div>'
+    )
+    producto = _producto(html)
+    assert producto is not None
+    assert (producto.nombre, producto.marca) == ("Faro Golf", "Hella")
+    html = _microdatos(
+        '<img src="/faro.jpg" itemprop="name"><span itemprop="name">Faro Golf</span>'
+        '<div itemprop="brand" itemscope itemtype="https://schema.org/Brand">'
+        '<a href="/marca/valeo" itemprop="name">Valeo</a></div>'
+    )
+    producto = _producto(html)
+    assert producto is not None
+    # Una imagen no tiene texto: no da nombre, y se pasa a la siguiente propiedad.
+    assert (producto.nombre, producto.marca) == ("Faro Golf", "Valeo")
+    # Con `content`, manda `content` como en cualquier otro elemento.
+    html = _microdatos('<a href="/p/31" itemprop="name" content="Faro Golf VI">Faro</a>')
+    producto = _producto(html)
+    assert producto is not None
+    assert producto.nombre == "Faro Golf VI"

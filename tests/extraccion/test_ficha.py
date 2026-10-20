@@ -279,7 +279,8 @@ def test_jsonld_tiene_prioridad_sobre_el_perfil() -> None:
 
 
 def test_titulo_de_respaldo() -> None:
-    assert _extraer(_pagina("<title> Faro | Tienda </title>"), ()).titulo == "Faro | Tienda"
+    # « | Tienda» es el nombre del sitio (el dominio es tienda.es): se quita.
+    assert _extraer(_pagina("<title> Faro | Tienda </title>"), ()).titulo == "Faro"
     html = '<meta property="og:title" content="Faro OG"><title>T</title>'
     assert _extraer(_pagina(html), ()).titulo == "Faro OG"
     assert _extraer(_pagina("<h1>Faro H1</h1><title>T</title>"), ()).titulo == "Faro H1"
@@ -432,11 +433,13 @@ def test_precio_absurdo_en_los_metadatos_pasa_al_perfil() -> None:
     assert ficha.campos["precio"] == ValorCampo("45,90 €", OrigenDato.PERFIL, confianza=0.9)
 
 
-def test_titulo_desde_los_microdatos_si_no_hay_h1() -> None:
+def test_titulo_desde_los_microdatos_antes_que_el_h1() -> None:
     html = _microdatos('<span itemprop="name">Faro Golf</span>') + "<title>Tienda</title>"
     assert _extraer(_pagina(html), ()).titulo == "Faro Golf"
-    html = "<h1>Faro H1</h1>" + html
-    assert _extraer(_pagina(html), ()).titulo == "Faro H1"
+    # El `<h1>` puede ser el del sitio (webscraper.io pone «Test Sites» en todas las páginas);
+    # el nombre de los microdatos es el que la tienda declara para el producto.
+    html = "<h1>Novedades</h1>" + html
+    assert _extraer(_pagina(html), ()).titulo == "Faro Golf"
 
 
 def test_los_microdatos_de_los_relacionados_no_dan_el_precio_de_la_ficha() -> None:

@@ -1,16 +1,24 @@
 """Validador de perfiles: selectores admitidos, búsqueda real, listado y fichas con precio."""
 
 import asyncio
+import time
 from typing import Any
 
 import pytest
 
+from precia.extraccion.dom import analizar
 from precia.ia.servicio import SesionIA as SesionReal
 from precia.navegador.navegador import Navegador as NavegadorReal
 from precia.navegador.tipos import Bloqueado, ErrorDescarga, ProhibidoPorRobots, URLNoPermitida
 from precia.perfiles.protocolos import Navegador, SesionIA
 from precia.perfiles.tipos import TIPO_API_SHOPIFY, InformeValidacion, Perfil
-from precia.perfiles.validador import MAX_FICHAS, resumir, url_de_busqueda, validar
+from precia.perfiles.validador import (
+    MAX_FICHAS,
+    resumir,
+    selectores_ausentes,
+    url_de_busqueda,
+    validar,
+)
 from tests.navegador.falsos import validar_con_dns_publico
 from tests.perfiles.plataformas import (
     SHOPIFY_API,
@@ -440,3 +448,90 @@ def test_bloqueo_en_la_api_se_propaga() -> None:
     navegador = NavegadorFalso(paginas_woo(), errores={WOO_API: Bloqueado(WOO_API, "DataDome")})
     with pytest.raises(Bloqueado):
         ejecutar(perfil_api(), navegador)
+
+
+# --- Selectores que no aparecen en la página (retroalimentación para el reintento de la IA) ----
+
+
+@pytest.mark.parametrize(
+    ("cambios", "esperado"),
+    [
+        # Las clases típicas de WooCommerce que Claude se inventó en desguacesdli.com.
+        (
+            {"sel_resultado": "ul.brx-query-trail li.product"},
+            "sel_resultado ('ul.brx-query-trail li.product') no aparece en ninguna parte de la "
+            "página",
+        ),
+        (
+            {"sel_titulo": "h2.woocommerce-loop-product__title"},
+            "sel_titulo ('h2.woocommerce-loop-product__title') no aparece en ninguna parte de la "
+            "página",
+        ),
+        (
+            {"sel_enlace": "a.woocommerce-LoopProduct-link @href"},
+            "sel_enlace ('a.woocommerce-LoopProduct-link @href') no aparece en ninguna parte de "
+            "la página",
+        ),
+        # Existe, pero fuera de los resultados.
+        (
+            {"sel_titulo": "h1"},
+            "sel_titulo ('h1') aparece en la página, pero no dentro de ningún elemento de "
+            "sel_resultado",
+        ),
+        # Existe, pero sin el atributo que se lee.
+        (
+            {"sel_enlace": "a.enlace @data-ficha"},
+            "sel_enlace ('a.enlace @data-ficha'): hay elementos, pero ninguno tiene el atributo "
+            "data-ficha",
+        ),
+    ],
+)
+def test_el_problema_dice_que_selector_no_aparece(cambios: dict[str, str], esperado: str) -> None:
+    informe = ejecutar(perfil(**cambios), NavegadorFalso(paginas_sitio()))
+    assert not informe.valido
+    assert any(esperado in p for p in informe.problemas), informe.problemas
+
+
+def test_los_selectores_que_si_aparecen_no_se_senalan() -> None:
+    # Solo falla sel_titulo: de los demás no se dice nada.
+    informe = ejecutar(perfil(sel_titulo="h2.no-existe"), NavegadorFalso(paginas_sitio()))
+    senalados = [p for p in informe.problemas if "no aparece" in p or "pero" in p]
+    assert any(p.startswith("sel_titulo ('h2.no-existe')") for p in senalados)
+    assert not any(p.startswith(("sel_resultado (", "sel_enlace (")) for p in senalados)
+
+
+def test_precio_del_listado_que_no_aparece_se_senala_aunque_el_perfil_valga() -> None:
+    informe = ejecutar(
+        perfil(sel_precio_listado="span.precio-inexistente"), NavegadorFalso(paginas_sitio())
+    )
+    assert informe.valido
+    assert any(
+        "sel_precio_listado ('span.precio-inexistente') no aparece en ninguna parte" in p
+        for p in informe.problemas
+    )
+
+
+@pytest.mark.parametrize(
+    "hostil",
+    [
+        '<div class="r"><span>t</span><a href="/p">x</a></div>' * 40_000,
+        "<h1>t</h1>" + '<div class="r">' * 20_000 + "<a href='/p'>x</a>",
+    ],
+    ids=["hermanos", "anidamiento"],
+)
+def test_selectores_ausentes_con_html_hostil(hostil: str) -> None:
+    raiz = analizar(hostil)
+    sitio = perfil(sel_resultado="div.r", sel_titulo="h1", sel_enlace="a.no @href")
+    inicio = time.perf_counter()
+    problemas = selectores_ausentes(raiz, sitio)
+    assert time.perf_counter() - inicio < 3
+    assert any(p.startswith("sel_enlace ('a.no @href') no aparece") for p in problemas)
+
+
+def test_atributo_de_un_resultado_que_no_existe_no_dice_que_hay_elementos() -> None:
+    # «@href» se lee del propio resultado: si sel_resultado no encuentra nada, no hay elementos.
+    raiz = analizar('<div class="r"><a href="/p">x</a></div>')
+    sitio = perfil(sel_resultado="li.no-existe", sel_titulo="a", sel_enlace="@href")
+    problemas = selectores_ausentes(raiz, sitio)
+    assert any(p.startswith("sel_resultado ('li.no-existe') no aparece") for p in problemas)
+    assert not any("hay elementos" in p for p in problemas), problemas

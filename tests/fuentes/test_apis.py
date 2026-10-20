@@ -10,6 +10,7 @@ from urllib.parse import quote_plus
 
 import pytest
 
+from precia.emparejado.referencias import normalizar_referencia
 from precia.fuentes.apis import (
     AVISO_AGOTADO,
     ofertas_api,
@@ -220,7 +221,8 @@ def test_woocommerce_sin_precio_y_sku_interno(fichas_woo: list[Any]) -> None:
 
 
 def test_woocommerce_solo_los_campos_pedidos() -> None:
-    (ficha,) = _woo(_producto_woo(sku="5K1941005"), campos=("marca", "referencia_oem", "color"))
+    producto = _producto_woo(name="Faro Golf 5K1941005", sku="5K1941005")
+    (ficha,) = _woo(producto, campos=("marca", "referencia_oem", "color"))
     assert set(ficha.campos) == {"referencia_oem"}
     assert ficha.precio is not None  # El precio de la oferta se da siempre.
     assert any("color" in aviso for aviso in ficha.avisos)
@@ -287,7 +289,9 @@ def test_woocommerce_precio_raro_no_da_precio(precios: object) -> None:
     ],
 )
 def test_woocommerce_sku_solo_si_parece_referencia(sku: object, esperada: str | None) -> None:
-    (ficha,) = _woo(_producto_woo(sku=sku))
+    """Aunque el título corrobore el SKU, tiene que tener forma de referencia OEM."""
+    titulo = f"Faro Golf {sku}"[:300] if isinstance(sku, str) else "Faro Golf"
+    (ficha,) = _woo(_producto_woo(name=titulo, sku=sku))
     assert ficha.campos.get("referencia_oem") == (_api(esperada) if esperada else None)
 
 
@@ -414,6 +418,8 @@ def test_shopify_suggest_producto(fichas_suggest: list[Any]) -> None:
     assert (faro.precio.importe, faro.precio.moneda) == (Decimal("89.90"), "EUR")
     assert faro.campos == {
         "precio": _api("89,90 €"),
+        # El buscador predictivo no trae SKU: la OEM sale de la etiqueta de la descripción.
+        "referencia_oem": _api("5K1941005"),
         "marca": _api("Hella"),
         "estado": _api("Usado"),
         "descripcion": _api(
@@ -496,7 +502,10 @@ def test_shopify_js_variante_disponible_y_opcion_de_estado() -> None:
         {"id": 2, "sku": "1T0857508A", "price": 4200, "available": True},
     ]
     opciones = [{"name": "Estado", "position": 1, "values": ["Reacondicionado"]}]
-    (ficha,) = _js(_producto_js(variants=variantes, options=opciones))
+    descripcion = "<p>Ref. original 1T0857508 (con tapa) o 1T0857508A (sin tapa).</p>"
+    producto = _producto_js(variants=variantes, options=opciones, description=descripcion)
+    producto["title"] = "Retrovisor Seat León 1T0857508A"
+    (ficha,) = _js(producto)
     assert ficha.precio is not None
     assert ficha.precio.importe == Decimal("42.00")
     assert ficha.campos["referencia_oem"] == _api("1T0857508A")
@@ -669,7 +678,9 @@ def test_shopify_js_referencia_solo_de_la_variante_elegida() -> None:
 
 
 def test_shopify_js_sin_variantes_con_precio_usa_la_unica_variante() -> None:
-    (ficha,) = _js(_producto_js(price=8990, variants=[{"id": 1, "sku": "5K1941005"}]))
+    producto = _producto_js(title="Faro Golf 5K1941005", price=8990)
+    producto["variants"] = [{"id": 1, "sku": "5K1941005"}]
+    (ficha,) = _js(producto)
     assert ficha.campos["referencia_oem"] == _api("5K1941005")
 
 
@@ -697,3 +708,249 @@ def test_productos_repetidos_con_html_pesado_no_se_reprocesan(plataforma: Plataf
     fichas = ofertas_api(plataforma, pagina, dominio, TODOS)
     assert time.perf_counter() - inicio < 1.5
     assert len(fichas) == 1
+
+
+# --- SKU interno frente a referencia OEM (prueba real de generalidad) -------------------------
+
+REALES = Path(__file__).parent.parent / "fixtures" / "reales"
+VELAZQUEZ = "desguacesvelazquez.com"
+URL_VELAZQUEZ = (
+    "https://www.desguacesvelazquez.com/wp-json/wc/store/v1/products?search=faro&per_page=10"
+)
+
+
+@pytest.fixture(scope="module")
+def fichas_velazquez() -> list[Any]:
+    texto = (REALES / "velazquez_api_woocommerce_faro.json").read_text(encoding="utf-8")
+    return ofertas_api(Plataforma.WOOCOMMERCE, _pagina(texto, URL_VELAZQUEZ), VELAZQUEZ, TODOS)
+
+
+def test_velazquez_real_el_sku_del_desguace_no_es_la_oem(fichas_velazquez: list[Any]) -> None:
+    """La Store API real de un desguace: `sku` es su código de stock («DESP220618»).
+
+    La OEM del fabricante viene en el atributo «Ref.Fabricante»; «Ref.Local» (220618) es el
+    mismo código de stock sin prefijo y «Ref.Equivalente», una referencia de recambio
+    alternativo. Ninguna de esas dos, ni el SKU, puede salir como OEM.
+    """
+    texto = (REALES / "velazquez_api_woocommerce_faro.json").read_text(encoding="utf-8")
+    skus = {p["sku"] for p in json.loads(texto)}
+    assert len(fichas_velazquez) == 10
+    referencias = [f.campos["referencia_oem"].valor for f in fichas_velazquez]
+    assert not skus & set(referencias)
+    assert referencias == [
+        "260107244r",
+        "8200002469",
+        "260606152R",
+        "8200002470",
+        "9682828280",
+        "8K0941004",
+        "260107249",
+        "260605720r",
+        "90114430",
+        "90114431",
+    ]
+    assert all(f.campos["referencia_oem"].origen is OrigenDato.API for f in fichas_velazquez)
+
+
+def test_woocommerce_sku_sin_corroborar_no_es_oem() -> None:
+    """Un SKU con forma de referencia pero que no aparece en ningún otro sitio es interno."""
+    (ficha,) = _woo(_producto_woo(sku="DESP220618", description="<p>Faro usado.</p>"))
+    assert "referencia_oem" not in ficha.campos
+
+
+@pytest.mark.parametrize(
+    "descripcion",
+    [
+        "<p>[getpid sku=&#8221;5K1941005&#8243;]</p>",
+        "<p>SKU: 5K1941005</p>",
+        "<p>Ref. interna 5K1941005</p>",
+        "<p>Código de almacén 5K1941005</p>",
+        "<p>No original 5K1941005</p>",
+    ],
+)
+def test_woocommerce_sku_en_el_texto_sin_etiqueta_oem_no_cuenta(descripcion: str) -> None:
+    (ficha,) = _woo(_producto_woo(sku="5K1941005", description=descripcion))
+    assert "referencia_oem" not in ficha.campos
+
+
+@pytest.mark.parametrize(
+    "descripcion",
+    [
+        "<p>Referencia OEM 5K1941005.</p>",
+        "<p>Ref. original: 5K1-941-005</p>",
+        "<p>OEM: 5K1941005</p>",
+        "<p>Ref. fabricante 5K1941005, probado.</p>",
+        "<p>Part number #5K1941005</p>",
+        "<p>Nº de pieza 5K1941005</p>",
+        "<p>Código del fabricante: 5K1941005</p>",
+    ],
+)
+def test_woocommerce_sku_corroborado_en_el_texto_como_oem(descripcion: str) -> None:
+    (ficha,) = _woo(_producto_woo(sku="5K1941005", description=descripcion))
+    assert normalizar_referencia(ficha.campos["referencia_oem"].valor) == "5K1941005"
+
+
+def test_woocommerce_sku_corroborado_en_el_titulo() -> None:
+    (ficha,) = _woo(_producto_woo(name="Faro Golf VI 5K1 941 005", sku="5K1941005"))
+    assert ficha.campos["referencia_oem"] == _api("5K1941005")
+
+
+@pytest.mark.parametrize(
+    "nombre",
+    [
+        "Ref.Fabricante",
+        "Referencia del fabricante",
+        "Código de fabricante",
+        "Cód. fabricante",
+        "Nº OEM",
+        "OEM",
+        "Referencia OE",
+        "Part Number",
+        "MPN",
+        "Ref. original",
+        "Número de pieza",
+    ],
+)
+def test_woocommerce_atributo_oem_gana_al_sku_interno(nombre: str) -> None:
+    atributos = [{"id": 0, "name": nombre, "terms": [{"id": 0, "name": "260107244R"}]}]
+    (ficha,) = _woo(_producto_woo(sku="DESP220618", attributes=atributos))
+    assert ficha.campos["referencia_oem"] == _api("260107244R")
+
+
+@pytest.mark.parametrize(
+    "nombre",
+    [
+        "Ref.Local",
+        "Ref.Equivalente",
+        "Ref. interna",
+        "Referencia OEM equivalente",
+        "Referencias compatibles",
+        "Bastidor",
+        "Código Motor",
+        "Marca fabricante",
+        "Fabricante",
+    ],
+)
+def test_woocommerce_atributos_que_no_son_la_oem(nombre: str) -> None:
+    atributos = [{"id": 0, "name": nombre, "terms": [{"id": 0, "name": "260107244R"}]}]
+    (ficha,) = _woo(_producto_woo(sku="DESP220618", attributes=atributos))
+    assert "referencia_oem" not in ficha.campos
+
+
+@pytest.mark.parametrize(
+    ("descripcion", "esperada"),
+    [
+        ("<p>Faro usado. Ref. original 1K0 698 151.</p>", "1K0 698 151"),
+        ("<p>Referencia OEM: 0 986 494 527</p>", "0 986 494 527"),
+        ("<p>OEM 5K1941005 / 5K1941006</p>", "5K1941005"),
+        ("<p>Ref. original 2015</p>", None),
+        ("<p>Referencia OEM: consultar</p>", None),
+        ("<p>Faro para Golf VI 5K1941005</p>", None),
+    ],
+)
+def test_woocommerce_oem_etiquetada_en_la_descripcion_sin_sku(
+    descripcion: str, esperada: str | None
+) -> None:
+    (ficha,) = _woo(_producto_woo(sku="", short_description=descripcion))
+    assert ficha.campos.get("referencia_oem") == (_api(esperada) if esperada else None)
+
+
+def test_shopify_js_sku_interno_sin_corroborar_no_es_oem() -> None:
+    variantes = [{"id": 1, "sku": "RR000123X", "price": 4500, "available": True}]
+    (ficha,) = _js(_producto_js(variants=variantes, description="<p>Retrovisor usado.</p>"))
+    assert "referencia_oem" not in ficha.campos
+
+
+def test_shopify_js_sku_corroborado_en_el_titulo() -> None:
+    variantes = [{"id": 1, "sku": "6J1857507", "price": 4500, "available": True}]
+    (ficha,) = _js(_producto_js(title="Retrovisor Seat Ibiza 6J1857507", variants=variantes))
+    assert ficha.campos["referencia_oem"] == _api("6J1857507")
+
+
+def test_shopify_js_oem_del_texto_no_se_pega_a_otra_variante() -> None:
+    """Con varias variantes, la OEM de la descripción puede ser la de la otra pieza."""
+    variantes = [
+        {"id": 1, "title": "Izquierdo", "sku": "RR0001A", "price": 8990, "available": True},
+        {"id": 2, "title": "Derecho", "sku": "RR0001B", "price": 9500, "available": True},
+    ]
+    descripcion = "<p>Derecho: ref. original 5K1941006.</p>"
+    (ficha,) = _js(_producto_js(variants=variantes, description=descripcion))
+    assert "referencia_oem" not in ficha.campos
+
+
+def test_oem_etiquetada_con_texto_hostil_en_tiempo_acotado() -> None:
+    hostiles = [
+        "ref. original " * 2_000,
+        "Referencia OEM: " + "5K1-" * 3_000,
+        "oem " * 3_000 + "5K1941005",
+        "nº " * 3_000,
+        ":" * 20_000,
+        "Referencia OEM 1 2 3 4 5 6 7 8 9 2015 " * 500,
+        "N.º de pieza " + " 698" * 5_000,
+    ]
+    inicio = time.perf_counter()
+    for texto in hostiles:
+        _woo(_producto_woo(sku="5K1941005", description=texto, short_description=texto))
+    assert time.perf_counter() - inicio < 2
+
+
+@pytest.mark.parametrize(
+    ("descripcion", "esperada"),
+    [
+        ("<p>Ref. original 0 986 494 527 2015</p>", "0 986 494 527"),
+        ("<p>N.º de pieza: 5K1941005</p>", "5K1941005"),
+        ("<p>OEM number: 5K1941005</p>", "5K1941005"),
+    ],
+)
+def test_woocommerce_oem_etiquetada_casos_de_borde(descripcion: str, esperada: str) -> None:
+    (ficha,) = _woo(_producto_woo(description=descripcion))
+    assert ficha.campos["referencia_oem"] == _api(esperada)
+
+
+def test_woocommerce_producto_variable_no_toma_la_oem_del_texto() -> None:
+    """Un producto variable (izquierdo y derecho) da el precio de una variación cualquiera."""
+    producto = _producto_woo(
+        type="variable",
+        variations=[{"id": 2, "attributes": []}, {"id": 3, "attributes": []}],
+        description="<p>Derecho: ref. original 5K1941006.</p>",
+    )
+    (ficha,) = _woo(producto)
+    assert "referencia_oem" not in ficha.campos
+
+
+# --- Revisión adversarial del fallo 3 ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "nombre",
+    [
+        "Código color fabricante",
+        "Código de pintura del fabricante",
+        "Número de serie del fabricante",
+        "Código motor fabricante",
+        "Código EAN fabricante",
+        "Número de bastidor del fabricante",
+    ],
+)
+def test_woocommerce_otros_codigos_del_fabricante_no_son_la_oem(nombre: str) -> None:
+    """Color, motor, serie, EAN o bastidor «del fabricante» no son la referencia de la pieza."""
+    atributos = [{"id": 0, "name": nombre, "terms": [{"id": 0, "name": "NV676X12"}]}]
+    (ficha,) = _woo(_producto_woo(sku="DESP220618", attributes=atributos))
+    assert "referencia_oem" not in ficha.campos
+
+
+def test_woocommerce_oem_etiquetada_no_pega_dos_referencias_con_barra() -> None:
+    """«5K1941005/5K1941006» son dos referencias, no una de 18 caracteres."""
+    (ficha,) = _woo(_producto_woo(description="<p>Ref. original 5K1941005/5K1941006</p>"))
+    assert ficha.campos["referencia_oem"] == _api("5K1941005")
+
+
+def test_shopify_js_sku_de_la_variante_corroborado_en_la_descripcion() -> None:
+    """Con varias variantes, el SKU elegido vale si la descripción lo da como OEM."""
+    variantes = [
+        {"id": 1, "sku": "5K1941005", "price": 8990, "available": True},
+        {"id": 2, "sku": "5K1941006", "price": 9500, "available": True},
+    ]
+    descripcion = "<p>Izquierdo: ref. original 5K1941005. Derecho: ref. original 5K1941006.</p>"
+    (ficha,) = _js(_producto_js(title="Faro Golf VI", variants=variantes, description=descripcion))
+    assert ficha.campos["referencia_oem"] == _api("5K1941005")

@@ -62,7 +62,7 @@ from precia.perfiles.validador import (
     TIPO_DE_PLATAFORMA,
     de_la_tienda,
     problema_selector,
-    problema_sin_resultados,
+    problemas_sin_resultados,
     resumir,
     validar,
 )
@@ -86,7 +86,10 @@ SUBCONJUNTO_CSS = (
     "No se admiten otros combinadores (+, ~), otras pseudoclases (:has, :not, :nth-child, "
     ":contains...), pseudoelementos ni XPath. Para leer un atributo en lugar del texto, añade "
     "al final un espacio y @atributo, por ejemplo «a.nombre @href» o «img.foto @src». Prefiere "
-    "clases e id estables a las posiciones."
+    "clases e id estables a las posiciones. Usa solo clases, id y atributos que aparezcan en el "
+    "HTML de los datos: no supongas los habituales de la plataforma.\n"
+    "En ese HTML, «<!-- N elementos similares omitidos -->» ocupa el lugar de N hermanos con la "
+    "misma estructura que los anteriores, quitados para ahorrar espacio."
 )
 INSTRUCCIONES_LISTADO = (
     "Eres el configurador de perfiles de PrecIA. Los datos son el HTML simplificado de la "
@@ -290,8 +293,8 @@ class _Configuracion:
         perfil = self.perfil(listado, {})
         resultados = extraer_listado(self.busqueda.pagina, perfil)
         if not resultados:
-            propuesta.problemas.append(
-                problema_sin_resultados(self.busqueda.pagina, perfil, self.consulta)
+            propuesta.problemas.extend(
+                problemas_sin_resultados(self.busqueda.pagina, perfil, self.consulta)
             )
             return propuesta
         ficha = await self.primera_ficha(resultados)
@@ -361,7 +364,7 @@ class _Configuracion:
             PeticionIA(
                 componente=COMPONENTE,
                 instrucciones=_instrucciones(INSTRUCCIONES_FICHA + lista + "\n", anterior),
-                datos=datos_para_ia(ficha, anterior_de(anterior)),
+                datos=datos_para_ia(ficha, anterior_de(anterior), listado=False),
                 esquema=esquema_campos(pedidos),
                 max_tokens=512,
             )
@@ -484,11 +487,12 @@ def anterior_de(propuesta: _Propuesta | None) -> Anterior | None:
     return Anterior(propuesta.propuesto, propuesta.problemas)
 
 
-def datos_para_ia(pagina: Pagina, anterior: Anterior | None = None) -> str:
+def datos_para_ia(pagina: Pagina, anterior: Anterior | None = None, *, listado: bool = True) -> str:
     """Datos de la petición: el intento anterior (si lo hay) y el resumen de la página.
 
     El intento anterior va delante para que, si los datos se recortan, se pierda el final de la
-    página y no los problemas.
+    página y no los problemas. `listado` va a `resumen_para_ia`: en una ficha (`False`) no se
+    reserva sitio para la serie de productos relacionados.
     """
     partes: list[str] = []
     if anterior is not None:
@@ -498,5 +502,6 @@ def datos_para_ia(pagina: Pagina, anterior: Anterior | None = None) -> str:
         if anterior.problemas:
             lista = "\n".join(f"- {p}" for p in anterior.problemas[:MAX_PROBLEMAS_IA])
             partes.append(f"PROBLEMAS DETECTADOS:\n{lista}")
-    partes.append(f"PÁGINA ({pagina.url_final or pagina.url}):\n{resumen_para_ia(pagina.html)}")
+    resumen = resumen_para_ia(pagina.html, listado=listado)
+    partes.append(f"PÁGINA ({pagina.url_final or pagina.url}):\n{resumen}")
     return "\n\n".join(partes)

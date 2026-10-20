@@ -18,9 +18,10 @@ contra el texto visible de la página:
 """
 
 import re
-from collections.abc import Sequence
+import unicodedata
+from collections.abc import Iterator, Sequence
 from decimal import ROUND_HALF_UP, Decimal
-from urllib.parse import urldefrag, urljoin
+from urllib.parse import urldefrag, urljoin, urlsplit
 
 from precia.extraccion.anclaje import anclado
 from precia.extraccion.dom import Nodo, analizar
@@ -51,9 +52,23 @@ MAX_TEXTO_IA = 60_000
 """Texto de la página que se pasa al extractor de IA (el paquete `ia` recorta aún más)."""
 MAX_VALOR = 5_000
 MAX_TITULO = 300
+"""El título es texto de la web: lo usan el emparejado y la web, así que no crece sin límite."""
+MAX_TITULO_BRUTO = 2_000
+"""Lo que se mira de cada candidato a título antes de limpiarlo y recortarlo a `MAX_TITULO`."""
+MAX_H1 = 20
+"""`<h1>` que se miran como candidatos a título; una ficha real tiene uno o dos."""
+MIN_NOMBRE_SITIO = 3
+"""Un nombre de sitio de una o dos letras («tv», «es») coincidiría con cualquier cosa."""
 MAX_PALABRA = 100
 _ESPACIOS = re.compile(r"\s+")
 _IMPORTE_MAQUINA = re.compile(r"\d{1,12}(?:\.\d{1,6})?")
+_SEPARADOR_TITULO = re.compile(" (?:[|\\-\u2013\u2014\u00b7\u00bb]|::) ")
+"""Barra, guion, semirraya, raya, punto medio, «»» o «::», con un espacio a cada lado.
+
+El texto llega con los espacios ya normalizados (uno solo), así que basta un espacio literal y la
+búsqueda es lineal."""
+_CABECERAS = frozenset({"header", "footer"})
+_SECCIONES = frozenset({"article", "main", "section", "aside"})
 
 
 async def extraer_ficha(
@@ -121,17 +136,34 @@ class _Extraccion:
         return tuple(validos)
 
     def titulo(self) -> str:
-        candidatos: list[str | None] = [self.producto.nombre if self.producto else None]
+        """Nombre del producto: el primer candidato que no sea el nombre del sitio, limpio.
+
+        Orden: el producto estructurado (JSON-LD y luego microdatos u OpenGraph de producto),
+        que es el nombre que la tienda declara para *este* producto; el selector del perfil; y
+        solo al final el `<h1>`, el `og:title` suelto y el `<title>`, que en muchos temas son
+        los del sitio (webscraper.io pone «Test Sites» en el `<h1>` de todas sus fichas). De
+        cada candidato se quita el nombre del sitio de los extremos («Faro | Tienda» → «Faro»)
+        y uno que solo sea ese nombre se salta. Si no queda ninguno, `""`: mejor sin título que
+        con el del sitio.
+        """
+        sitio = _nombres_del_sitio(self.raiz, self.url)
+        for candidato in self._candidatos_titulo():
+            if candidato and (limpio := _sin_nombre_del_sitio(candidato, sitio)):
+                return limpio
+        return ""
+
+    def _candidatos_titulo(self) -> Iterator[str | None]:
+        """Los candidatos a título, del más fiable al menos; se generan solo hasta el bueno."""
+        yield self.producto.nombre if self.producto else None
+        yield self.metadatos.nombre if self.metadatos else None
         if self.perfil is not None and "titulo" in self.perfil.sel_campos:
             try:
-                candidatos.append(extraer_valor(self.raiz, self.perfil.sel_campos["titulo"]))
+                yield extraer_valor(self.raiz, self.perfil.sel_campos["titulo"])
             except SelectorNoValido as error:
                 self.avisos.append(f"Selector del perfil para «titulo» no válido: {error}")
-        candidatos.append(_primer_texto(self.raiz, "h1"))
-        candidatos.append(self.metadatos.nombre if self.metadatos else None)
-        candidatos.append(_meta(self.raiz, "og:title"))
-        candidatos.append(_primer_texto(self.raiz, "title"))
-        return next((_recortar(c, MAX_TITULO) for c in candidatos if c), "")
+        yield from _encabezados(self.raiz)
+        yield _meta(self.raiz, "og:title")
+        yield _primer_texto(self.raiz, "title")
 
     def anotar(self, campo: str, valor: str, origen: OrigenDato, es_anclado: bool) -> None:
         confianza = CONFIANZA[origen] if es_anclado else CONFIANZA_NO_ANCLADO
@@ -339,13 +371,112 @@ def _primer_texto(raiz: Nodo, etiqueta: str) -> str | None:
     return None
 
 
-def _meta(raiz: Nodo, propiedad: str) -> str | None:
+def _meta(raiz: Nodo, propiedad: str, atributo: str = "property") -> str | None:
     for nodo in raiz.descendientes():
-        if nodo.etiqueta == "meta" and nodo.atributo("property") == propiedad:
+        if nodo.etiqueta == "meta" and nodo.atributo(atributo) == propiedad:
             contenido = (nodo.atributo("content") or "").strip()
             if contenido:
                 return contenido
     return None
+
+
+# --- Título -------------------------------------------------------------------------------------
+
+
+def _encabezados(raiz: Nodo) -> Iterator[str]:
+    """Textos de los `<h1>` que no están en la cabecera, el menú o el pie de la página.
+
+    El `<h1>` de la cabecera suele ser el logotipo del sitio (`<header><h1><a href="/">…`). Se
+    miran como mucho `MAX_H1` (cada uno sube por sus antepasados, hasta `dom.MAX_PROFUNDIDAD`).
+    """
+    vistos = 0
+    for nodo in raiz.descendientes():
+        if nodo.etiqueta != "h1":
+            continue
+        vistos += 1
+        if vistos > MAX_H1:
+            return
+        if not _en_zona_del_sitio(nodo) and (texto := nodo.texto()):
+            yield texto
+
+
+def _en_zona_del_sitio(nodo: Nodo) -> bool:
+    """Si `nodo` está en el menú, o en la cabecera o el pie *del sitio*.
+
+    Como en HTML5, un `<header>` o `<footer>` dentro de `<article>`, `<main>`, `<section>` o
+    `<aside>` es el de esa sección (muchos temas ponen ahí el nombre del producto), no el del sitio.
+    """
+    en_cabecera = False
+    padre = nodo.padre
+    while padre is not None:
+        if padre.etiqueta == "nav":
+            return True
+        if padre.etiqueta in _CABECERAS:
+            en_cabecera = True
+        elif padre.etiqueta in _SECCIONES:
+            return False
+        padre = padre.padre
+    return en_cabecera
+
+
+def _nombres_del_sitio(raiz: Nodo, url: str) -> frozenset[str]:
+    """Claves (ver `_clave`) del nombre del sitio: `og:site_name`, `application-name` y dominio.
+
+    Del dominio valen el nombre entero sin `www.` («desguacespepe.es») y su etiqueta más larga
+    sin el TLD («desguacespepe»), que es como suele llamarse la tienda en sus títulos.
+    """
+    nombres = [_meta(raiz, "og:site_name"), _meta(raiz, "application-name", "name")]
+    try:
+        host = (urlsplit(url).hostname or "").removeprefix("www.")
+    except ValueError:
+        host = ""
+    if host:
+        etiquetas = host.split(".")
+        nombres += [host, max(etiquetas[:-1] or etiquetas, key=len)]
+    claves = (_clave(n[:MAX_TITULO_BRUTO]) for n in nombres if n)
+    return frozenset(c for c in claves if len(c) >= MIN_NOMBRE_SITIO)
+
+
+def _sin_nombre_del_sitio(texto: str, sitio: frozenset[str]) -> str:
+    """`texto` sin el nombre del sitio al final ni al principio, recortado a `MAX_TITULO`.
+
+    Solo se quita un extremo separado por `_SEPARADOR_TITULO` (« | », « - »…) que *es* el
+    nombre del sitio: sin saberlo, en «Lámpara H7 - 55W» el «55W» es parte del nombre.
+    Si el texto entero es el nombre del sitio, `""`.
+    """
+    limpio = _ESPACIOS.sub(" ", _sin_invisibles(texto[:MAX_TITULO_BRUTO])).strip()
+    if not limpio or _clave(limpio) in sitio:
+        return ""
+    separadores = list(_SEPARADOR_TITULO.finditer(limpio))
+    if separadores:
+        ultimo = separadores[-1]
+        if _clave(limpio[ultimo.end() :]) in sitio:
+            limpio = limpio[: ultimo.start()]
+            separadores.pop()
+    if separadores:
+        primero = separadores[0]
+        if _clave(limpio[: primero.start()]) in sitio:
+            limpio = limpio[primero.end() :]
+    # «Tienda | Tienda»: lo que queda puede seguir siendo el nombre del sitio.
+    return "" if _clave(limpio) in sitio else _recortar(limpio, MAX_TITULO)
+
+
+def _sin_invisibles(texto: str) -> str:
+    """Sin caracteres de control (pasan a espacio) ni de formato (anchura cero, bidireccionales).
+
+    El título se muestra en la web y lo compara el emparejado: una inversión bidireccional le daría
+    la vuelta en pantalla y un espacio de anchura cero partiría una palabra sin que se viera.
+    """
+    return "".join(
+        " " if (categoria := unicodedata.category(c)) == "Cc" else "" if categoria == "Cf" else c
+        for c in texto
+    )
+
+
+def _clave(texto: str) -> str:
+    """«Desguaces D.L.I.» → «desguacesdli»: sin tildes, en minúsculas y solo letras y cifras."""
+    descompuesto = unicodedata.normalize("NFKD", texto)
+    return "".join(c for c in descompuesto.casefold() if c.isalnum())
 
 
 def _recortar(texto: str, maximo: int) -> str:

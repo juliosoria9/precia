@@ -15,6 +15,15 @@ profundidad limitada por el propio `json` (un anidamiento excesivo se descarta),
 productos, imágenes, etiquetas y atributos acotado, textos HTML pasados a texto plano y
 recortados, y solo URL de la tienda (`extraccion.listado.url_de_la_tienda`). Un JSON roto,
 gigante o con otra forma da una lista vacía, nunca una excepción.
+
+**Referencia OEM.** El `sku` es el código que la tienda usa en su almacén: en un desguace suele
+ser su número de stock («DESP220618»), no la referencia del fabricante. Por eso la OEM sale, por
+este orden, de (1) un atributo cuyo nombre la identifica («Ref.Fabricante», «OEM», «Part
+number»...), (2) el SKU **solo si está corroborado**: aparece como referencia en el título o
+justo después de una etiqueta OEM en la descripción («Ref. original 5K1941005»), y (3) la
+primera referencia que sigue a una etiqueta OEM en la descripción, si el producto es una sola
+pieza (con varias variantes, esa referencia puede ser la de otra). Un SKU sin corroborar no es
+nunca la OEM.
 """
 
 import json
@@ -55,6 +64,10 @@ MAX_VARIANTES = 100
 MAX_UNIDAD_MENOR = 6
 DIGITOS_MINIMOS_SKU_NUMERICO = 7
 """Un SKU solo de cifras más corto suele ser un número interno («1234», «000451»), no una OEM."""
+MAX_OEM_ETIQUETADAS = 10
+"""Referencias tras una etiqueta OEM que se leen de cada texto (las siguientes se ignoran)."""
+MAX_TRAS_ETIQUETA = 60
+"""Caracteres tras la etiqueta en los que se busca la referencia."""
 AVISO_AGOTADO = "La tienda lo marca como agotado."
 """Va en `FichaExtraida.avisos`; el orquestador lo traduce a `disponible=False`."""
 
@@ -72,6 +85,61 @@ _MONEDA = re.compile(r"[A-Z]{3}")
 _HANDLE = re.compile(r"[A-Za-z0-9_%-]{1,255}")
 _ESPACIOS = re.compile(r"\s+")
 _NO_ALFANUMERICO = re.compile(r"[^a-z0-9]+")
+# Etiqueta OEM en un texto ya limpio (`_texto_html` deja un solo espacio entre palabras):
+# «Referencia OEM», «Ref. original», «Ref.Fabricante», «Código del fabricante», «Nº de pieza»,
+# «OEM», «MPN», «Part number». Sin «Ref.» ni «Referencia» a secas: las tiendas los usan también
+# para su código interno. Alternativas literales y cuantificadores acotados: coste lineal.
+_ETIQUETA_OEM = re.compile(
+    r"\b(?:"
+    r"(?:ref(?:erencias?|s)?\.?|c[oó]d(?:igo)?\.?|n[uú]m(?:ero)?\.?|n\.?[º°]\.?) ?"
+    r"(?:(?:de |del )?fabricante|original(?:es)?|oem|oe)"
+    r"|n(?:[uú]m(?:ero)?\.?|\.?[º°]\.?) ?(?:de )?pieza"
+    r"|oem(?: ?(?:number|nr\.?|no\.?))?|mpn|part ?(?:number|no\.?|n[º°])"
+    r")(?![0-9A-Za-zÀ-ÿ])[ :#.\-]{0,4}",
+    re.IGNORECASE,
+)
+# La referencia que sigue a la etiqueta: «1K0 698 151», «0 986 494 527» (por grupos, sin
+# tragarse un año detrás) o un token con separadores («5K1-941-005»). Sin «/»: separa dos
+# referencias («5K1941005/5K1941006»), no los grupos de una. Cuantificadores acotados y una sola
+# posición de inicio.
+_REF_TRAS_ETIQUETA = re.compile(
+    r"[0-9A-Za-z]{1,4}(?: (?!(?:19|20)\d\d(?!\d))\d{1,4}(?![0-9A-Za-z])){2,8}"
+    r"|[0-9A-Za-z]{1,40}(?:[-.][0-9A-Za-z]{1,40}){0,8}"
+)
+# Palabras que, en el nombre de un atributo, dicen que la referencia no es la OEM del fabricante.
+_NO_OEM = frozenset(
+    {
+        "equivalente",
+        "equivalentes",
+        "alternativa",
+        "alternativas",
+        "compatible",
+        "compatibles",
+        "interna",
+        "interno",
+        "local",
+        "tienda",
+        "almacen",
+        "proveedor",
+        "stock",
+        "sku",
+        # Otros códigos «del fabricante» que no son la referencia de la pieza.
+        "color",
+        "pintura",
+        "motor",
+        "serie",
+        "bastidor",
+        "chasis",
+        "vin",
+        "ean",
+        "gtin",
+        "barras",
+    }
+)
+_REFERENCIA_PALABRAS = frozenset(
+    {"ref", "refs", "referencia", "referencias", "cod", "codigo", "n", "num", "numero", "part"}
+)
+_FABRICANTE_PALABRAS = frozenset({"fabricante", "original", "originales", "manufacturer", "oe"})
 # Parámetros que añade el buscador predictivo de Shopify para sus estadísticas.
 _RASTREO_SHOPIFY = frozenset({"_pos", "_sid", "_ss", "_psq", "_fid", "_v"})
 
@@ -282,19 +350,21 @@ def _producto_woo(
     atributos = _atributos_woo(datos.get("attributes"))
     marcas = (_texto_html(m.get("name"), MAX_MARCA) for m in _dicts(datos.get("brands")))
     etiquetas = (m.get("name") for m in _dicts(datos.get("tags"), MAX_ETIQUETAS))
+    claves = ("short_description", "description")
+    textos = [_texto_html(datos.get(clave), MAX_DESCRIPCION) for clave in claves]
+    oem_atributos = [v for nombre, valores in atributos if _es_nombre_oem(nombre) for v in valores]
     return _Producto(
         titulo=titulo,
         url=url,
         precio=_precio_woo(datos.get("prices")),
-        referencia=_referencia([*_valores(atributos, _NOMBRES_OEM), datos.get("sku")]),
+        referencia=_referencia_oem(
+            oem_atributos, datos.get("sku"), titulo, textos, una_pieza=not _variable_woo(datos)
+        ),
         marca=_primero(
             [*marcas, *(_texto_html(v, MAX_MARCA) for v in _valores(atributos, _NOMBRES_MARCA))]
         ),
         estado=_estado(atributos, etiquetas),
-        descripcion=_primero(
-            _texto_html(datos.get(clave), MAX_DESCRIPCION)
-            for clave in ("short_description", "description")
-        ),
+        descripcion=_primero(textos),
         imagenes=sum(
             1
             for imagen in _dicts(datos.get("images"), MAX_IMAGENES)
@@ -302,6 +372,11 @@ def _producto_woo(
         ),
         agotado=datos.get("is_in_stock") is False,
     )
+
+
+def _variable_woo(datos: dict[str, Any]) -> bool:
+    """Producto con variaciones: su precio es el de una cualquiera (izquierdo o derecho)."""
+    return datos.get("type") == "variable" or bool(_lista(datos.get("variations"), 1))
 
 
 def _precio_woo(precios: object) -> Precio | None:
@@ -381,32 +456,38 @@ def _producto_shopify(
     elegida = elegida or (con_precio[0] if con_precio else None)
     precio = elegida[1] if elegida else leer(datos.get("price"), moneda)
     opciones = _opciones_shopify(datos.get("options"))
+    textos = [_texto_html(datos.get(clave), MAX_DESCRIPCION) for clave in ("description", "body")]
     return _Producto(
         titulo=titulo,
         url=url,
         precio=precio,
-        referencia=_referencia_shopify(elegida[0] if elegida else None, variantes),
+        referencia=_referencia_shopify(elegida[0] if elegida else None, variantes, titulo, textos),
         marca=_texto_html(datos.get("vendor"), MAX_MARCA),
         estado=_estado(opciones, _lista(datos.get("tags"), MAX_ETIQUETAS)),
-        descripcion=_primero(
-            _texto_html(datos.get(clave), MAX_DESCRIPCION) for clave in ("description", "body")
-        ),
+        descripcion=_primero(textos),
         imagenes=_imagenes_shopify(datos),
         agotado=datos.get("available") is False,
     )
 
 
 def _referencia_shopify(
-    elegida: dict[str, Any] | None, variantes: list[dict[str, Any]]
+    elegida: dict[str, Any] | None,
+    variantes: list[dict[str, Any]],
+    titulo: str,
+    textos: Sequence[str | None],
 ) -> str | None:
-    """OEM del SKU de la variante cuyo precio se da (o de la única variante, si no hay precio).
+    """OEM de la variante cuyo precio se da (o de la única variante, si no hay precio).
 
-    Las variantes pueden ser piezas distintas (lado izquierdo y derecho, con OEM distinta): el
-    SKU de otra variante nunca se pega al precio de esta.
+    Shopify no publica atributos en estas respuestas: la OEM es el SKU de esa variante si el
+    título o la descripción lo corroboran, o la referencia etiquetada de la descripción. Las
+    variantes pueden ser piezas distintas (lado izquierdo y derecho, con OEM distinta): ni el SKU
+    de otra variante ni, con varias variantes, la referencia de la descripción (puede ser la de
+    otra) se pegan al precio de esta.
     """
     if elegida is None and len(variantes) == 1:
         elegida = variantes[0]
-    return _referencia([elegida.get("sku")]) if elegida is not None else None
+    sku = elegida.get("sku") if elegida is not None else None
+    return _referencia_oem([], sku, titulo, textos, una_pieza=len(variantes) <= 1)
 
 
 def _precio_texto(valor: object, moneda: str | None) -> Precio | None:
@@ -496,8 +577,61 @@ def _precio(importe: Decimal, moneda: str, texto: str) -> Precio | None:
     return Precio(importe, moneda, texto)
 
 
+def _referencia_oem(
+    atributos: Sequence[object],
+    sku: object,
+    titulo: str,
+    textos: Sequence[str | None],
+    *,
+    una_pieza: bool = True,
+) -> str | None:
+    """OEM del producto: atributo OEM, SKU corroborado o referencia etiquetada del texto.
+
+    El SKU vale solo si su forma normalizada aparece como referencia en el título o justo detrás
+    de una etiqueta OEM de la descripción: que la tienda lo muestre como referencia es la prueba
+    de que no es solo su código de almacén. El título basta porque el emparejado ya lee las
+    referencias del título (`emparejado.agrupador`): aceptarlo no añade un riesgo nuevo.
+    """
+    etiquetadas = [r for texto in textos if texto for r in _oem_etiquetadas(texto)]
+    corroboradas = referencias_en(titulo) | {normalizar_referencia(r) for r in etiquetadas}
+    candidatas: list[object] = list(atributos)
+    if isinstance(sku, str) and normalizar_referencia(sku[: MAX_REFERENCIA * 2]) in corroboradas:
+        candidatas.append(sku)
+    if una_pieza:
+        candidatas.extend(etiquetadas)
+    return _referencia(candidatas)
+
+
+def _oem_etiquetadas(texto: str) -> list[str]:
+    """Referencias que siguen a una etiqueta OEM («Ref. original 1K0 698 151» → «1K0 698 151»)."""
+    encontradas: list[str] = []
+    for etiqueta in _ETIQUETA_OEM.finditer(texto[:MAX_DESCRIPCION]):
+        inicio = etiqueta.end()
+        ref = _REF_TRAS_ETIQUETA.match(texto, inicio, inicio + MAX_TRAS_ETIQUETA)
+        if ref is not None:
+            encontradas.append(ref.group())
+            if len(encontradas) >= MAX_OEM_ETIQUETADAS:
+                break
+    return encontradas
+
+
+def _es_nombre_oem(nombre: str) -> bool:
+    """Indica si el nombre (ya `_normalizar`) de un atributo es el de la referencia OEM.
+
+    Además de los nombres conocidos, vale una palabra de referencia con otra de fabricante
+    («Ref.Fabricante», «Código del fabricante», «Nº OEM»); no, si alguna palabra dice que es
+    otra cosa («Ref.Local», «Ref.Equivalente», «Referencia OEM equivalente»).
+    """
+    palabras = set(nombre.split())
+    if palabras & _NO_OEM:
+        return False
+    if nombre in _NOMBRES_OEM or palabras & {"oem", "mpn"}:
+        return True
+    return bool(palabras & _REFERENCIA_PALABRAS and palabras & _FABRICANTE_PALABRAS)
+
+
 def _referencia(candidatas: Iterable[object]) -> str | None:
-    """Primera candidata (atributo OEM o SKU) con forma de referencia OEM.
+    """Primera candidata (atributo OEM, SKU corroborado o texto) con forma de referencia OEM.
 
     Además de `es_referencia`, se exige que `referencias_en` la reconozca (descarta medidas,
     años y precios: «100MM», «2015») y que un SKU solo de cifras tenga al menos 7.

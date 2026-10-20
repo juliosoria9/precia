@@ -64,6 +64,14 @@ Alimenta la memoria §3 («método de validación del código generado»).
 | 2026-10-20 | Los destacados de `__NEXT_DATA__` se daban como resultados de cualquier búsqueda (y en modo Auto se podía pagar IA por cada uno) | Revisor adversarial de la integración | Solo los resultados que nombran la consulta |
 | 2026-10-20 | TDD incumplido: `descubrimiento.py` se escribió antes que sus tests unitarios, y los tests de extremo a extremo después del código | Lo reconoció el propio agente en su informe | Se comprobó que los tests prueban algo quitando el código a mano; queda anotado |
 | 2026-10-20 | Filtro de scripts que dejaba fuera Rocket Loader/WP Rocket (falso negativo de plataforma) | Tests de optimizadores en rojo | Lista de exclusión de tipos de datos en lugar de lista de admitidos |
+| 2026-10-20 | La IA de la herramienta (Claude Haiku) propuso las clases genéricas de WooCommerce sin verlas en la página (el resumen se cortaba antes de los productos) | Validador automático + diagnóstico offline con la página de la caché | Pendiente: resumen que comprime lo repetido y prioriza el listado |
+| 2026-10-20 | La API de WooCommerce da el SKU interno de la tienda (`DESP220618`) y se guardaba como referencia OEM | Prueba real en desguacesvelazquez.com | Pendiente |
+| 2026-10-20 | El título de la ficha salía «Test Sites» (el de la web) y no el del producto | Prueba real en webscraper.io | Pendiente |
+| 2026-10-20 | Compresión del resumen que quitaba filas de la tabla de atributos (OEM) y secciones de Elementor; contenedor del listado sin proteger | Revisor adversarial F1 (fichas sintéticas y portada real de Velázquez) | Umbral de ahorro, forma con más niveles y contenedor protegido + tests |
+| 2026-10-20 | Título de ficha igual al href de `<a itemprop="name">` | Revisor adversarial F2 con el listado real de webscraper.io | Microdatos: el texto, no el href, para `name` + tests |
+| 2026-10-20 | «Código … fabricante» (pintura, motor, EAN) tomado como OEM; dos OEM pegadas con «/» | Revisor adversarial F3 | Exclusiones y «/» fuera de los separadores + tests |
+| 2026-10-20 | Test parametrizado con la propia constante (no detecta que se quite un caso); informe con una afirmación falsa sobre el tope de peticiones | Revisor adversarial F4 (mutación) | Lista escrita a mano; afirmación corregida en la bitácora |
+| 2026-10-20 | Una candidata con 401/403/451 se repetía con Chromium (insistir ante un rechazo) | Revisor adversarial F4 | `RECHAZOS` en `descubrimiento.py` + 4 tests |
 
 ---
 
@@ -240,3 +248,37 @@ Alimenta la memoria §3 («método de validación del código generado»).
 - **Qué pasó:** si la portada revela WooCommerce o Shopify y su API pública devuelve productos con precio, el configurador crea un perfil `api_*` directamente: 0 llamadas a la IA y sin selectores que se rompan en un rediseño. La IA queda para las tiendas sin plataforma conocida.
 - **Lección:** el uso de la IA tiene que ser el último recurso de una cascada, no el primero: abarata, es más fiable y deja menos superficie a la prompt injection. Conecta con el modo Auto (ADR-002).
 - **Para la memoria:** §5 (arquitectura), Eval (coste por tienda), §4 · S01
+
+### 2026-10-20 14:35 · 📏 Medida · Primera prueba de generalidad con webs reales: 2 de 4 dan datos y la IA escribe un scraper correcto a la primera
+- **Qué pasó:** con un tope de 12 peticiones por dominio y 2 s entre ellas. (1) Un desguace WooCommerce (desguacesvelazquez.com): 5 ofertas reales por su API pública, **0 llamadas a la IA**, 4 peticiones. (2) webscraper.io, una web de práctica que PrecIA no conocía: Claude escribió a la primera los selectores del listado (6 productos con precio) y las fichas se leyeron por microdatos e IA, todo anclado, por 0,0018 $. (3) Un desguace con plantilla Bricks (desguacesdli.com): se encontró el buscador, pero Claude no dio con un perfil válido. (4) books.toscrape.com: sin buscador, PrecIA no tiene por dónde entrar. Coste total de la IA: unos 0,0065 $.
+- **Lección:** la vía general (la IA escribe el scraper y el código lo ejecuta) funciona en una web real que no había visto, y es barata. Los fallos no son de la IA, sino de **lo que se le enseña** y de **cómo se entra** en la web.
+- **Para la memoria:** Eval (cobertura, coste por tienda, tasa de éxito), §5 (flujo real), §1 (generalidad) · S01
+
+### 2026-10-20 14:35 · ❌ Fallo · La IA se inventó los selectores porque el resumen de la página no llegaba a los productos
+- **Qué pasó:** en desguacesdli.com, el resumen de 30 000 caracteres que se manda a la IA se llenaba con el menú y unos 1200 filtros del buscador antes de llegar a los 12 productos. Sin verlos, Claude propuso las clases genéricas de WooCommerce, que en esa plantilla no existen. El validador lo cazó (no se guardó ningún perfil malo), pero la tienda se quedó sin perfil.
+- **Causa:** un recorte por longitud no sirve para páginas reales, donde lo repetitivo (filtros, menús) pesa más que el contenido.
+- **Lección:** cuando a un modelo le falta información, no se queda callado: rellena con lo que es «típico». Lo que se le manda tiene que priorizar lo que importa. Y el validador automático es lo que impide que esa invención llegue a los datos.
+- **Para la memoria:** §4 (riesgos: alucinación), §5 (resumen para la IA), Eval · S01
+
+### 2026-10-20 14:35 · 💡 Aprendizaje · «General» exige también una forma de entrar en webs sin buscador
+- **Qué pasó:** books.toscrape.com no tiene buscador. El configurador solo sabe partir de una búsqueda, así que gastó todas las peticiones probando rutas que daban 404, y Chromium repitió los mismos 404.
+- **Lección:** el diseño suponía que toda tienda tiene buscador. Para que sea general hace falta otra entrada (una URL de listado o categorías), y no repetir con Chromium lo que ya dio 404.
+- **Para la memoria:** §5 (diseño), §7 (trabajo futuro o mejora) · S01
+
+### 2026-10-20 15:22 · 🔧 Solución · El resumen para la IA comprime lo repetido y prioriza el listado: Claude ya escribe bien los selectores de DLI
+- **Qué pasó:** con la misma página real de desguacesdli.com que antes hacía inventar a Claude, el resumen nuevo deja 3 ejemplos de cada serie repetida (los 1196 filtros pasan a 3 + «N elementos similares omitidos») y reserva sitio para la serie que parece el listado. Resultado con Claude de verdad (1 llamada, 0,0016 $): selectores correctos a la primera y 10 resultados reales con título, enlace y precio. Antes eran 0 resultados y clases inventadas.
+- **Además:** el título de la ficha ya es el del producto (no «Test Sites»); en Velázquez la OEM real sale del atributo «Ref.Fabricante» y no del SKU de stock; en una web sin buscador se pasa de 14 a 9 descargas, y un 401/403/429/451 nunca se repite con Chromium.
+- **Lección:** la calidad de un sistema con IA depende mucho de **qué contexto se le da**. Aquí la mejora no estuvo en el modelo ni en el prompt, sino en elegir qué parte de la página ve.
+- **Para la memoria:** §4 (riesgos: alucinación y su mitigación), §5 (diseño del resumen), Eval (antes y después en una web real) · S01
+
+### 2026-10-20 15:22 · ❌ Fallo · Los revisores cazaron 9 fallos en las correcciones de la IA, algunos peores que el fallo original
+- **Qué pasó:** (1) La compresión del resumen recortaba también la tabla de atributos de una ficha y podía quitar la fila de la referencia OEM. (2) Agrupaba como «repetidas» las secciones de Elementor y omitía partes enteras de la ficha. (3) No protegía el propio contenedor del listado: con 6 filas de 8 tarjetas, 0 productos. (4) Un mensaje de reintento falso («ningún elemento tiene href»). (5) Con microdatos `<a itemprop="name" href=…>`, el título de la ficha salía como la ruta. (6) Cualquier «código … fabricante» (pintura, motor, EAN) contaba como OEM. (7) «5K1941005/5K1941006» salía como una sola OEM. (8) Un test parametrizado con la propia constante, que no detectaba que se quitara un caso. (9) Un informe decía que el tope de 12 peticiones lo pone el navegador real, y es falso: lo ponía el guardián de la prueba.
+- **Qué se hizo:** todos corregidos con un test en rojo primero. Los revisores comprobaron que los tests fallan al quitar la corrección a mano (mutación).
+- **Lección:** cada corrección abre su propio riesgo. La revisión adversarial, con pruebas de mutación, no es un extra: en esta ronda encontró tantos fallos como la prueba real.
+- **Para la memoria:** §4, metodología (uso de IA en el desarrollo y su control) · S01
+
+### 2026-10-20 15:22 · 🧭 Decisión · Un rechazo HTTP no se repite con Chromium
+- **Qué pasó:** un revisor señaló que una candidata que respondía 401/403/451 sin parecer un bloqueo (página grande o con productos) se volvía a pedir con Chromium.
+- **Qué se hizo:** constante `RECHAZOS` = {401, 403, 429, 451}, que no se repiten con Chromium (TDD: 4 tests en rojo y luego en verde).
+- **Lección:** la línea roja no está solo en «no resolver CAPTCHAs». Insistir con otra herramienta ante un «no» explícito es el mismo gesto, más sutil. Va en la nota legal.
+- **Para la memoria:** nota legal (art. 197 bis CP), §4 · S01

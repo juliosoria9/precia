@@ -20,7 +20,8 @@ El configurador lo usa antes de pedir selectores a la IA. Las plantillas candida
 
 Si la portada por HTTP no trae ni formularios ni enlaces de búsqueda (ni OpenSearch), se mira la
 versión renderizada con Chromium, que es donde están en una tienda que se pinta con JavaScript.
-Cada candidata se prueba primero por HTTP y, solo si ninguna da un listado, con Chromium.
+Cada candidata se prueba primero por HTTP y, solo si ninguna da un listado, con Chromium; las que
+por HTTP dieron un estado de `ESTADOS_DEFINITIVOS` (un 404, por ejemplo) no se repiten.
 
 Todo sale de páginas no confiables: hay topes de formularios, enlaces y plantillas (una portada no
 puede multiplicar las descargas), solo se aceptan URL `http(s)` de la propia tienda
@@ -85,6 +86,10 @@ MAX_FORMULARIOS_RESUMEN = 10
 MAX_CAMPOS_RESUMEN = 10
 MAX_ENLACES_RESUMEN = 150
 MAX_TEXTO_ENLACE = 80
+RECHAZOS = frozenset({401, 403, 429, 451})
+"""La tienda dice que no: repetirlo con un navegador real sería insistir (regla 5, sin evasión)."""
+ESTADOS_DEFINITIVOS = frozenset({400, 404, 410, 414, 501}) | RECHAZOS
+"""Estados por HTTP con los que una candidata no se repite con Chromium (ver `_probar`)."""
 MIN_PRODUCTOS = 2
 """Enlaces a productos con precio para que una página parezca un listado."""
 MAX_TEXTO_CONTENEDOR = 600
@@ -185,11 +190,14 @@ async def descubrir(
     candidatas: list[tuple[str, str]] = []
     resumida = portada
     if portada is not None:
-        de_portada = await _de_la_portada(portada, dominio, navegador, validador)
+        descriptores: set[str] = set()
+        de_portada = await _de_la_portada(portada, dominio, navegador, validador, descriptores)
         if not de_portada:
             renderizada = await abrir(navegador, _url(portada), js=True, validador=validador)
             if renderizada is not None and _de_la_tienda_y_bien(renderizada, dominio):
-                de_portada = await _de_la_portada(renderizada, dominio, navegador, validador)
+                de_portada = await _de_la_portada(
+                    renderizada, dominio, navegador, validador, descriptores
+                )
                 resumida = renderizada
         candidatas.extend(de_portada)
         plataforma = detectar_plataforma(portada)
@@ -222,12 +230,22 @@ async def descubrir(
 
 
 async def _de_la_portada(
-    portada: Pagina, dominio: str, navegador: Navegador, validador: Validador
+    portada: Pagina,
+    dominio: str,
+    navegador: Navegador,
+    validador: Validador,
+    descriptores: set[str],
 ) -> list[tuple[str, str]]:
-    """Candidatas que salen de la propia portada: OpenSearch, formularios y enlaces."""
+    """Candidatas que salen de la propia portada: OpenSearch, formularios y enlaces.
+
+    `descriptores` son los descriptores OpenSearch ya pedidos: la portada renderizada con Chromium
+    suele traer el mismo `<link>` en la cabecera, y si no dio una plantilla la primera vez tampoco
+    la dará la segunda (se piden siempre por HTTP).
+    """
     candidatas: list[tuple[str, str]] = []
     descriptor = enlace_opensearch(portada, dominio)
-    if descriptor is not None:
+    if descriptor is not None and descriptor not in descriptores:
+        descriptores.add(descriptor)
         pagina = await abrir(navegador, descriptor, js=False, validador=validador)
         if pagina is not None and _de_la_tienda_y_bien(pagina, dominio):
             plantilla = plantilla_opensearch(pagina, dominio)
@@ -246,13 +264,31 @@ async def _probar(
     portada: Pagina | None,
     validador: Validador,
 ) -> Busqueda | None:
-    # Primero todas por HTTP (barato) y, solo si ninguna da resultados, con Chromium.
+    """La primera candidata que da un listado: primero todas por HTTP (barato) y, solo si
+    ninguna lo da, con Chromium.
+
+    Con Chromium no se repiten las que por HTTP respondieron con un estado de
+    `ESTADOS_DEFINITIVOS`: Chromium pide el mismo documento, con el mismo User-Agent, y recibiría
+    el mismo estado; y `parece_listado` exige un 2xx del documento, así que aunque su JavaScript
+    pintara resultados encima de la página de error no se aceptaría. 404 y 410: la ruta no existe;
+    400 y 414: el servidor rechaza la propia URL; 501: no admite el GET. Sí se repiten un 2xx que
+    no era un listado (puede pintarlo el JavaScript) y los 5xx (pueden ser pasajeros). Los
+    bloqueos (`Bloqueado`, un 403 o un 429 de un anti-bot) ni llegan aquí: el navegador los lanza
+    y se para.
+    """
+    definitivas: set[str] = set()
     for js in (False, True):
         for plantilla, origen in candidatas:
             url = url_de_busqueda(plantilla, consulta)
+            if js and url in definitivas:
+                continue
             pagina = await abrir(navegador, url, js=js, validador=validador)
-            if pagina is not None and parece_listado(pagina, dominio, consulta, portada=portada):
+            if pagina is None:
+                continue
+            if parece_listado(pagina, dominio, consulta, portada=portada):
                 return Busqueda(plantilla, pagina, js, origen)
+            if pagina.estado in ESTADOS_DEFINITIVOS:
+                definitivas.add(url)
     return None
 
 

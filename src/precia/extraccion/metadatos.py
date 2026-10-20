@@ -22,7 +22,7 @@ trata igual venga de donde venga.
 
 import math
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import fields, replace
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urljoin, urlsplit
@@ -78,6 +78,8 @@ _ATRIBUTO_VALOR = {
     "meter": "value",
     "time": "datetime",
 }
+_ATRIBUTO_URL = frozenset(e for e, a in _ATRIBUTO_VALOR.items() if a in ("src", "href", "data"))
+"""Elementos cuyo valor de microdatos es una URL (`<a>` → `href`, `<img>` → `src`...)."""
 _IMPORTE_MAQUINA = re.compile(r"\d{1,12}(?:\.\d{1,6})?")
 _IMPORTE_AMBIGUO = re.compile(r"\d{1,3}\.\d{3}")
 """«1.500»: 1,5 en formato de máquina o 1500 con el punto de miles (Shopify sin decimales)."""
@@ -222,11 +224,25 @@ def _valor(nodo: Nodo) -> str | None:
     return nodo.texto()
 
 
-def _primero(nodos: Iterable[Nodo], maximo: int) -> str | None:
+def _valor_texto(nodo: Nodo) -> str | None:
+    """Valor de una propiedad que es texto (`name`, `brand`): de un enlace, su texto.
+
+    Por la regla de los microdatos el valor de `<a itemprop="name" href="/p/31">Faro</a>` es
+    `/p/31`, pero muchas tiendas lo marcan así (las tarjetas de webscraper.io) y lo que quieren
+    decir es «Faro». Un `content` sigue mandando; una imagen sin él no tiene texto.
+    """
+    if "content" in nodo.atributos or nodo.etiqueta not in _ATRIBUTO_URL:
+        return _valor(nodo)
+    return nodo.texto()
+
+
+def _primero(
+    nodos: Iterable[Nodo], maximo: int, valor: Callable[[Nodo], str | None] = _valor
+) -> str | None:
     for nodo in nodos:
         if "itemscope" in nodo.atributos:
             continue
-        texto = _texto(_valor(nodo), maximo)
+        texto = _texto(valor(nodo), maximo)
         if texto:
             return texto
     return None
@@ -363,7 +379,7 @@ def _producto_microdatos(
 
     estado = _estado(_primero(propiedades.get("itemCondition", ()), MAX_URL))
     return ProductoJSONLD(
-        nombre=_primero(propiedades.get("name", ()), MAX_NOMBRE),
+        nombre=_primero(propiedades.get("name", ()), MAX_NOMBRE, _valor_texto),
         precio=_precio_microdatos(fuentes),
         marca=_marca_microdatos(propiedades.get("brand", ()), presupuesto),
         mpn=_primero(propiedades.get("mpn", ()), MAX_IDENTIFICADOR),
@@ -405,9 +421,10 @@ def _precio_microdatos(fuentes: list[dict[str, list[Nodo]]]) -> Precio | None:
 def _marca_microdatos(nodos: Iterable[Nodo], presupuesto: _Presupuesto) -> str | None:
     for nodo in nodos:
         if "itemscope" in nodo.atributos:
-            marca = _primero(_propiedades(nodo, presupuesto).get("name", ()), MAX_NOMBRE)
+            nombres = _propiedades(nodo, presupuesto).get("name", ())
+            marca = _primero(nombres, MAX_NOMBRE, _valor_texto)
         else:
-            marca = _texto(_valor(nodo), MAX_NOMBRE)
+            marca = _texto(_valor_texto(nodo), MAX_NOMBRE)
         if marca:
             return marca
     return None

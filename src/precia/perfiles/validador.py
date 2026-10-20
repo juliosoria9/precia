@@ -43,11 +43,11 @@ la búsqueda (la tienda no responde); el de una ficha cuenta como ficha fallida.
 from collections.abc import Iterable, Mapping, Sequence
 from urllib.parse import quote, quote_plus, urlsplit
 
-from precia.extraccion.dom import analizar
+from precia.extraccion.dom import Nodo, analizar
 from precia.extraccion.ficha import extraer_ficha, formatear_precio
 from precia.extraccion.listado import dominio_normalizado, extraer_listado, url_de_la_tienda
 from precia.extraccion.precios import leer_precio
-from precia.extraccion.selectores import extraer_valor, seleccionar
+from precia.extraccion.selectores import dividir_selector, extraer_valor, seleccionar
 from precia.extraccion.tipos import FichaExtraida, Precio, SelectorNoValido
 from precia.fuentes.apis import MAX_FICHAS as MAX_FICHAS_API
 from precia.fuentes.apis import ofertas_api
@@ -73,6 +73,8 @@ MAX_PROBLEMA = 300
 MAX_RESUMEN = 2_000
 """Lo que admite el almacén en la nota de un perfil."""
 MAX_CITA = 80
+MAX_RESULTADOS_REVISADOS = 50
+"""Resultados en los que se busca un selector al explicar por qué no lee nada."""
 CLAVES = tuple(c.clave for c in CAMPOS)
 SELECTORES_LISTADO = ("sel_resultado", "sel_titulo", "sel_enlace", "sel_precio_listado")
 _RAIZ_VACIA = analizar("")
@@ -115,8 +117,11 @@ async def validar(
 
     resultados = extraer_listado(pagina, perfil)
     if not resultados:
-        problemas.add(problema_sin_resultados(pagina, perfil, consulta_prueba))
+        problemas.extend(problemas_sin_resultados(pagina, perfil, consulta_prueba))
         return problemas.informe(valido=False)
+    if perfil.sel_precio_listado and all(r.precio is None for r in resultados):
+        # El perfil puede valer sin precios en el listado, pero el selector no lee ninguno.
+        problemas.extend(selectores_ausentes(analizar(pagina.html), perfil))
 
     fichas = resultados[:MAX_FICHAS]
     con_precio = 0
@@ -458,9 +463,67 @@ def _otro_precio_del_selector(
     return leido if leido is not None and not _mismo_precio(leido, ficha.precio) else None
 
 
+def problemas_sin_resultados(pagina: Pagina, perfil: Perfil, consulta: str) -> list[str]:
+    """`problema_sin_resultados` y, detrás, `selectores_ausentes` (para la IA en su reintento)."""
+    raiz = analizar(pagina.html)
+    return [_sin_resultados(raiz, perfil, consulta), *selectores_ausentes(raiz, perfil)]
+
+
 def problema_sin_resultados(pagina: Pagina, perfil: Perfil, consulta: str) -> str:
     """Por qué el listado sale vacío: `sel_resultado` no encaja o lo que encaja no sirve."""
-    elementos = len(seleccionar(analizar(pagina.html), perfil.sel_resultado))
+    return _sin_resultados(analizar(pagina.html), perfil, consulta)
+
+
+def selectores_ausentes(raiz: Nodo, perfil: Perfil) -> list[str]:
+    """Un problema por cada selector del listado que no encuentra nada en la página `raiz`.
+
+    Distingue si el selector no aparece en ninguna parte de la página, si aparece pero no dentro
+    de los resultados o si sus elementos no tienen el atributo que se lee. Lo primero es lo que
+    pasa cuando la IA, sin ver los productos, se inventa las clases típicas de la plataforma
+    (`h2.woocommerce-loop-product__title` en una tienda WooCommerce cuya plantilla no las usa):
+    decírselo por selector la empuja a usar clases que sí están en el HTML.
+    """
+    problemas: list[str] = []
+    resultados = seleccionar(raiz, perfil.sel_resultado)
+    if not resultados:
+        problemas.append(_no_aparece("sel_resultado", perfil.sel_resultado))
+    for nombre in ("sel_titulo", "sel_enlace", "sel_precio_listado"):
+        selector = getattr(perfil, nombre)
+        if selector and (problema := _ausente(raiz, resultados, nombre, selector)):
+            problemas.append(problema)
+    return problemas
+
+
+def _ausente(raiz: Nodo, resultados: Sequence[Nodo], nombre: str, selector: str) -> str | None:
+    css, atributo = dividir_selector(selector)
+    revisados = resultados[:MAX_RESULTADOS_REVISADOS]
+    elementos = seleccionar(raiz, css) if css else list(revisados)
+    if css and not elementos:
+        return _no_aparece(nombre, selector)
+    # Sin elementos (`@atributo` del propio resultado y ningún resultado) no hay nada que decir:
+    # el problema ya es sel_resultado.
+    if elementos and atributo is not None and not any(e.atributo(atributo) for e in elementos):
+        return (
+            f"{nombre} ({_cita(selector)}): hay elementos, pero ninguno tiene el atributo "
+            f"{atributo}."
+        )
+    if css and revisados and not any(seleccionar(r, css) for r in revisados):
+        return (
+            f"{nombre} ({_cita(selector)}) aparece en la página, pero no dentro de ningún "
+            "elemento de sel_resultado: tiene que ser relativo a cada resultado."
+        )
+    return None
+
+
+def _no_aparece(nombre: str, selector: str) -> str:
+    return (
+        f"{nombre} ({_cita(selector)}) no aparece en ninguna parte de la página: usa clases e id "
+        "que estén en el HTML."
+    )
+
+
+def _sin_resultados(raiz: Nodo, perfil: Perfil, consulta: str) -> str:
+    elementos = len(seleccionar(raiz, perfil.sel_resultado))
     if not elementos:
         return f"sel_resultado no encuentra ningún elemento en la búsqueda de «{consulta}»."
     plural = "elemento" if elementos == 1 else "elementos"
