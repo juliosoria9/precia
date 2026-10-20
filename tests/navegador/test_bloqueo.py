@@ -64,9 +64,12 @@ def test_403_con_texto_de_desafio() -> None:
     assert detectar_bloqueo(pagina(URL, html, estado=403)) is not None
 
 
-def test_403_sin_desafio_no_es_bloqueo() -> None:
+def test_403_corto_sin_desafio_es_rechazo_seco() -> None:
+    # Antes no contaba como bloqueo; la primera prueba real (nota 15) mostró que así es como
+    # rechazan muchas tiendas a un cliente automático: un 403 pequeño y sin ficha.
     html = "<html><body><h1>403 Prohibido</h1><p>No tienes permiso para ver esto.</p></body></html>"
-    assert detectar_bloqueo(pagina(URL, html, estado=403)) is None
+    motivo = detectar_bloqueo(pagina(URL, html, estado=403))
+    assert motivo == "La tienda rechaza el acceso automático (HTTP 403)."
 
 
 def test_frase_de_desafio_en_una_ficha_normal_no_basta() -> None:

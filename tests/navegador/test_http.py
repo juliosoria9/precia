@@ -198,7 +198,15 @@ def test_tipos_admitidos(tipo: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "tipo", ["application/json", "image/png", "application/pdf", "application/octet-stream", None]
+    "tipo",
+    [
+        "image/png",
+        "application/pdf",
+        "application/octet-stream",
+        "application/javascript",
+        "application/ld+json",
+        None,
+    ],
 )
 def test_tipos_rechazados(tipo: str | None) -> None:
     cuerpo = Cuerpo(b"%PDF-1.7")
@@ -211,6 +219,110 @@ def test_tipos_rechazados(tipo: str | None) -> None:
     assert cuerpo.cerrado
 
 
+# JSON (APIs públicas de plataforma) y XML (descriptor OpenSearch): nota 15, sección A.
+TIPOS_DE_DATOS = [
+    "application/json",
+    "application/json; charset=utf-8",
+    "application/opensearchdescription+xml",
+    "application/xml",
+    "text/xml; charset=UTF-8",
+]
+
+
+@pytest.mark.parametrize("tipo", TIPOS_DE_DATOS)
+def test_tipos_de_datos_admitidos_tal_cual(tipo: str) -> None:
+    datos = '{"name": "Pastillas", "precio": "29,95 €"}'
+    transporte = TransporteFalso({URL: [respuesta(datos.encode(), tipo=tipo)]})
+    pagina = asyncio.run(descargador(transporte).descargar(URL))
+    assert pagina.html == datos
+    assert pagina.tipo_contenido == tipo.split(";")[0].strip().lower()
+
+
+@pytest.mark.parametrize("tipo", TIPOS_DE_DATOS)
+def test_tipos_de_datos_con_el_mismo_limite_de_bytes(tipo: str) -> None:
+    cuerpo = Cuerpo(b"[" + b"1," * 1_000_000 + b"1]")
+    transporte = TransporteFalso({URL: [RespuestaCruda(200, {"content-type": tipo}, cuerpo)]})
+    with pytest.raises(ErrorDescarga, match="grande"):
+        asyncio.run(descargador(transporte, max_bytes=100_000).descargar(URL))
+    assert sum(cuerpo.lecturas) <= 100_000 + 64 * 1024
+
+
+def test_json_con_content_length_excesivo_no_se_lee() -> None:
+    cuerpo = Cuerpo(b"{}")
+    cabeceras = {"content-type": "application/json", "content-length": "2000"}
+    transporte = TransporteFalso({URL: [RespuestaCruda(200, cabeceras, cuerpo)]})
+    with pytest.raises(ErrorDescarga, match="grande"):
+        asyncio.run(descargador(transporte, max_bytes=1000).descargar(URL))
+    assert cuerpo.lecturas == []
+
+
+def test_cabecera_accept_pide_html_antes_que_datos() -> None:
+    transporte = TransporteFalso({URL: [respuesta()]})
+    asyncio.run(descargador(transporte).descargar(URL))
+    accept = {k.lower(): v for k, v in transporte.peticiones[0][1].items()}["accept"]
+    pesos: dict[str, float] = {}
+    for parte in accept.split(","):
+        tipo, _, parametro = parte.strip().partition(";")
+        pesos[tipo] = float(parametro.removeprefix("q=")) if parametro else 1.0
+    assert pesos["text/html"] == 1.0
+    for tipo in ("application/json", "application/opensearchdescription+xml", "application/xml"):
+        assert 0 < pesos[tipo] < pesos["text/plain"] < pesos["text/html"]
+    assert "*/*" not in pesos
+
+
+def test_xml_con_declaracion_de_codificacion() -> None:
+    xml = '<?xml version="1.0" encoding="ISO-8859-15"?><ShortName>Señal €</ShortName>'
+    transporte = TransporteFalso(
+        {URL: [respuesta(xml.encode("iso-8859-15"), tipo="application/opensearchdescription+xml")]}
+    )
+    assert asyncio.run(descargador(transporte).descargar(URL)).html == xml
+
+
+def test_json_no_toma_el_charset_de_un_meta_de_su_contenido() -> None:
+    # JSON va en UTF-8 (RFC 8259). Una descripción con HTML pegado de Word trae su propio
+    # `<meta ... charset=windows-1252>`: si se le hiciera caso, «ñ» y «€» saldrían destrozados.
+    datos = (
+        '{"products":[{"name":"Pastillas de freno Señal","price":"29,95 €",'
+        '"description":"<meta http-equiv=\\"Content-Type\\" '
+        'content=\\"text/html; charset=windows-1252\\"><p>Año 2008</p>"}]}'
+    )
+    transporte = TransporteFalso({URL: [respuesta(datos.encode(), tipo="application/json")]})
+    assert asyncio.run(descargador(transporte).descargar(URL)).html == datos
+
+
+def test_xml_no_toma_el_charset_de_un_meta_de_su_contenido() -> None:
+    # En XML solo cuentan el BOM, la cabecera y su declaración `<?xml ... encoding=...?>`.
+    xml = (
+        '<?xml version="1.0"?><OpenSearchDescription><Description>'
+        "<![CDATA[<meta charset=koi8-r>]]> Señal €</Description></OpenSearchDescription>"
+    )
+    transporte = TransporteFalso(
+        {URL: [respuesta(xml.encode(), tipo="application/opensearchdescription+xml")]}
+    )
+    assert asyncio.run(descargador(transporte).descargar(URL)).html == xml
+
+
+@pytest.mark.parametrize(
+    ("cuerpo", "mime"),
+    [
+        (b'<?xml version="1.0" encoding="UTF-16"?><a>Se\xc3\xb1al</a>', "application/xml"),
+        (b'<meta charset="utf-16"><p>Se\xc3\xb1al</p>', "text/html"),
+        (b'<meta charset="UTF-32LE"><p>Se\xc3\xb1al</p>', "text/html"),
+    ],
+)
+def test_utf16_declarado_dentro_de_un_documento_ascii_se_ignora(cuerpo: bytes, mime: str) -> None:
+    # Si la declaración se ha podido leer como ASCII, el documento no está en UTF-16 ni UTF-32
+    # (WHATWG lo trata como UTF-8): hacerle caso convertiría toda la página en basura ilegible.
+    assert "Señal" in decodificar(cuerpo, mime=mime)
+
+
+def test_declaracion_xml_hostil_no_dispara_el_tiempo() -> None:
+    hostil = b"<?xml " + b" " * 3000 + b"encoding" * 5000 + b"=" * 100_000
+    inicio = time.perf_counter()
+    decodificar(hostil)
+    assert time.perf_counter() - inicio < 1
+
+
 def test_errores_http_se_devuelven_como_pagina() -> None:
     transporte = TransporteFalso({URL: [respuesta(b"<h1>No encontrada</h1>", estado=404)]})
     pagina = asyncio.run(descargador(transporte).descargar(URL))
@@ -220,7 +332,7 @@ def test_errores_http_se_devuelven_como_pagina() -> None:
 
 def test_error_http_con_tipo_raro_no_lee_el_cuerpo() -> None:
     transporte = TransporteFalso(
-        {URL: [respuesta(b'{"error": 1}', estado=503, tipo="application/json")]}
+        {URL: [respuesta(b"%PDF-1.7", estado=503, tipo="application/pdf")]}
     )
     pagina = asyncio.run(descargador(transporte).descargar(URL))
     assert pagina.estado == 503 and pagina.html == ""

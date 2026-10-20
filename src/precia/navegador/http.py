@@ -7,7 +7,9 @@ Defensas, porque todo lo que manda la web es no confiable:
 - Al abrir el socket se vuelve a resolver el nombre y se comprueba la IP a la que se conecta de
   verdad (contra el *DNS rebinding*: la IP validada antes podría no ser la de ahora).
 - Sin proxies del entorno, sin cookies y sin compresión.
-- El cuerpo se lee por trozos con un tope de bytes y de tiempo total, y solo se acepta HTML o texto.
+- El cuerpo se lee por trozos con un tope de bytes y de tiempo total, y solo se acepta HTML o texto
+  y, para las APIs públicas de plataforma y el descriptor OpenSearch (nota 15), JSON o XML, con el
+  mismo límite de bytes. Esos datos llegan tal cual en `Pagina.html`: no se interpretan aquí.
 """
 
 import asyncio
@@ -36,11 +38,33 @@ MAXIMO_BYTES = 5 * 1024 * 1024
 MAXIMO_REDIRECCIONES = 5
 TAMANO_TROZO = 64 * 1024
 TIPOS_ADMITIDOS = frozenset({"text/html", "application/xhtml+xml", "text/plain"})
+"""Páginas. Chromium solo acepta estas: un JSON renderizado sería el visor del navegador."""
+TIPOS_DATOS = frozenset(
+    {
+        "application/json",
+        "application/opensearchdescription+xml",
+        "application/xml",
+        "text/xml",
+    }
+)
+"""Datos que solo descarga `DescargadorHTTP`: APIs públicas (JSON) y descriptor OpenSearch (XML)."""
+_TIPOS_DESCARGABLES = TIPOS_ADMITIDOS | TIPOS_DATOS
+# Lo que se acepta, y nada más (sin `*/*`): el HTML primero y los datos con menos peso.
+ACCEPT = (
+    "text/html,application/xhtml+xml;q=0.9,text/plain;q=0.8,"
+    "application/json;q=0.5,application/opensearchdescription+xml;q=0.5,"
+    "application/xml;q=0.4,text/xml;q=0.4"
+)
 REDIRECCIONES = frozenset({301, 302, 303, 307, 308})
 # Códecs que Python acepta como «charset» pero que no son de la web (o, como UTF-7, se han usado
 # para colar XSS): con ellos se decodifica como UTF-8.
 _CODECS_VETADOS = frozenset({"utf-7", "unicode-escape", "raw-unicode-escape", "idna", "punycode"})
 _META_CHARSET = re.compile(rb"""<meta[^>]*?charset\s*=\s*["']?\s*([a-zA-Z0-9_.:-]+)""", re.I)
+# Declaración XML (`<?xml version="1.0" encoding="..."?>`): solo vale al principio del documento,
+# así que se busca con `match` y acotada; los cuantificadores son acotados o posesivos.
+_DECLARACION_XML = re.compile(
+    rb"""<\?xml\s[^>?]{0,200}?encoding\s*+=\s*+["']([a-zA-Z0-9_.:-]{1,40})"""
+)
 
 
 class Lector(Protocol):
@@ -83,7 +107,7 @@ class DescargadorHTTP:
         self._reloj = reloj
         self._cabeceras = {
             "User-Agent": user_agent,
-            "Accept": "text/html,application/xhtml+xml;q=0.9,text/plain;q=0.8",
+            "Accept": ACCEPT,
             "Accept-Language": "es-ES,es;q=0.9,en;q=0.5",
             "Accept-Encoding": "identity",
         }
@@ -129,7 +153,7 @@ class DescargadorHTTP:
             return _Resultado(crudo.estado, destino=destino)
 
         mime, charset = _tipo_contenido(cabeceras.get("content-type"))
-        if mime not in TIPOS_ADMITIDOS:
+        if mime not in _TIPOS_DESCARGABLES:
             if 200 <= crudo.estado < 300:
                 raise ErrorDescarga(f"La respuesta no es una página web (tipo «{mime}»).")
             # En un error (404, 503...) lo que importa es el estado: el cuerpo ni se lee.
@@ -140,7 +164,7 @@ class DescargadorHTTP:
         if longitud.isdigit() and int(longitud) > self._max_bytes:
             raise ErrorDescarga("La página es demasiado grande.")
         datos = self._leer(crudo.cuerpo)
-        return _Resultado(crudo.estado, html=decodificar(datos, charset), tipo=mime)
+        return _Resultado(crudo.estado, html=decodificar(datos, charset, mime=mime), tipo=mime)
 
     def _leer(self, cuerpo: Lector) -> bytes:
         # El timeout del socket solo limita cada lectura: una web que suelta un byte cada pocos
@@ -168,8 +192,13 @@ class _Resultado:
     tipo: str = ""
 
 
-def decodificar(datos: bytes, charset: str | None = None) -> str:
-    """Texto de la respuesta: BOM, después el charset de la cabecera, el `<meta>` y UTF-8."""
+def decodificar(datos: bytes, charset: str | None = None, *, mime: str = "text/html") -> str:
+    """Texto de la respuesta: BOM, charset de la cabecera, `<meta>`, declaración XML y UTF-8.
+
+    El `<meta charset>` solo vale en HTML y la declaración `<?xml?>` solo en HTML y XML. Un JSON
+    (UTF-8 por RFC 8259) o un XML pueden llevar dentro HTML de una descripción con su propio
+    `<meta charset=windows-1252>`: hacerle caso destrozaría los acentos y el «€» de todo el texto.
+    """
     for bom, nombre in (
         (codecs.BOM_UTF8, "utf-8-sig"),
         (codecs.BOM_UTF16_LE, "utf-16"),
@@ -177,9 +206,16 @@ def decodificar(datos: bytes, charset: str | None = None) -> str:
     ):
         if datos.startswith(bom):
             return datos.decode(nombre, "replace")
-    for candidato in (charset, _charset_meta(datos)):
+    es_json = mime == "application/json"
+    es_xml = mime in TIPOS_DATOS and not es_json
+    meta = None if es_json or es_xml else _charset_meta(datos)
+    xml = None if es_json else _charset_xml(datos)
+    for candidato, de_dentro in ((charset, False), (meta, True), (xml, True)):
         codec = _codec(candidato)
         if codec is None:
+            continue
+        if de_dentro and codec.startswith(("utf-16", "utf-32")):
+            # Si se ha leído como ASCII, el documento no está en UTF-16/32 (WHATWG: es UTF-8).
             continue
         try:
             return datos.decode(codec, "replace")
@@ -371,6 +407,11 @@ def _tipo_contenido(valor: str | None) -> tuple[str, str | None]:
 
 def _charset_meta(datos: bytes) -> str | None:
     encontrado = _META_CHARSET.search(datos, 0, 4096)
+    return encontrado[1].decode("ascii") if encontrado else None
+
+
+def _charset_xml(datos: bytes) -> str | None:
+    encontrado = _DECLARACION_XML.match(datos, 0, 1024)
     return encontrado[1].decode("ascii") if encontrado else None
 
 
