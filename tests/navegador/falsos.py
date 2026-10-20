@@ -96,3 +96,15 @@ class DescargadorFalso:
 
     async def cerrar(self) -> None:
         self.cerrado = True
+
+
+class DescargadorGrandeFalso(DescargadorFalso):
+    """Como `DescargadorFalso`, con `descargar_grande` (sitemaps): apunta el tope que se pide."""
+
+    def __init__(self, respuestas: Mapping[str, Pagina | Exception] | None = None) -> None:
+        super().__init__(respuestas)
+        self.grandes: list[tuple[str, int]] = []
+
+    async def descargar_grande(self, url: str, *, max_bytes: int) -> Pagina:
+        self.grandes.append((url, max_bytes))
+        return await self.descargar(url)

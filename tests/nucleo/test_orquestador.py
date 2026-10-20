@@ -5,18 +5,20 @@ el `ProveedorSimulado` detrás de un `ServicioIA` de verdad con el almacén como
 """
 
 import asyncio
+import time
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 import pytest
 
 from precia.almacen.sqlite import Almacen
+from precia.fuentes.sitemap import MAX_ENTRADAS_SITEMAP, MAX_FICHEROS_SITEMAP, palabras_url
 from precia.ia.servicio import ServicioIA
 from precia.ia.simulado import Guion, ProveedorSimulado
-from precia.ia.tipos import ErrorIA, IANoDisponible, PresupuestoAgotado
+from precia.ia.tipos import ErrorIA, IANoDisponible, PeticionIA, PresupuestoAgotado
 from precia.navegador.tipos import Bloqueado, ErrorDescarga, Pagina, ProhibidoPorRobots
 from precia.nucleo.modelos import (
     ConsultaBusqueda,
@@ -28,8 +30,20 @@ from precia.nucleo.modelos import (
     ProgresoTienda,
     ResultadoBusqueda,
 )
-from precia.nucleo.orquestador import ESTRUCTURADOS, Orquestador
-from precia.perfiles.tipos import TIPO_API_SHOPIFY, TIPO_API_WOOCOMMERCE, Perfil
+from precia.nucleo.orquestador import (
+    BLOQUEO,
+    ESTRUCTURADOS,
+    MAX_PAGINAS_LISTADO,
+    MAX_RESULTADOS_PAGINA,
+    REFRESCO_CATALOGO,
+    Orquestador,
+)
+from precia.perfiles import catalogo
+from precia.perfiles.tipos import (
+    TIPO_API_SHOPIFY,
+    TIPO_API_WOOCOMMERCE,
+    Perfil,
+)
 from tests.navegador.falsos import validar_con_dns_publico
 from tests.perfiles.plataformas import (
     SHOPIFY,
@@ -47,17 +61,24 @@ from tests.perfiles.sitio import (
     CAMPOS_OK,
     CONSULTA,
     DOMINIO,
+    LISTADO,
     LISTADO_OK,
     PORTADA,
     PRODUCTOS,
+    SITEMAP,
     TIENDA,
     NavegadorFalso,
+    Producto,
     html_ficha,
     html_listado,
     html_next,
     next_data,
     paginas_sitio,
     perfil,
+    perfil_listado,
+    perfil_sitemap,
+    xml_indice,
+    xml_urlset,
 )
 
 AHORA = datetime(2026, 10, 19, 12, 0, tzinfo=UTC)
@@ -451,9 +472,12 @@ class NavegadorProhibido:
     def __init__(self) -> None:
         self.pedidas: list[str] = []
 
-    async def obtener(self, url: str, *, js: bool = False) -> Pagina:
+    async def obtener(self, url: str, *, js: bool = False, grande: bool = False) -> Pagina:
         self.pedidas.append(url)
         raise ProhibidoPorRobots("El robots.txt de la tienda no permite visitar esa página.")
+
+    async def sitemaps(self, url: str) -> tuple[str, ...]:
+        return ()
 
 
 def test_robots_que_lo_prohibe_todo_al_configurar_omite_la_tienda() -> None:
@@ -589,13 +613,13 @@ class NavegadorCita(NavegadorFalso):
         self.en_vuelo = 0
         self.ambas = asyncio.Event()
 
-    async def obtener(self, url: str, *, js: bool = False) -> Pagina:
+    async def obtener(self, url: str, *, js: bool = False, grande: bool = False) -> Pagina:
         if "/buscar" in url:
             self.en_vuelo += 1
             if self.en_vuelo == 2:
                 self.ambas.set()
             await asyncio.wait_for(self.ambas.wait(), 2)
-        return await super().obtener(url, js=js)
+        return await super().obtener(url, js=js, grande=grande)
 
 
 def test_las_tiendas_se_buscan_en_paralelo() -> None:
@@ -855,3 +879,584 @@ def test_destacados_del_json_embebido_no_son_resultados_de_la_busqueda() -> None
     assert m.navegador.urls == [BUSQUEDA]
     assert m.peticiones_ia == []
     assert "Sin resultados" in paso(r, "extracción").detalle
+
+
+# --- Perfiles sin buscador: listado y sitemap (nota 16) -------------------------------------------
+
+OTROS = (
+    replace(PRODUCTOS[0], ruta="/p/retrovisor-seat-ibiza", titulo="Retrovisor derecho Seat Ibiza"),
+    replace(PRODUCTOS[1], ruta="/p/bomba-agua-opel-astra", titulo="Bomba de agua Opel Astra"),
+)
+
+
+def pagina_listado(numero: int) -> str:
+    return LISTADO.replace("{pagina}", str(numero))
+
+
+def otro(numero: int) -> Producto:
+    """Un producto que no tiene nada que ver con «faro golf»."""
+    return replace(
+        PRODUCTOS[2], ruta=f"/p/alternador-seat-{numero}", titulo=f"Alternador Seat modelo {numero}"
+    )
+
+
+def sitio_listado(*paginas: Iterable[Producto]) -> dict[str, str]:
+    """Las páginas del listado (1, 2...) y las fichas de todos sus productos."""
+    sitio: dict[str, str] = {}
+    for numero, productos in enumerate(paginas, start=1):
+        lista = tuple(productos)
+        sitio[pagina_listado(numero)] = html_listado(lista)
+        for producto in lista:
+            sitio[producto.url] = html_ficha(producto)
+    return sitio
+
+
+def test_perfil_listado_recorre_las_paginas_y_filtra_por_la_consulta() -> None:
+    sitio = sitio_listado([OTROS[0], PRODUCTOS[0]], [PRODUCTOS[1], OTROS[1]], [])
+    m = montar(nuevo_almacen(perfil_listado()), NavegadorFalso(sitio), {})
+    r = m.buscar(modo=Modo.AUTO)
+
+    # Se para en la primera página sin resultados y solo abre las fichas que nombran la consulta.
+    assert m.navegador.urls == [
+        pagina_listado(1),
+        pagina_listado(2),
+        pagina_listado(3),
+        PRODUCTOS[0].url,
+        PRODUCTOS[1].url,
+    ]
+    assert sorted(o.url for o in ofertas(r)) == sorted([PRODUCTOS[0].url, PRODUCTOS[1].url])
+    assert paso(r, "búsqueda") == Paso(
+        "búsqueda",
+        EstadoPaso.OK,
+        "Listado de la tienda (sin buscador): 3 páginas, 2 coincidencias de 4",
+    )
+    assert [p.nombre for p in progreso(r).pasos] == [
+        "robots.txt",
+        "perfil",
+        "búsqueda",
+        "extracción",
+        "verificación",
+    ]
+    assert m.peticiones_ia == []
+    tienda = m.almacen.tienda(DOMINIO)
+    assert tienda is not None and tienda.estado is EstadoPerfil.ACTIVO
+
+
+def test_perfil_listado_recorre_como_mucho_cinco_paginas() -> None:
+    sitio = sitio_listado(*([otro(n)] for n in range(1, 9)))
+    m = montar(nuevo_almacen(perfil_listado()), NavegadorFalso(sitio), {})
+    r = m.buscar(modo=Modo.CLASICO)
+    assert MAX_PAGINAS_LISTADO == 5
+    assert m.navegador.urls == [pagina_listado(n) for n in range(1, 6)]
+    assert ofertas(r) == []
+    assert "5 páginas, 0 coincidencias de 5" in paso(r, "búsqueda").detalle
+    assert "Sin resultados" in paso(r, "extracción").detalle
+
+
+def test_perfil_listado_se_para_en_una_pagina_repetida() -> None:
+    # La tienda no entiende el número de página y devuelve siempre la primera.
+    sitio = sitio_listado([PRODUCTOS[0], OTROS[0]], [PRODUCTOS[0], OTROS[0]], [PRODUCTOS[1]])
+    m = montar(nuevo_almacen(perfil_listado()), NavegadorFalso(sitio), {})
+    r = m.buscar(modo=Modo.CLASICO)
+    assert m.navegador.urls == [pagina_listado(1), pagina_listado(2), PRODUCTOS[0].url]
+    assert "2 páginas, 1 coincidencias de 2" in paso(r, "búsqueda").detalle
+
+
+def test_perfil_listado_sin_pagina_solo_lee_la_url_del_listado() -> None:
+    url = f"{TIENDA}/categoria/faros"
+    sitio = sitio_listado([PRODUCTOS[0], OTROS[0]])
+    sitio[url] = sitio.pop(pagina_listado(1))
+    m = montar(nuevo_almacen(perfil_listado(url_busqueda=url)), NavegadorFalso(sitio), {})
+    r = m.buscar(modo=Modo.CLASICO)
+    assert m.navegador.urls == [url, PRODUCTOS[0].url]
+    assert [o.url for o in ofertas(r)] == [PRODUCTOS[0].url]
+    assert "1 páginas, 1 coincidencias de 2" in paso(r, "búsqueda").detalle
+
+
+def test_perfil_listado_abre_como_mucho_max_fichas_y_deja_de_paginar() -> None:
+    # Con `max_fichas` coincidencias que nombran toda la consulta ya no se piden más páginas.
+    sitio = sitio_listado(PRODUCTOS[:2], PRODUCTOS[2:], [OTROS[0]])
+    m = montar(nuevo_almacen(perfil_listado()), NavegadorFalso(sitio), {}, max_fichas=2)
+    r = m.buscar(modo=Modo.CLASICO)
+    assert m.navegador.urls == [pagina_listado(1), PRODUCTOS[0].url, PRODUCTOS[1].url]
+    assert len(ofertas(r)) == 2
+
+
+def test_perfil_listado_prefiere_los_que_nombran_toda_la_consulta() -> None:
+    golf = replace(OTROS[0], ruta="/p/retrovisor-golf", titulo="Retrovisor Golf VI")
+    sitio = sitio_listado([golf, PRODUCTOS[0]], [])
+    m = montar(nuevo_almacen(perfil_listado()), NavegadorFalso(sitio), {}, max_fichas=1)
+    r = m.buscar(modo=Modo.CLASICO)
+    assert [o.url for o in ofertas(r)] == [PRODUCTOS[0].url]
+
+
+def test_perfil_listado_encuentra_la_referencia_oem_en_la_ruta() -> None:
+    con_ref = replace(PRODUCTOS[0], ruta="/p/pieza-5k1-941-005-e", titulo="Pieza de recambio")
+    sitio = sitio_listado([OTROS[0], con_ref], [])
+    m = montar(nuevo_almacen(perfil_listado()), NavegadorFalso(sitio), {})
+    r = m.buscar(texto="5K1941005E", modo=Modo.CLASICO)
+    assert m.navegador.urls[-1] == con_ref.url and OTROS[0].url not in m.navegador.urls
+    assert [o.url for o in ofertas(r)] == [con_ref.url]
+
+
+def test_perfil_listado_bloqueado_en_una_pagina_se_para() -> None:
+    sitio = sitio_listado([PRODUCTOS[0]], [PRODUCTOS[1]], [PRODUCTOS[2]])
+    bloqueo = Bloqueado(pagina_listado(2), "La tienda rechaza el acceso automático (HTTP 403)")
+    navegador = NavegadorFalso(sitio, errores={pagina_listado(2): bloqueo})
+    m = montar(nuevo_almacen(perfil_listado()), navegador, {})
+    r = m.buscar(modo=Modo.AUTO)
+    # Ni una petición más: ni la página 3 ni las fichas.
+    assert m.navegador.urls == [pagina_listado(1), pagina_listado(2)]
+    assert ofertas(r) == []
+    errores = [p for p in progreso(r).pasos if p.estado is EstadoPaso.ERROR]
+    assert len(errores) == 1 and errores[0].detalle.startswith(BLOQUEO)
+    assert m.peticiones_ia == []
+    tienda = m.almacen.tienda(DOMINIO)
+    assert tienda is not None and tienda.bloqueos == 1
+
+
+def test_perfil_listado_con_la_primera_pagina_que_no_responde_es_un_error() -> None:
+    m = montar(nuevo_almacen(perfil_listado()), NavegadorFalso({}), {})
+    r = m.buscar(modo=Modo.CLASICO)
+    assert m.navegador.urls == [pagina_listado(1)]
+    assert paso(r, "búsqueda").estado is EstadoPaso.ERROR
+    assert "404" in paso(r, "búsqueda").detalle
+
+
+def test_perfil_listado_una_pagina_que_no_existe_termina_el_recorrido() -> None:
+    sitio = sitio_listado([PRODUCTOS[0]], [PRODUCTOS[1]])
+    m = montar(nuevo_almacen(perfil_listado()), NavegadorFalso(sitio), {})
+    r = m.buscar(modo=Modo.CLASICO)
+    assert m.navegador.urls[:3] == [pagina_listado(1), pagina_listado(2), pagina_listado(3)]
+    assert len(ofertas(r)) == 2
+    assert paso(r, "búsqueda").estado is EstadoPaso.OK
+    assert "3 páginas, 2 coincidencias de 2" in paso(r, "búsqueda").detalle
+
+
+def test_perfil_listado_que_redirige_fuera_de_la_tienda_no_se_usa() -> None:
+    sitio = sitio_listado([PRODUCTOS[0]])
+    sitio["https://otra-tienda.es/listado"] = sitio[pagina_listado(1)]
+    navegador = NavegadorFalso(
+        sitio, redirecciones={pagina_listado(1): "https://otra-tienda.es/listado"}
+    )
+    m = montar(nuevo_almacen(perfil_listado()), navegador, {})
+    r = m.buscar(modo=Modo.CLASICO)
+    assert paso(r, "búsqueda").estado is EstadoPaso.ERROR
+    assert m.navegador.urls == [pagina_listado(1)]
+    assert ofertas(r) == []
+
+
+def test_perfil_listado_con_selectores_que_ya_no_encuentran_nada_esta_roto() -> None:
+    sitio = sitio_listado(PRODUCTOS)
+    m = montar(nuevo_almacen(perfil_listado(sel_resultado="div.resultado")), NavegadorFalso(sitio))
+    r = m.buscar(modo=Modo.CLASICO)
+    assert m.navegador.urls == [pagina_listado(1)]
+    error = [p for p in progreso(r).pasos if p.estado is EstadoPaso.ERROR]
+    assert len(error) == 1 and "perfil roto" in error[0].detalle.lower()
+    tienda = m.almacen.tienda(DOMINIO)
+    assert tienda is not None and tienda.estado is EstadoPerfil.ROTO
+
+
+def test_perfil_listado_roto_no_llama_al_reparador() -> None:
+    # El reparador solo sabe validar una plantilla de búsqueda con `{consulta}`.
+    sitio = sitio_listado(PRODUCTOS)
+    almacen = nuevo_almacen(perfil_listado(sel_resultado="div.resultado"))
+    m = montar(almacen, NavegadorFalso(sitio), {"reparador": [PROPUESTA]})
+    r = m.buscar(modo=Modo.AUTO)
+    assert m.peticiones_ia == []
+    assert "perfil roto" in " ".join(p.detalle.lower() for p in progreso(r).pasos)
+
+
+def test_perfil_listado_con_selector_no_valido_esta_roto() -> None:
+    sitio = sitio_listado(PRODUCTOS)
+    almacen = nuevo_almacen(perfil_listado(sel_resultado="li.producto:has(a)"))
+    m = montar(almacen, NavegadorFalso(sitio), {})
+    r = m.buscar(modo=Modo.CLASICO)
+    tienda = m.almacen.tienda(DOMINIO)
+    assert tienda is not None and tienda.estado is EstadoPerfil.ROTO
+    assert r.grupos == ()
+
+
+def test_perfil_listado_vacio_sin_productos_no_esta_roto() -> None:
+    sitio = {pagina_listado(1): SIN_RESULTADOS}
+    m = montar(nuevo_almacen(perfil_listado()), NavegadorFalso(sitio), {})
+    r = m.buscar(modo=Modo.CLASICO)
+    assert "Sin resultados" in paso(r, "extracción").detalle
+    tienda = m.almacen.tienda(DOMINIO)
+    assert tienda is not None and tienda.estado is EstadoPerfil.ACTIVO
+
+
+SITEMAP_PRODUCTOS = f"{TIENDA}/sitemap-productos.xml"
+
+
+class Reloj:
+    """Un reloj que se puede adelantar (el del almacén fecha el catálogo)."""
+
+    def __init__(self, ahora: datetime) -> None:
+        self.ahora = ahora
+
+    def __call__(self) -> datetime:
+        return self.ahora
+
+
+def con_sitemaps(xml: Mapping[str, str] | None = None, **opciones: Any) -> NavegadorFalso:
+    """El sitio falso, que además sirve los sitemaps de `xml` (URL → XML)."""
+    return NavegadorFalso({**paginas_sitio(), **(xml or {})}, **opciones)
+
+
+def almacen_con_catalogo(
+    *urls: str, reloj: Reloj | None = None, parcial: bool = False, guardado: bool = True
+) -> Almacen:
+    reloj = reloj or Reloj(AHORA)
+    almacen = Almacen(":memory:", reloj=reloj)
+    almacen.alta_tienda(DOMINIO, "Recambios")
+    almacen.guardar_perfil(perfil_sitemap(sel_campos=dict(CAMPOS_OK)))
+    if guardado:
+        almacen.guardar_catalogo(
+            DOMINIO, SITEMAP, [(u, palabras_url(u), None) for u in urls], parcial=parcial
+        )
+    return almacen
+
+
+TODAS = [*(p.url for p in PRODUCTOS), *(p.url for p in OTROS)]
+
+
+def test_perfil_sitemap_busca_en_el_catalogo_y_abre_las_fichas() -> None:
+    almacen = almacen_con_catalogo(*TODAS)
+    m = montar(almacen, con_sitemaps(), {})
+    r = m.buscar(modo=Modo.AUTO)
+    # Catálogo al día: no se descarga el sitemap; solo las fichas que nombran «faro» y «golf».
+    con_faro_y_golf = [p.url for p in PRODUCTOS[:3]]
+    assert sorted(m.navegador.urls) == sorted(con_faro_y_golf)
+    assert sorted(o.url for o in ofertas(r)) == sorted(con_faro_y_golf)
+    assert paso(r, "búsqueda") == Paso(
+        "búsqueda", EstadoPaso.OK, "Catálogo por sitemap (6 URL): 3 coincidencias"
+    )
+    assert [p.nombre for p in progreso(r).pasos] == [
+        "robots.txt",
+        "perfil",
+        "búsqueda",
+        "extracción",
+        "verificación",
+    ]
+    assert m.peticiones_ia == []
+    tienda = m.almacen.tienda(DOMINIO)
+    assert tienda is not None and tienda.estado is EstadoPerfil.ACTIVO
+
+
+def test_perfil_sitemap_avisa_si_el_catalogo_es_parcial() -> None:
+    almacen = almacen_con_catalogo(*TODAS, parcial=True)
+    m = montar(almacen, con_sitemaps(), {})
+    r = m.buscar(modo=Modo.CLASICO)
+    assert paso(r, "búsqueda").detalle == "Catálogo por sitemap (6 URL, parcial): 3 coincidencias"
+
+
+def test_perfil_sitemap_abre_como_mucho_max_fichas() -> None:
+    almacen = almacen_con_catalogo(*TODAS)
+    m = montar(almacen, con_sitemaps(), {}, max_fichas=2)
+    r = m.buscar(modo=Modo.CLASICO)
+    assert len(m.navegador.urls) == 2 and len(ofertas(r)) == 2
+
+
+def test_perfil_sitemap_sin_coincidencias_no_abre_fichas() -> None:
+    almacen = almacen_con_catalogo(*TODAS)
+    m = montar(almacen, con_sitemaps(), {})
+    r = m.buscar(texto="embrague", modo=Modo.CLASICO)
+    assert m.navegador.urls == []
+    assert "0 coincidencias" in paso(r, "búsqueda").detalle
+    assert "Sin resultados" in paso(r, "extracción").detalle
+
+
+def test_perfil_sitemap_con_catalogo_viejo_lo_rehace() -> None:
+    reloj = Reloj(AHORA - timedelta(days=8))
+    almacen = almacen_con_catalogo(PRODUCTOS[3].url, reloj=reloj)
+    reloj.ahora = AHORA
+    navegador = con_sitemaps({SITEMAP: xml_urlset(TODAS)})
+    m = montar(almacen, navegador, {})
+    r = m.buscar(modo=Modo.CLASICO)
+    assert m.navegador.pedidas[0] == (SITEMAP, False)
+    assert m.navegador.grandes == [SITEMAP]
+    info = m.almacen.catalogo(DOMINIO)
+    assert info is not None and (info.total, info.actualizado, info.parcial) == (6, AHORA, False)
+    assert len(ofertas(r)) == 3
+    assert "Catálogo por sitemap (6 URL): 3 coincidencias" in paso(r, "búsqueda").detalle
+
+
+def test_perfil_sitemap_con_catalogo_de_siete_dias_no_lo_rehace() -> None:
+    reloj = Reloj(AHORA - REFRESCO_CATALOGO)
+    almacen = almacen_con_catalogo(*TODAS, reloj=reloj)
+    navegador = con_sitemaps({SITEMAP: xml_urlset([])})
+    m = montar(almacen, navegador, {})
+    m.buscar(modo=Modo.CLASICO)
+    assert SITEMAP not in m.navegador.urls
+
+
+def test_perfil_sitemap_sin_catalogo_lo_hace_desde_el_indice() -> None:
+    ajeno = "https://otra-tienda.es/sitemap-productos.xml"
+    navegador = con_sitemaps(
+        {
+            SITEMAP: xml_indice([f"{TIENDA}/sitemap-paginas.xml", SITEMAP_PRODUCTOS, ajeno]),
+            SITEMAP_PRODUCTOS: xml_urlset([*TODAS, "https://otra-tienda.es/p/faro-golf"]),
+            f"{TIENDA}/sitemap-paginas.xml": xml_urlset([f"{TIENDA}/p/faro-golf-aviso-legal"]),
+        },
+    )
+    m = montar(almacen_con_catalogo(guardado=False), navegador, {})
+    r = m.buscar(modo=Modo.CLASICO)
+    # Solo el sitemap de productos (por el nombre) y nunca uno de otro host.
+    assert m.navegador.urls[:2] == [SITEMAP, SITEMAP_PRODUCTOS]
+    assert all("otra-tienda" not in u for u in m.navegador.urls)
+    info = m.almacen.catalogo(DOMINIO)
+    assert info is not None and (info.sitemap, info.total) == (SITEMAP, 6)
+    assert len(ofertas(r)) == 3
+
+
+def test_perfil_sitemap_con_url_malas_en_el_sitemap_las_descarta() -> None:
+    malas = [
+        "https://otra-tienda.es/p/faro-golf",
+        f"https://usuario@www.{DOMINIO}/p/faro-golf-x",
+        f"{TIENDA}/p/{'faro-golf-' * 300}",
+    ]
+    navegador = con_sitemaps({SITEMAP: xml_urlset([*malas, *TODAS])})
+    m = montar(almacen_con_catalogo(guardado=False), navegador, {})
+    r = m.buscar(modo=Modo.CLASICO)
+    info = m.almacen.catalogo(DOMINIO)
+    assert info is not None and info.total == 6
+    assert len(ofertas(r)) == 3
+
+
+def test_perfil_sitemap_con_tope_de_ficheros_queda_parcial() -> None:
+    hijos = [f"{TIENDA}/product-sitemap{n}.xml" for n in range(1, 15)]
+    xml = {SITEMAP: xml_indice(hijos), **{h: xml_urlset([PRODUCTOS[0].url]) for h in hijos}}
+    xml[hijos[0]] = xml_urlset(TODAS)
+    navegador = con_sitemaps(xml)
+    m = montar(almacen_con_catalogo(guardado=False), navegador, {})
+    r = m.buscar(modo=Modo.CLASICO)
+    assert len(m.navegador.grandes) == MAX_FICHEROS_SITEMAP
+    info = m.almacen.catalogo(DOMINIO)
+    assert info is not None and info.parcial
+    assert ", parcial)" in paso(r, "búsqueda").detalle
+
+
+def test_perfil_sitemap_bloqueado_al_rehacer_el_catalogo_se_para() -> None:
+    bloqueo = Bloqueado(SITEMAP, "Desafío de Cloudflare")
+    navegador = con_sitemaps(errores={SITEMAP: bloqueo})
+    m = montar(almacen_con_catalogo(guardado=False), navegador, {"configurador": []})
+    r = m.buscar(modo=Modo.AUTO)
+    assert m.navegador.urls == m.navegador.grandes == [SITEMAP]
+    assert m.peticiones_ia == []
+    errores = [p for p in progreso(r).pasos if p.estado is EstadoPaso.ERROR]
+    assert len(errores) == 1 and errores[0].detalle.startswith(BLOQUEO)
+    tienda = m.almacen.tienda(DOMINIO)
+    assert tienda is not None and tienda.bloqueos == 1
+
+
+def test_perfil_sitemap_que_no_responde_usa_el_catalogo_viejo_y_avisa() -> None:
+    reloj = Reloj(AHORA - timedelta(days=30))
+    almacen = almacen_con_catalogo(*TODAS, reloj=reloj)
+    reloj.ahora = AHORA
+    m = montar(almacen, con_sitemaps(), {})
+    r = m.buscar(modo=Modo.CLASICO)
+    assert m.navegador.urls[0] == SITEMAP
+    aviso = paso(r, "catálogo")
+    assert aviso.estado is EstadoPaso.AVISO and "no responde" in aviso.detalle
+    assert len(ofertas(r)) == 3
+    info = m.almacen.catalogo(DOMINIO)
+    assert info is not None and info.total == 6
+
+
+def test_perfil_sitemap_sin_catalogo_y_sin_sitemap_es_un_error() -> None:
+    m = montar(almacen_con_catalogo(guardado=False), con_sitemaps(), {})
+    r = m.buscar(modo=Modo.CLASICO)
+    assert m.navegador.urls == m.navegador.grandes == [SITEMAP]
+    assert paso(r, "búsqueda").estado is EstadoPaso.ERROR
+    assert ofertas(r) == []
+
+
+def test_perfil_sitemap_que_no_es_un_sitemap_no_borra_el_catalogo() -> None:
+    reloj = Reloj(AHORA - timedelta(days=30))
+    almacen = almacen_con_catalogo(*TODAS, reloj=reloj)
+    reloj.ahora = AHORA
+    navegador = con_sitemaps({SITEMAP: "<html><body>Hola</body></html>"})
+    m = montar(almacen, navegador, {})
+    r = m.buscar(modo=Modo.CLASICO)
+    info = m.almacen.catalogo(DOMINIO)
+    assert info is not None and info.total == 6
+    assert paso(r, "catálogo").estado is EstadoPaso.AVISO
+    assert len(ofertas(r)) == 3
+
+
+# --- Casos hostiles (cronometrados) ------------------------------------------------------------
+
+
+def test_listado_hostil_con_miles_de_resultados_y_titulos_enormes_es_lineal() -> None:
+    # Cada página (2 MB) trae 1000 tarjetas con títulos de 2000 caracteres y una consulta enorme:
+    # se leen como mucho `MAX_RESULTADOS_PAGINA` por página y el filtro es de subcadenas.
+    largo = "golf " * 400
+    piezas = [
+        replace(OTROS[0], ruta=f"/p/pieza-{n}", titulo=f"Retrovisor {n} {largo}")
+        for n in range(1000)
+    ]
+    sitio = {pagina_listado(n): html_listado(piezas) for n in range(1, 6)}
+    consulta = " ".join(f"palabra{n}" for n in range(400)) + " faro"
+    m = montar(nuevo_almacen(perfil_listado()), NavegadorFalso(sitio), {})
+    inicio = time.perf_counter()
+    r = m.buscar(texto=consulta, modo=Modo.CLASICO)
+    duracion = time.perf_counter() - inicio
+    # La página 2 repite los mismos resultados: se para ahí.
+    assert m.navegador.urls == [pagina_listado(1), pagina_listado(2)]
+    assert f"coincidencias de {MAX_RESULTADOS_PAGINA}" in paso(r, "búsqueda").detalle
+    assert duracion < 10, f"un listado hostil tardó {duracion:.2f} s"
+
+
+def test_sitemap_con_el_maximo_de_entradas_se_guarda_y_se_busca_rapido() -> None:
+    urls = [f"{TIENDA}/p/pieza-recambio-{n}-modelo-{n % 97}" for n in range(MAX_ENTRADAS_SITEMAP)]
+    urls[-1] = PRODUCTOS[0].url
+    navegador = con_sitemaps({SITEMAP: xml_urlset(urls)})
+    m = montar(almacen_con_catalogo(guardado=False), navegador, {})
+    inicio = time.perf_counter()
+    r = m.buscar(modo=Modo.CLASICO)
+    duracion = time.perf_counter() - inicio
+    info = m.almacen.catalogo(DOMINIO)
+    assert info is not None and info.total == MAX_ENTRADAS_SITEMAP
+    assert [o.url for o in ofertas(r)] == [PRODUCTOS[0].url]
+    assert duracion < 20, f"rehacer un catálogo de 50 000 URL tardó {duracion:.2f} s"
+
+
+def test_indice_hostil_con_miles_de_hijos_solo_descarga_el_tope() -> None:
+    hijos = [f"{TIENDA}/product-sitemap{n}.xml" for n in range(MAX_ENTRADAS_SITEMAP)]
+    xml = {SITEMAP: xml_indice(hijos), hijos[0]: xml_urlset(TODAS)}
+    navegador = con_sitemaps(xml)
+    m = montar(almacen_con_catalogo(guardado=False), navegador, {})
+    inicio = time.perf_counter()
+    m.buscar(modo=Modo.CLASICO)
+    duracion = time.perf_counter() - inicio
+    assert len(m.navegador.grandes) == MAX_FICHEROS_SITEMAP
+    info = m.almacen.catalogo(DOMINIO)
+    assert info is not None and info.parcial and info.total == len(TODAS)
+    assert duracion < 10, f"un índice de 50 000 hijos tardó {duracion:.2f} s"
+
+
+def test_sitemap_con_entidades_o_dtd_no_borra_el_catalogo() -> None:
+    bomba = (
+        '<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY lol "lol">'
+        '<!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">]>'
+        f'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>{TIENDA}/p/&lol2;'
+        "</loc></url></urlset>"
+    )
+    reloj = Reloj(AHORA - timedelta(days=30))
+    almacen = almacen_con_catalogo(*TODAS, reloj=reloj)
+    reloj.ahora = AHORA
+    m = montar(almacen, con_sitemaps({SITEMAP: bomba}), {})
+    r = m.buscar(modo=Modo.CLASICO)
+    info = m.almacen.catalogo(DOMINIO)
+    assert info is not None and info.total == len(TODAS)
+    assert paso(r, "catálogo").estado is EstadoPaso.AVISO
+
+
+def test_al_llenar_el_catalogo_no_se_descargan_mas_sitemaps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Con el tope del almacén ya alcanzado, otro sitemap solo serían peticiones de más.
+    monkeypatch.setattr(catalogo, "MAX_URLS_CATALOGO", 4)
+    hijos = [f"{TIENDA}/product-sitemap{n}.xml" for n in range(1, 4)]
+    xml = {SITEMAP: xml_indice(hijos), **{h: xml_urlset(TODAS) for h in hijos}}
+    m = montar(almacen_con_catalogo(guardado=False), con_sitemaps(xml), {})
+    r = m.buscar(modo=Modo.CLASICO)
+    assert m.navegador.grandes == [SITEMAP, hijos[0]]
+    info = m.almacen.catalogo(DOMINIO)
+    assert info is not None and (info.total, info.parcial) == (4, True)
+    assert ", parcial)" in paso(r, "búsqueda").detalle
+
+
+# --- Configurar una tienda sin buscador (nota 16) ----------------------------------------------
+
+
+@dataclass
+class ConfiguradorEspia:
+    """Sustituye a `perfiles.configurador.configurar`: apunta con qué se le llama y devuelve
+    `perfil`, guardando antes el catálogo si se le da (como hace el de verdad con `sitemap`)."""
+
+    perfil: Perfil
+    entradas: tuple[str, ...] = ()
+    llamadas: list[dict[str, Any]] = field(default_factory=list)
+
+    async def __call__(self, dominio: str, *args: Any, **opciones: Any) -> Perfil:
+        self.llamadas.append(opciones)
+        catalogo = opciones.get("catalogo")
+        if catalogo is not None and self.entradas:
+            catalogo.guardar_catalogo(
+                dominio,
+                self.perfil.url_busqueda,
+                [(u, palabras_url(u), None) for u in self.entradas],
+                parcial=False,
+            )
+        return self.perfil
+
+
+def test_configurar_recibe_la_entrada_de_la_tienda_y_el_almacen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    espia = ConfiguradorEspia(perfil_listado(revisado=False, autor="🤖 configurador"))
+    monkeypatch.setattr("precia.nucleo.orquestador.configurar", espia)
+    almacen = nuevo_almacen()
+    almacen.cambiar_entrada(DOMINIO, LISTADO)
+    sitio = sitio_listado([PRODUCTOS[0]], [])
+    m = montar(almacen, NavegadorFalso(sitio), {})
+    m.buscar(modo=Modo.AUTO)
+    (opciones,) = espia.llamadas
+    assert opciones["entrada"] == LISTADO
+    assert opciones["catalogo"] is almacen
+
+
+def test_configurar_sin_entrada_pasa_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    espia = ConfiguradorEspia(perfil_listado(revisado=False, autor="🤖 configurador"))
+    monkeypatch.setattr("precia.nucleo.orquestador.configurar", espia)
+    m = montar(nuevo_almacen(), NavegadorFalso(sitio_listado([PRODUCTOS[0]], [])), {})
+    m.buscar(modo=Modo.AUTO)
+    assert espia.llamadas[0]["entrada"] is None
+
+
+def test_perfil_sitemap_nuevo_sin_ia_lo_dice_y_busca_en_su_catalogo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nuevo = perfil_sitemap(revisado=False, autor="🤖 configurador", sel_campos=dict(CAMPOS_OK))
+    espia = ConfiguradorEspia(nuevo, entradas=tuple(TODAS))
+    monkeypatch.setattr("precia.nucleo.orquestador.configurar", espia)
+    m = montar(nuevo_almacen(), con_sitemaps(), {})
+    r = m.buscar(modo=Modo.AUTO)
+    configuracion = paso(r, "perfil")
+    assert configuracion.estado is EstadoPaso.AVISO
+    assert "sitemap" in configuracion.detalle and "sin IA" in configuracion.detalle
+    assert "pendiente de revisión" in configuracion.detalle
+    # El catálogo recién guardado vale: no se vuelve a descargar el sitemap.
+    assert m.navegador.grandes == []
+    assert len(ofertas(r)) == 3
+    assert "Catálogo por sitemap (6 URL): 3 coincidencias" in paso(r, "búsqueda").detalle
+    tienda = m.almacen.tienda(DOMINIO)
+    assert tienda is not None and tienda.estado is EstadoPerfil.PENDIENTE_REVISION
+
+
+def test_perfil_listado_nuevo_con_ia_lo_dice(monkeypatch: pytest.MonkeyPatch) -> None:
+    class ConIA(ConfiguradorEspia):
+        async def __call__(self, dominio: str, *args: Any, **opciones: Any) -> Perfil:
+            sesion = args[1]
+            await sesion.pedir(
+                PeticionIA(
+                    componente="configurador",
+                    instrucciones="x",
+                    datos="y",
+                    esquema={"type": "object"},
+                    max_tokens=16,
+                )
+            )
+            return await super().__call__(dominio, *args, **opciones)
+
+    espia = ConIA(perfil_listado(revisado=False, autor="🤖 configurador"))
+    monkeypatch.setattr("precia.nucleo.orquestador.configurar", espia)
+    m = montar(
+        nuevo_almacen(), NavegadorFalso(sitio_listado([PRODUCTOS[0]], [])), {"configurador": [{}]}
+    )
+    r = m.buscar(modo=Modo.AUTO)
+    configuracion = paso(r, "perfil")
+    assert configuracion.estado is EstadoPaso.IA
+    assert "listado" in configuracion.detalle and "pendiente de revisión" in configuracion.detalle

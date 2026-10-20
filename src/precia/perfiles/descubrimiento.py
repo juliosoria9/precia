@@ -3,6 +3,9 @@
 El configurador lo usa antes de pedir selectores a la IA. Las plantillas candidatas (con
 `{consulta}`, como `Perfil.url_busqueda`) se prueban en este orden, de la más fiable a la menos:
 
+0. La **plantilla del usuario** (A1, nota 16): la URL de entrada de la tienda, si lleva
+   `{consulta}`. La ha pegado una persona, pero se filtra igual que una propuesta de la IA (del
+   dominio de la tienda, `{consulta}` una vez, fuera del host y del fragmento, sin otras llaves).
 1. El descriptor **OpenSearch** que enlaza la portada (`<link rel="search"
    type="application/opensearchdescription+xml">`): es la propia tienda diciendo cómo se busca.
 2. Los **formularios** de búsqueda GET de la portada.
@@ -104,6 +107,7 @@ ORIGEN_ENLACE = "enlace de la portada"
 ORIGEN_PLATAFORMA = "plataforma"
 ORIGEN_PATRON = "patrón habitual"
 ORIGEN_IA = "🤖 propuesta de la IA"
+ORIGEN_USUARIO = "URL de entrada del usuario"
 
 # Un parámetro opcional de OpenSearch (`{startPage?}`, `{os:count?}`): se quita de la plantilla.
 _OPCIONAL = re.compile(r"\{[A-Za-z0-9:_.-]{1,50}\?\}")
@@ -179,15 +183,25 @@ async def descubrir(
     *,
     sesion: SesionIA | None = None,
     validador: Validador = validar_url,
+    entrada: str | None = None,
 ) -> Busqueda:
     """La búsqueda de la tienda, o `ConfiguracionFallida`. Ver el docstring del módulo.
 
     `portada` es la de `abrir_portada` (`None` si no se pudo abrir). Sin `sesion` no se pide
     nada a la IA. `PresupuestoAgotado` se propaga; cualquier otro error de la IA solo significa
-    que no ha propuesto nada.
+    que no ha propuesto nada. `entrada` es la URL de entrada del usuario: si es una plantilla con
+    `{consulta}` válida, es la primera candidata (`ORIGEN_USUARIO`).
     """
     base = _base(portada, host)
     candidatas: list[tuple[str, str]] = []
+    motivo = ""
+    if entrada is not None and MARCADOR in entrada:
+        plantilla = plantilla_de_entrada(entrada, dominio)
+        if plantilla is None:
+            motivo = " La URL de entrada no es una plantilla de búsqueda válida de la tienda."
+        else:
+            candidatas.append((plantilla, ORIGEN_USUARIO))
+            motivo = " Tampoco da resultados la URL de entrada."
     resumida = portada
     if portada is not None:
         descriptores: set[str] = set()
@@ -209,7 +223,6 @@ async def descubrir(
     encontrada = await _probar(unicas, dominio, navegador, consulta, portada, validador)
     if encontrada is not None:
         return encontrada
-    motivo = ""
     if sesion is not None and resumida is not None:
         try:
             propuestas = await plantillas_de_la_ia(resumida, dominio, sesion)
@@ -217,7 +230,7 @@ async def descubrir(
             raise
         except ErrorIA as error:
             propuestas = []
-            motivo = f" La IA tampoco ha podido proponer una: {error}"
+            motivo += f" La IA tampoco ha podido proponer una: {error}"
         conocidas = {p for p, _ in candidatas}
         nuevas = [(p, ORIGEN_IA) for p in propuestas if p not in conocidas]
         encontrada = await _probar(nuevas, dominio, navegador, consulta, portada, validador)
@@ -520,6 +533,24 @@ async def plantillas_de_la_ia(portada: Pagina, dominio: str, sesion: SesionIA) -
         )
     )
     return leer_plantillas_ia(respuesta.datos, _url(portada), dominio)
+
+
+def plantilla_de_entrada(entrada: str, dominio: str) -> str | None:
+    """La URL de entrada del usuario como plantilla de búsqueda (A1), o `None` si no vale.
+
+    Absoluta, ASCII imprimible sin espacios ni caracteres raros, como mucho `MAX_PLANTILLA`
+    caracteres, con `{consulta}` una sola vez y fuera del esquema, del host y del fragmento, sin
+    otras llaves y del dominio de la tienda. Normalmente ya llega así de
+    `perfiles.entrada.normalizar_entrada`; aquí se comprueba otra vez porque es un dato guardado.
+    """
+    texto = entrada.strip()
+    if not texto or len(texto) > MAX_PLANTILLA or any(c in _PROHIBIDOS for c in texto):
+        return None
+    if not texto.isascii() or not texto.isprintable() or texto.count(MARCADOR) != 1:
+        return None
+    if "#" in texto or not _solo_el_marcador(texto):
+        return None
+    return texto if _es_de_la_tienda(texto, dominio) else None
 
 
 def leer_plantillas_ia(datos: Mapping[str, Any], base: str, dominio: str) -> list[str]:

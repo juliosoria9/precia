@@ -18,6 +18,19 @@ Un perfil `api_*` (WooCommerce, Shopify) busca en la API pública de la tienda, 
 las ofertas salen directamente de su respuesta (`fuentes.apis.ofertas_api`): no se abre ninguna
 ficha ni hay selectores que reparar. Una respuesta sin productos es «sin resultados».
 
+Tiendas sin buscador (nota 16, ADR-018):
+
+- Perfil `listado` (A2): se recorren como mucho `MAX_PAGINAS_LISTADO` páginas del listado que dio
+  el usuario (solo la URL si no lleva `{pagina}`), parando en la primera que no trae resultados
+  nuevos (vacía o repetida) o en cuanto hay `max_fichas` que nombran toda la consulta. Los
+  resultados se filtran por la consulta como los datos estructurados (`_de_la_consulta`) y se
+  abren como mucho `max_fichas` fichas. Un listado roto no lo repara la IA: se marca roto.
+- Perfil `sitemap` (B): se busca en el catálogo local de URL de la tienda
+  (`Almacen.buscar_catalogo`) y se abren esas fichas con la cascada de siempre. Si el catálogo
+  tiene más de `REFRESCO_CATALOGO`, antes se rehace desde el sitemap
+  (`perfiles.catalogo.leer_catalogo`, descargas grandes y sin caché); si eso falla, se avisa y
+  se usa el anterior. Un bloqueo en un sitemap para la tienda como cualquier otro.
+
 Después, el emparejado de todas las ofertas (como mucho `max_ofertas`) y el histórico.
 
 Modos (ADR-002): **clásico** nunca llama a la IA; **auto** solo cuando falla la vía clásica
@@ -35,16 +48,18 @@ restringido de `extraccion.selectores`, y toda URL que se visita pasa por `valid
 import asyncio
 import contextlib
 import logging
+import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Protocol
 from urllib.parse import urlsplit
 
-from precia.almacen.sqlite import Almacen, ErrorAlmacen
+from precia.almacen.sqlite import MAX_LIMITE_CATALOGO, Almacen, DatoNoValido, ErrorAlmacen
 from precia.emparejado.agrupador import agrupar
+from precia.emparejado.referencias import referencias_en
 from precia.emparejado.tipos import OfertaCandidata
 from precia.extraccion.anclaje import normalizar
 from precia.extraccion.embebidos import listado_estructurado
@@ -52,9 +67,10 @@ from precia.extraccion.ficha import extraer_ficha
 from precia.extraccion.listado import extraer_listado
 from precia.extraccion.tipos import ExtractorIA, ResultadoListado, SelectorNoValido
 from precia.fuentes.apis import AVISO_AGOTADO
+from precia.fuentes.sitemap import palabras_url
 from precia.ia.extractor import ExtractorRespaldoIA
 from precia.ia.servicio import ServicioIA, SesionIA
-from precia.ia.tipos import ErrorIA
+from precia.ia.tipos import ErrorIA, PeticionIA, RespuestaIA
 from precia.navegador.tipos import (
     Bloqueado,
     ErrorDescarga,
@@ -70,6 +86,7 @@ from precia.nucleo.modelos import (
     EstadoPaso,
     EstadoPerfil,
     GrupoProducto,
+    InfoCatalogo,
     Modo,
     OrigenDato,
     Paso,
@@ -77,11 +94,18 @@ from precia.nucleo.modelos import (
     ResultadoBusqueda,
     Tienda,
 )
+from precia.perfiles.catalogo import leer_catalogo
 from precia.perfiles.configurador import configurar
 from precia.perfiles.descubrimiento import MIN_PALABRA, parece_listado
 from precia.perfiles.protocolos import Navegador as NavegadorDePerfiles
 from precia.perfiles.reparador import reparar
-from precia.perfiles.tipos import ConfiguracionFallida, Perfil, ReparacionFallida
+from precia.perfiles.tipos import (
+    TIPO_LISTADO,
+    TIPO_SITEMAP,
+    ConfiguracionFallida,
+    Perfil,
+    ReparacionFallida,
+)
 from precia.perfiles.validador import (
     NOMBRE_PLATAFORMA,
     PLATAFORMA_DE_TIPO,
@@ -91,6 +115,18 @@ from precia.perfiles.validador import (
 )
 
 MAX_FICHAS = 5
+MAX_PAGINAS_LISTADO = 5
+"""Páginas de un perfil `listado` que se recorren como mucho en cada búsqueda (nota 16 §A2)."""
+MAX_RESULTADOS_PAGINA = 200
+"""Resultados que se leen de cada página de un listado (antes de filtrar por la consulta)."""
+REFRESCO_CATALOGO = timedelta(days=7)
+"""Un catálogo por sitemap más viejo que esto se rehace antes de buscar (nota 16 §B)."""
+MARCA_PAGINA = "{pagina}"
+LISTADO = "Listado de la tienda (sin buscador)"
+CATALOGO = "Catálogo por sitemap"
+MAX_CONSULTA = 500
+"""Caracteres de la consulta que se miran al filtrar un listado (la web ya la recorta)."""
+MAX_PALABRAS_CONSULTA = 12
 MAX_OFERTAS = 60
 """Ofertas que llegan al agrupador: con más de 150 el emparejado ya es lento."""
 GENERAL = "PrecIA"
@@ -102,6 +138,14 @@ PERMITE = "Permite la búsqueda"
 IGNORADO = "Lo prohíbe; se ignora por decisión del usuario (ADR-017)"
 INESPERADO = "Error inesperado: la tienda se salta en esta búsqueda (detalle en el registro)"
 ESTRUCTURADOS = "Selectores sin resultados: se usan los datos estructurados de la página"
+_DE_TIPO = {
+    TIPO_LISTADO: " con el listado de la URL de entrada (sin buscador)",
+    TIPO_SITEMAP: " con el catálogo del sitemap (sin buscador)",
+}
+"""Cómo se cuenta en el progreso un perfil nuevo de una tienda sin buscador (nota 16)."""
+
+_SEPARADORES = re.compile(r"[\s\-./_]+")
+"""Los de `emparejado.referencias`: una referencia se compara sin ellos («5k1-941-005-e»)."""
 
 registro = logging.getLogger(__name__)
 
@@ -128,18 +172,25 @@ class _NavegadorVigilado:
     que lo prohíbe todo saldría como «no se encuentra la búsqueda» en vez de como omitida.
     """
 
-    def __init__(self, navegador: NavegadorDePerfiles) -> None:
+    def __init__(self, navegador: "Navegador") -> None:
         self._navegador = navegador
         self.intentos = 0
         self.prohibidas = 0
 
-    async def obtener(self, url: str, *, js: bool = False) -> Pagina:
+    async def obtener(self, url: str, *, js: bool = False, grande: bool = False) -> Pagina:
         self.intentos += 1
         try:
+            if grande:
+                return await self._navegador.obtener(url, js=js, grande=True)
             return await self._navegador.obtener(url, js=js)
         except ProhibidoPorRobots:
             self.prohibidas += 1
             raise
+
+    async def sitemaps(self, url: str) -> tuple[str, ...]:
+        """Las líneas `Sitemap:` del robots.txt (nota 16 §B). No cuenta como intento: el
+        robots.txt se lee aunque se ignore (ADR-017)."""
+        return await self._navegador.sitemaps(url)
 
     @property
     def todo_prohibido(self) -> bool:
@@ -166,8 +217,30 @@ class _ExtractorVigilado:
             raise
 
 
+class _SesionContada:
+    """La sesión de IA que se le da al configurador de una tienda, contando sus llamadas.
+
+    La sesión de la búsqueda la comparten todas las tiendas en paralelo: su contador no dice si
+    la IA ha intervenido en *este* perfil.
+    """
+
+    def __init__(self, sesion: SesionIA) -> None:
+        self._sesion = sesion
+        self.llamadas = 0
+
+    async def pedir(self, peticion: PeticionIA) -> RespuestaIA:
+        self.llamadas += 1
+        return await self._sesion.pedir(peticion)
+
+
 class Navegador(NavegadorDePerfiles, Protocol):
-    """Lo que necesita el orquestador del navegador: lo de `perfiles` y si se ignoró robots."""
+    """Lo que necesita el orquestador del navegador: lo de `perfiles`, si se ignoró robots y,
+    para las tiendas sin buscador (nota 16 §B), las descargas grandes (`grande=True`) y las
+    líneas `Sitemap:` del robots.txt, que usa el configurador."""
+
+    async def obtener(self, url: str, *, js: bool = False, grande: bool = False) -> Pagina: ...
+
+    async def sitemaps(self, url: str) -> tuple[str, ...]: ...
 
     def robots_ignorado(self, dominio: str) -> bool: ...
 
@@ -426,6 +499,10 @@ class _EnTienda:
             perfil = await self._configurar()
             if perfil is None:
                 return []
+        if perfil.es_listado:
+            return await self._de_listado(perfil, nuevo)
+        if perfil.es_sitemap:
+            return await self._de_sitemap(perfil, nuevo)
         pagina = await self._buscar(perfil, nuevo)
         if pagina is None:
             return []
@@ -466,15 +543,20 @@ class _EnTienda:
             return None
         assert self.sesion is not None
         navegador = _NavegadorVigilado(self.o._navegador)
+        sesion = _SesionContada(self.sesion)
         self.visitada = True
         try:
             perfil = await configurar(
                 self.dominio,
                 navegador,
-                self.sesion,
+                sesion,
                 self.consulta.texto,
                 validador=self.o._validador,
                 reloj=self.o._reloj,
+                # Nota 16: la URL de entrada del usuario (A1 o A2) y dónde guardar el catálogo
+                # si el perfil sale del sitemap (B).
+                entrada=self.tienda.entrada,
+                catalogo=self.o._almacen,
             )
         except ConfiguracionFallida as error:
             if navegador.todo_prohibido:
@@ -504,12 +586,21 @@ class _EnTienda:
                 f"Configurador: perfil nuevo v{guardado.version} con la API pública de {nombre}, "
                 "sin IA; pendiente de revisión (se usa de forma provisional)",
             )
+        elif sesion.llamadas == 0:
+            # Sin IA: p. ej. un perfil `sitemap` cuyas fichas traen JSON-LD con el precio.
+            self.paso(
+                "perfil",
+                EstadoPaso.AVISO,
+                f"Configurador: perfil nuevo v{guardado.version}{_DE_TIPO.get(guardado.tipo, '')}"
+                ", sin IA; pendiente de revisión (se usa de forma provisional)",
+            )
         else:
             self.paso(
                 "perfil",
                 EstadoPaso.IA,
-                f"🤖 Configurador: perfil nuevo v{guardado.version}, pendiente de revisión "
-                "(se usa de forma provisional)",
+                f"🤖 Configurador: perfil nuevo v{guardado.version}"
+                f"{_DE_TIPO.get(guardado.tipo, '')}, pendiente de revisión (se usa de forma "
+                "provisional)",
             )
         return guardado
 
@@ -544,13 +635,7 @@ class _EnTienda:
             return None
         if not nuevo:
             self._paso_perfil(perfil)
-        if self.o._navegador.robots_ignorado(urlsplit(url).hostname or self.dominio):
-            # ADR-017: el usuario decidió ignorar el robots.txt; se visita, pero se enseña.
-            self.robots = (IGNORADO, False)
-            self.pasos.insert(0, Paso("robots.txt", EstadoPaso.AVISO, IGNORADO))
-        else:
-            self.robots = (PERMITE, True)
-            self.pasos.insert(0, Paso("robots.txt", EstadoPaso.OK, PERMITE))
+        self._paso_robots(url)
         if not 200 <= pagina.estado < 300:
             self.paso(
                 "búsqueda", EstadoPaso.ERROR, f"La tienda responde con el estado {pagina.estado}"
@@ -568,6 +653,176 @@ class _EnTienda:
             detalle += " (caché)"
         self.paso("búsqueda", EstadoPaso.OK, detalle)
         return pagina
+
+    def _paso_robots(self, url: str) -> None:
+        """Primer paso del progreso: si el robots.txt permitía la visita o se ha ignorado.
+
+        Se llama después de la primera descarga de la tienda (antes no se sabe) y solo una vez.
+        """
+        if self.robots is not None:
+            return
+        if self.o._navegador.robots_ignorado(urlsplit(url).hostname or self.dominio):
+            # ADR-017: el usuario decidió ignorar el robots.txt; se visita, pero se enseña.
+            self.robots = (IGNORADO, False)
+            self.pasos.insert(0, Paso("robots.txt", EstadoPaso.AVISO, IGNORADO))
+        else:
+            self.robots = (PERMITE, True)
+            self.pasos.insert(0, Paso("robots.txt", EstadoPaso.OK, PERMITE))
+
+    # --- Sin buscador: listado de la tienda (nota 16 §A2) -----------------------------------
+
+    async def _de_listado(self, perfil: Perfil, nuevo: bool) -> list[OfertaCandidata]:
+        """Recorre unas pocas páginas del listado, filtra por la consulta y abre las fichas.
+
+        Como mucho `MAX_PAGINAS_LISTADO` (solo la URL tal cual si no lleva `{pagina}`). Se para
+        en la primera página que no responde, que no trae resultados o que los repite (la
+        tienda no entiende el número de página), y en cuanto hay `max_fichas` resultados que
+        nombran toda la consulta: no se pide ni una página más de las necesarias.
+        """
+        self.fase = "búsqueda"
+        self.visitada = True
+        leidos: list[ResultadoListado] = []
+        vistas: set[str] = set()
+        paginas = 0
+        for numero, plantilla in enumerate(_paginas_listado(perfil.url_busqueda), start=1):
+            primera = numero == 1
+            try:
+                url = await self.o._validador(plantilla)
+                pagina = await self.o._navegador.obtener(url, js=perfil.necesita_js)
+            except (Bloqueado, ProhibidoPorRobots):
+                if primera and not nuevo:
+                    self._paso_perfil(perfil)
+                raise  # Se para: ni una petición más (y el robots.txt omite la tienda).
+            except (ErrorDescarga, URLNoPermitida) as error:
+                if not primera:
+                    break
+                if not nuevo:
+                    self._paso_perfil(perfil)
+                self.paso("búsqueda", EstadoPaso.ERROR, str(error))
+                return []
+            if primera:
+                if not nuevo:
+                    self._paso_perfil(perfil)
+                self._paso_robots(url)
+            paginas += 1
+            if not 200 <= pagina.estado < 300 or not de_la_tienda(pagina, self.dominio):
+                if not primera:
+                    break  # Una página que no existe es el final del listado.
+                detalle = (
+                    f"La tienda responde con el estado {pagina.estado}"
+                    if not 200 <= pagina.estado < 300
+                    else "El listado redirige fuera de la tienda"
+                )
+                self.paso("búsqueda", EstadoPaso.ERROR, detalle)
+                return []
+            try:
+                resultados = extraer_listado(pagina, perfil, maximo=MAX_RESULTADOS_PAGINA)
+            except SelectorNoValido as error:
+                self._listado_roto(f"selector no válido: {error}")
+                return []
+            nuevos = [r for r in resultados if r.url not in vistas]
+            if not nuevos:
+                if primera and parece_listado(pagina, self.dominio, "", portada=None):
+                    # La página tiene productos con precio y los selectores no los ven.
+                    self._listado_roto("el listado sale vacío")
+                    return []
+                break
+            vistas.update(r.url for r in nuevos)
+            leidos.extend(nuevos)
+            if _completos(leidos, self.consulta.texto) >= self.o._max_fichas:
+                break
+        self.estado = self.estado or estado_de(perfil)
+        coincidencias = _de_la_consulta(leidos, self.consulta.texto, ordenar=True)
+        self.paso(
+            "búsqueda",
+            EstadoPaso.OK,
+            f"{LISTADO}: {paginas} páginas, {len(coincidencias)} coincidencias de {len(leidos)}",
+        )
+        if not coincidencias:
+            self._sin_resultados("en el listado de esta tienda")
+            return []
+        return await self._fichas(perfil, coincidencias)
+
+    def _listado_roto(self, motivo: str) -> None:
+        """Un perfil `listado` roto no se repara: el reparador valida una búsqueda con
+        `{consulta}`, y un listado se arregla volviendo a configurar la tienda."""
+        self.fase = "perfil"
+        self.estado = EstadoPerfil.ROTO
+        self.paso(
+            "perfil",
+            EstadoPaso.ERROR,
+            f"Perfil roto ({motivo}): un perfil de listado no se repara solo; hay que "
+            "revisarlo o configurar la tienda de nuevo",
+        )
+
+    # --- Sin buscador: catálogo por sitemap (nota 16 §B) ------------------------------------
+
+    async def _de_sitemap(self, perfil: Perfil, nuevo: bool) -> list[OfertaCandidata]:
+        """Busca en el catálogo local de URL de la tienda y abre las fichas que encajan.
+
+        Si el catálogo no existe o tiene más de `REFRESCO_CATALOGO`, antes se rehace desde el
+        sitemap (con los mismos topes que al configurar). Si eso falla y hay un catálogo
+        anterior, se avisa y se usa; un bloqueo, en cambio, para la tienda.
+        """
+        self.fase = "búsqueda"
+        if not nuevo:
+            self._paso_perfil(perfil)
+        info = self.o._almacen.catalogo(self.dominio)
+        if info is None or self.o._reloj() - info.actualizado > REFRESCO_CATALOGO:
+            self.visitada = True
+            rehecho = await self._rehacer_catalogo(perfil)
+            if isinstance(rehecho, InfoCatalogo):
+                info = rehecho
+            elif info is None:
+                self.paso("búsqueda", EstadoPaso.ERROR, f"Sin catálogo: {rehecho}")
+                return []
+            else:
+                self.paso(
+                    "catálogo",
+                    EstadoPaso.AVISO,
+                    f"No se ha podido rehacer el catálogo ({rehecho}): se usa el anterior, del "
+                    f"{info.actualizado:%d/%m/%Y}",
+                )
+        limite = min(self.o._max_fichas, MAX_LIMITE_CATALOGO)
+        urls = self.o._almacen.buscar_catalogo(self.dominio, self.consulta.texto, limite=limite)
+        parcial = ", parcial" if info.parcial else ""
+        self.estado = self.estado or estado_de(perfil)
+        self.paso(
+            "búsqueda",
+            EstadoPaso.OK,
+            f"{CATALOGO} ({info.total} URL{parcial}): {len(urls)} coincidencias",
+        )
+        if not urls:
+            self._sin_resultados("en el catálogo de esta tienda")
+            return []
+        self.visitada = True
+        # El catálogo solo guarda URL: el título de cada resultado son las palabras del slug.
+        resultados = [ResultadoListado(palabras_url(u), u) for u in urls]
+        candidatas = await self._fichas(perfil, resultados)
+        self._paso_robots(urls[0])
+        return candidatas
+
+    async def _rehacer_catalogo(self, perfil: Perfil) -> InfoCatalogo | str:
+        """El catálogo nuevo, ya guardado, o el motivo por el que no se ha podido rehacer.
+
+        Lo lee `perfiles.catalogo.leer_catalogo` (el mismo código y los mismos topes que al
+        configurar). Un bloqueo se propaga: la tienda se para ahí, sin ninguna petición más.
+        """
+        self.fase = "catálogo"
+        try:
+            leido = await leer_catalogo(
+                perfil.url_busqueda, self.dominio, self.o._navegador, validador=self.o._validador
+            )
+            if leido is None:
+                return "el sitemap no responde o no tiene URL de la tienda"
+            self._paso_robots(leido.sitemap)
+            return self.o._almacen.guardar_catalogo(
+                self.dominio, leido.sitemap, leido.entradas, parcial=leido.parcial
+            )
+        except DatoNoValido as error:
+            return f"el catálogo no es válido: {error}"
+        finally:
+            self.fase = "búsqueda"
 
     async def _listado(
         self, perfil: Perfil, pagina: Pagina
@@ -795,26 +1050,74 @@ class _EnTienda:
 
 
 def _de_la_consulta(
-    resultados: Sequence[ResultadoListado], consulta: str
+    resultados: Sequence[ResultadoListado], consulta: str, *, ordenar: bool = False
 ) -> list[ResultadoListado]:
-    """Los resultados de los datos estructurados que mencionan la consulta.
+    """Los resultados (de los datos estructurados o de un listado) que mencionan la consulta.
 
     El JSON embebido de una página sin resultados suele traer igualmente productos (los
     «destacados» o «más vendidos» del diseño de la tienda), con título, enlace y precio: si se
     usaran, cada búsqueda sin resultados abriría fichas de otras piezas y las daría como
     ofertas. Por eso cada resultado tiene que nombrar alguna palabra de la consulta (como en
-    `parece_listado`) en su título o en la ruta de su enlace, que suele llevar el nombre o la
-    referencia. Solo comparaciones de subcadenas: los títulos y rutas ya vienen recortados.
+    `parece_listado`) o alguna de sus referencias OEM (sin separadores: «5k1-941-005-e») en su
+    título o en la ruta de su enlace, que suele llevar el nombre o la referencia. Solo
+    comparaciones de subcadenas: los títulos y rutas ya vienen recortados.
+
+    Con `ordenar`, primero los que tienen la referencia y después los que nombran más palabras
+    (un listado trae de todo, y solo se abren unas pocas fichas); a igualdad, el orden de la
+    tienda.
     """
-    palabras = [p for p in normalizar(consulta).split() if len(p) >= MIN_PALABRA]
-    if not palabras:
+    palabras, referencias = _terminos(consulta)
+    if not palabras and not referencias:
         return list(resultados)
-    relacionados: list[ResultadoListado] = []
+    puntuados: list[tuple[tuple[bool, int], ResultadoListado]] = []
     for resultado in resultados:
-        texto = normalizar(f"{resultado.titulo} {urlsplit(resultado.url).path}")
-        if any(palabra in texto for palabra in palabras):
-            relacionados.append(resultado)
-    return relacionados
+        referencia, nombradas = _encaje(resultado, palabras, referencias)
+        if referencia or nombradas:
+            puntuados.append(((referencia, nombradas), resultado))
+    if ordenar:
+        # `sorted` es estable: a igualdad se conserva el orden de la tienda.
+        puntuados.sort(key=lambda par: par[0], reverse=True)
+    return [resultado for _, resultado in puntuados]
+
+
+def _terminos(consulta: str) -> tuple[list[str], list[str]]:
+    """Palabras de la consulta (normalizadas, de `MIN_PALABRA` letras o más, sin repetir) y sus
+    referencias OEM en minúsculas y sin separadores."""
+    consulta = consulta[:MAX_CONSULTA]
+    palabras = list(dict.fromkeys(p for p in normalizar(consulta).split() if len(p) >= MIN_PALABRA))
+    referencias = sorted(r.lower() for r in referencias_en(consulta))
+    return palabras[:MAX_PALABRAS_CONSULTA], referencias[:MAX_PALABRAS_CONSULTA]
+
+
+def _encaje(
+    resultado: ResultadoListado, palabras: Sequence[str], referencias: Sequence[str]
+) -> tuple[bool, int]:
+    """Si `resultado` lleva alguna de las referencias y cuántas palabras nombra."""
+    texto = normalizar(f"{resultado.titulo} {urlsplit(resultado.url).path}")
+    compacto = _SEPARADORES.sub("", texto)
+    referencia = any(r in compacto for r in referencias)
+    return referencia, sum(p in texto for p in palabras)
+
+
+def _completos(resultados: Sequence[ResultadoListado], consulta: str) -> int:
+    """Cuántos resultados nombran toda la consulta (o su referencia): con `max_fichas` de
+    ellos no hace falta pedir más páginas del listado."""
+    palabras, referencias = _terminos(consulta)
+    if not palabras and not referencias:
+        return len(resultados)
+    total = 0
+    for resultado in resultados:
+        referencia, nombradas = _encaje(resultado, palabras, referencias)
+        total += referencia or (bool(palabras) and nombradas == len(palabras))
+    return total
+
+
+def _paginas_listado(plantilla: str) -> list[str]:
+    """Las URL de las páginas que se recorren de un listado: la 1..`MAX_PAGINAS_LISTADO` si
+    lleva `{pagina}` y, si no, solo la propia URL."""
+    if MARCA_PAGINA not in plantilla:
+        return [plantilla]
+    return [plantilla.replace(MARCA_PAGINA, str(n), 1) for n in range(1, MAX_PAGINAS_LISTADO + 1)]
 
 
 def _valida(candidata: OfertaCandidata) -> bool:

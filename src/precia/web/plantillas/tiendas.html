@@ -41,8 +41,15 @@
       <label>Nombre (opcional)
         <input name="nombre" maxlength="100" autocomplete="off" placeholder="Recambios Ejemplo" value="{{ nombre or '' }}">
       </label>
+    </div>
+    <div class="campo-fila">
+      <label class="crece">URL de entrada (opcional)
+        <input name="entrada" maxlength="500" autocomplete="off" spellcheck="false" inputmode="url"
+               aria-describedby="ayuda-entrada" placeholder="https://tienda.es/buscar?q={consulta}" value="{{ entrada or '' }}">
+      </label>
       <button class="boton boton-primario" type="submit">Añadir tienda</button>
     </div>
+    {% include "_ayuda_entrada.html" %}
   </form>
   {% if es_demo %}<p class="tenue">En la demo la tienda solo se guarda en memoria y no se visita.</p>{% endif %}
 </section>

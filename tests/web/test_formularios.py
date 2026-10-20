@@ -1,12 +1,15 @@
+import time
 from decimal import Decimal
 
 import pytest
 
 from precia.nucleo.modelos import Modo
+from precia.perfiles.entrada import MAX_ENTRADA
 from precia.web.formularios import (
     ErrorFormulario,
     consulta_desde_parametros,
     datos_de_alta,
+    leer_entrada,
     leer_formulario,
     leer_importe,
     leer_version,
@@ -123,3 +126,27 @@ def test_leer_version(texto: str, version: int) -> None:
 def test_leer_version_no_valida(texto: str) -> None:
     with pytest.raises(ErrorFormulario):
         leer_version(texto)
+
+
+# --- URL de entrada (nota 16 §A) ------------------------------------------------------------
+
+
+def test_leer_entrada_quita_los_espacios_y_admite_vacia() -> None:
+    assert leer_entrada({"entrada": ["  https://t.es/b?q={consulta}  "]}) == (
+        "https://t.es/b?q={consulta}"
+    )
+    assert leer_entrada({"entrada": ["   "]}) == ""
+    assert leer_entrada({}) == ""
+
+
+def test_leer_entrada_con_el_mismo_tope_que_el_almacen() -> None:
+    assert len(leer_entrada({"entrada": ["a" * MAX_ENTRADA]})) == MAX_ENTRADA
+    with pytest.raises(ErrorFormulario, match=str(MAX_ENTRADA)):
+        leer_entrada({"entrada": ["a" * (MAX_ENTRADA + 1)]})
+
+
+def test_leer_entrada_gigante_no_tarda() -> None:
+    inicio = time.perf_counter()
+    with pytest.raises(ErrorFormulario):
+        leer_entrada({"entrada": ["a" * 10_000_000]})
+    assert time.perf_counter() - inicio < 1

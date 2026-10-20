@@ -29,6 +29,16 @@ Los `problemas` del informe explican qué falla con detalle suficiente para que 
 configurador se los devuelva a la IA en su reintento; pueden contener texto de la tienda, así
 que solo viajan en los `datos` de una petición, nunca en las instrucciones.
 
+Un perfil `listado` (nota 16 §A2) se valida como uno `html`, pero sobre la página 1 de su URL
+(`url_de_listado`), que no lleva `{consulta}`: hacen falta al menos `MIN_RESULTADOS_LISTADO`
+resultados de la tienda y 2 de 3 fichas con precio anclado. No se exige que los resultados nombren
+la consulta: un listado es una categoría, no una búsqueda.
+
+Un perfil `sitemap` (nota 16 §B) no tiene listado que leer: se abren las fichas del catálogo que
+se le pasan en `fichas` (las elige el configurador, o el orquestador del catálogo local) y vale
+si 2 de 3 tienen precio anclado. Sin `sel_campos` solo cuentan el JSON-LD y los metadatos (sin IA).
+El sitemap no se descarga aquí: pesa hasta 20 MiB y es cosa de `perfiles.catalogo`.
+
 Un perfil `api_*` (nota 15 §D) no tiene selectores: se comprueban su tipo y su URL, se descarga
 la búsqueda de la API (sin JavaScript) y vale si `fuentes.apis.ofertas_api` saca de la respuesta
 al menos un producto con precio. No se abre ninguna ficha: los datos vienen de la propia tienda.
@@ -41,11 +51,17 @@ la búsqueda (la tienda no responde); el de una ficha cuenta como ficha fallida.
 """
 
 from collections.abc import Iterable, Mapping, Sequence
+from itertools import islice
 from urllib.parse import quote, quote_plus, urlsplit
 
 from precia.extraccion.dom import Nodo, analizar
 from precia.extraccion.ficha import extraer_ficha, formatear_precio
-from precia.extraccion.listado import dominio_normalizado, extraer_listado, url_de_la_tienda
+from precia.extraccion.listado import (
+    MAX_URL,
+    dominio_normalizado,
+    extraer_listado,
+    url_de_la_tienda,
+)
 from precia.extraccion.precios import leer_precio
 from precia.extraccion.selectores import dividir_selector, extraer_valor, seleccionar
 from precia.extraccion.tipos import FichaExtraida, Precio, SelectorNoValido
@@ -60,6 +76,8 @@ from precia.perfiles.tipos import (
     TIPO_API_SHOPIFY,
     TIPO_API_WOOCOMMERCE,
     TIPO_HTML,
+    TIPO_LISTADO,
+    TIPO_SITEMAP,
     InformeValidacion,
     Perfil,
 )
@@ -68,6 +86,14 @@ MAX_FICHAS = 3
 MIN_FICHAS_OK = 2
 """Fichas con precio anclado necesarias (o todas, si se abren menos)."""
 MARCADOR = "{consulta}"
+MARCADOR_PAGINA = "{pagina}"
+"""Número de página en la URL de un perfil `listado` (opcional, como mucho una vez)."""
+MIN_RESULTADOS_LISTADO = 3
+"""Resultados de la tienda que tiene que dar la página 1 de un listado para que valga."""
+MAX_URL_ENTRADA = 500
+"""Caracteres de la URL de un listado (la URL de entrada del usuario; como el almacén)."""
+MAX_FICHAS_REVISADAS = 100
+"""Fichas de catálogo que se miran como mucho para elegir las que se abren (perfil `sitemap`)."""
 MAX_PROBLEMAS = 20
 MAX_PROBLEMA = 300
 MAX_RESUMEN = 2_000
@@ -84,6 +110,9 @@ PLATAFORMA_DE_TIPO: dict[str, Plataforma] = {
 }
 TIPO_DE_PLATAFORMA = {plataforma: tipo for tipo, plataforma in PLATAFORMA_DE_TIPO.items()}
 NOMBRE_PLATAFORMA = {Plataforma.WOOCOMMERCE: "WooCommerce", Plataforma.SHOPIFY: "Shopify"}
+# Caracteres que no pueden ir en una URL de listado o de sitemap: cada analizador de URL los
+# entiende a su manera (`https://tienda.es\@otra.es` es otra.es para Chromium).
+_PROHIBIDOS = frozenset(" \t\r\n\"'<>\\`|^")
 
 
 async def validar(
@@ -92,57 +121,134 @@ async def validar(
     consulta_prueba: str,
     *,
     validador: Validador = validar_url,
+    fichas: Sequence[str] = (),
 ) -> InformeValidacion:
-    """Prueba `perfil` en su tienda buscando `consulta_prueba`. Ver el docstring del módulo."""
-    if perfil.tipo != TIPO_HTML:
+    """Prueba `perfil` en su tienda buscando `consulta_prueba`. Ver el docstring del módulo.
+
+    `fichas` son las URL del catálogo que se abren con un perfil `sitemap` (los demás tipos no
+    lo usan): datos de la web, así que solo se abren las de la tienda, como mucho `MAX_FICHAS`.
+    """
+    if perfil.tipo == TIPO_SITEMAP:
+        return await _validar_sitemap(perfil, navegador, fichas, validador)
+    if perfil.tipo not in (TIPO_HTML, TIPO_LISTADO):
         return await _validar_api(perfil, navegador, consulta_prueba, validador)
+    listado = perfil.tipo == TIPO_LISTADO
     problemas = _Problemas()
     problemas.extend(problemas_de_sintaxis(perfil))
-    problemas.extend(problemas_de_url(perfil))
+    if listado:
+        problemas.extend(problemas_de_url_listado(perfil.url_busqueda, perfil.dominio))
+    else:
+        problemas.extend(problemas_de_url(perfil))
     if problemas:
         return problemas.informe(valido=False)
 
+    if listado:
+        destino = url_de_listado(perfil.url_busqueda, 1)
+        que = "El listado (página 1)"
+    else:
+        destino = url_de_busqueda(perfil.url_busqueda, consulta_prueba)
+        que = f"La búsqueda de «{consulta_prueba}»"
     try:
-        url = await validador(url_de_busqueda(perfil.url_busqueda, consulta_prueba))
+        url = await validador(destino)
     except URLNoPermitida as error:
         problemas.add(f"url_busqueda no está permitida: {error}")
         return problemas.informe(valido=False)
     pagina = await navegador.obtener(url, js=perfil.necesita_js)
     if not _correcta(pagina):
-        problemas.add(f"La búsqueda de «{consulta_prueba}» responde con el estado {pagina.estado}.")
+        problemas.add(f"{que} responde con el estado {pagina.estado}.")
         return problemas.informe(valido=False)
     if not de_la_tienda(pagina, perfil.dominio):
-        problemas.add(f"La búsqueda redirige a otro dominio ({pagina.url_final}).")
+        problemas.add(f"{que} redirige a otro dominio ({pagina.url_final}).")
         return problemas.informe(valido=False)
 
     resultados = extraer_listado(pagina, perfil)
     if not resultados:
         problemas.extend(problemas_sin_resultados(pagina, perfil, consulta_prueba))
         return problemas.informe(valido=False)
+    if listado and len(resultados) < MIN_RESULTADOS_LISTADO:
+        # Una página con uno o dos enlaces de producto (destacados, un menú) no es el listado.
+        problemas.add(
+            f"El listado solo da {len(resultados)} resultados de la tienda (hacen falta al "
+            f"menos {MIN_RESULTADOS_LISTADO})."
+        )
+        return problemas.informe(valido=False, resultados=len(resultados))
     if perfil.sel_precio_listado and all(r.precio is None for r in resultados):
         # El perfil puede valer sin precios en el listado, pero el selector no lee ninguno.
         problemas.extend(selectores_ausentes(analizar(pagina.html), perfil))
 
-    fichas = resultados[:MAX_FICHAS]
+    return await _comprobar_fichas(
+        perfil,
+        navegador,
+        validador,
+        [(r.url, r.precio) for r in resultados[:MAX_FICHAS]],
+        problemas,
+        resultados=len(resultados),
+    )
+
+
+async def _validar_sitemap(
+    perfil: Perfil, navegador: Navegador, fichas: Sequence[str], validador: Validador
+) -> InformeValidacion:
+    """Perfil `sitemap`: sin listado; se abren hasta `MAX_FICHAS` fichas de la tienda."""
+    problemas = _Problemas()
+    problemas.extend(problemas_de_url_sitemap(perfil.url_busqueda, perfil.dominio))
+    for nombre in ("sel_resultado", "sel_titulo", "sel_enlace"):
+        if getattr(perfil, nombre) != "":
+            problemas.add(f"Un perfil sitemap no lee ningún listado: {nombre} tiene que ir vacío.")
+    if perfil.sel_precio_listado is not None:
+        problemas.add("Un perfil sitemap no lee ningún listado: sel_precio_listado va a null.")
+    problemas.extend(problemas_de_campos(perfil))
+    if problemas:
+        return problemas.informe(valido=False)
+    dominio = dominio_normalizado(perfil.dominio)
+    propias: dict[str, None] = {}
+    for ficha in islice(fichas, MAX_FICHAS_REVISADAS):
+        if dominio is not None and isinstance(ficha, str):
+            url = url_de_la_tienda(ficha, ficha, dominio)
+            if url is not None:
+                propias[url] = None
+    if not propias:
+        problemas.add("No hay fichas del catálogo de la tienda con las que probar el perfil.")
+        return problemas.informe(valido=False)
+    return await _comprobar_fichas(
+        perfil,
+        navegador,
+        validador,
+        [(url, None) for url in list(propias)[:MAX_FICHAS]],
+        problemas,
+        resultados=len(propias),
+    )
+
+
+async def _comprobar_fichas(
+    perfil: Perfil,
+    navegador: Navegador,
+    validador: Validador,
+    fichas: Sequence[tuple[str, Precio | None]],
+    problemas: "_Problemas",
+    *,
+    resultados: int,
+) -> InformeValidacion:
+    """Abre las `fichas` (URL y precio del listado, si lo hay) y cuenta las de precio anclado."""
     con_precio = 0
     cuenta: dict[str, int] = {}
     # Los avisos de la extracción van al final: si hay muchos, no deben tapar los problemas.
     avisos: list[str] = []
-    for numero, resultado in enumerate(fichas, 1):
+    for numero, (url_resultado, precio_listado) in enumerate(fichas, 1):
         try:
-            url_ficha = await validador(resultado.url)
+            url_ficha = await validador(url_resultado)
             pagina_ficha = await navegador.obtener(url_ficha, js=perfil.necesita_js)
         except (ErrorDescarga, URLNoPermitida) as error:
-            problemas.add(f"Ficha {numero} ({resultado.url}): no se pudo abrir: {error}")
+            problemas.add(f"Ficha {numero} ({url_resultado}): no se pudo abrir: {error}")
             continue
         if not _correcta(pagina_ficha):
             problemas.add(
-                f"Ficha {numero} ({resultado.url}): responde con el estado {pagina_ficha.estado}."
+                f"Ficha {numero} ({url_resultado}): responde con el estado {pagina_ficha.estado}."
             )
             continue
         if not de_la_tienda(pagina_ficha, perfil.dominio):
             problemas.add(
-                f"Ficha {numero} ({resultado.url}): redirige a otro dominio "
+                f"Ficha {numero} ({url_resultado}): redirige a otro dominio "
                 f"({pagina_ficha.url_final})."
             )
             continue
@@ -150,17 +256,17 @@ async def validar(
         for campo in ficha.campos:
             cuenta[campo] = cuenta.get(campo, 0) + 1
         if ficha.precio is None:
-            problemas.add(f"Ficha {numero} ({resultado.url}): no se encuentra un precio anclado.")
-        elif resultado.precio is not None and not _mismo_precio(ficha.precio, resultado.precio):
+            problemas.add(f"Ficha {numero} ({url_resultado}): no se encuentra un precio anclado.")
+        elif precio_listado is not None and not _mismo_precio(ficha.precio, precio_listado):
             problemas.add(
-                f"Ficha {numero} ({resultado.url}): el precio de la ficha "
+                f"Ficha {numero} ({url_resultado}): el precio de la ficha "
                 f"({formatear_precio(ficha.precio)}) no coincide con el del listado "
-                f"({formatear_precio(resultado.precio)}); el selector puede estar leyendo el "
+                f"({formatear_precio(precio_listado)}); el selector puede estar leyendo el "
                 "precio de otro producto o de otra parte de la página."
             )
         elif (otro := _otro_precio_del_selector(pagina_ficha, perfil, ficha)) is not None:
             problemas.add(
-                f"Ficha {numero} ({resultado.url}): sel_campos[precio] lee "
+                f"Ficha {numero} ({url_resultado}): sel_campos[precio] lee "
                 f"{formatear_precio(otro)}, pero el precio del producto (JSON-LD) es "
                 f"{formatear_precio(ficha.precio)}."
             )
@@ -183,7 +289,7 @@ async def validar(
     problemas.extend(avisos)
     return problemas.informe(
         valido=valido,
-        resultados=len(resultados),
+        resultados=resultados,
         fichas_ok=con_precio,
         fichas_total=len(fichas),
         campos={c: cuenta[c] for c in CLAVES if cuenta.get(c)},
@@ -322,8 +428,14 @@ def problemas_de_sintaxis(perfil: Perfil) -> list[str]:
         problema = problema_selector(nombre, selector, con_atributo=nombre != "sel_resultado")
         if problema:
             problemas.append(problema)
+    return problemas + problemas_de_campos(perfil)
+
+
+def problemas_de_campos(perfil: Perfil) -> list[str]:
+    """Claves de `sel_campos` desconocidas y selectores de campo fuera del subconjunto."""
     if not isinstance(perfil.sel_campos, Mapping):
-        return [*problemas, "sel_campos tiene que ser un objeto campo → selector."]
+        return ["sel_campos tiene que ser un objeto campo → selector."]
+    problemas: list[str] = []
     for clave, selector in perfil.sel_campos.items():
         if clave not in CLAVES_CAMPOS:
             problemas.append(
@@ -353,6 +465,84 @@ def problemas_de_url(perfil: Perfil) -> list[str]:
             "(en el puerto por defecto y sin usuario)."
         ]
     return []
+
+
+def url_de_listado(plantilla: str, pagina: int) -> str:
+    """La URL de la página `pagina` de un listado: `plantilla` con el número en `{pagina}`.
+
+    Sin `{pagina}` el listado tiene una sola página y se devuelve `plantilla` tal cual.
+    """
+    return plantilla.replace(MARCADOR_PAGINA, str(pagina), 1)
+
+
+def problemas_de_url_listado(plantilla: object, dominio: str) -> list[str]:
+    """Por qué `plantilla` no vale como URL de un perfil `listado` (lista vacía si vale).
+
+    Las mismas reglas que la URL de entrada del usuario (nota 16 §A): `http(s)` del dominio de
+    la tienda (con o sin `www.`, sin usuario ni puerto raro), sin fragmento, ASCII imprimible sin
+    espacios, comillas, `<`, `>` ni barra invertida, como mucho `MAX_URL_ENTRADA` caracteres,
+    sin `{consulta}`, con `{pagina}` como mucho una vez (fuera del esquema y del host) y sin
+    ninguna otra llave.
+    """
+    if not isinstance(plantilla, str):
+        return ["url_busqueda tiene que ser texto."]
+    if len(plantilla) > MAX_URL_ENTRADA:
+        return [f"La URL del listado es demasiado larga (más de {MAX_URL_ENTRADA} caracteres)."]
+    if problema := _caracteres_no_admitidos("La URL del listado", plantilla):
+        return [problema]
+    if MARCADOR in plantilla:
+        return ["La URL de un listado no lleva {consulta}: eso es una plantilla de búsqueda."]
+    if plantilla.count(MARCADOR_PAGINA) > 1:
+        return ["{pagina} solo puede ir una vez en la URL del listado."]
+    resto = plantilla.replace(MARCADOR_PAGINA, "", 1)
+    if "{" in resto or "}" in resto:
+        return ["La URL del listado lleva una llave que no es {pagina}."]
+    if "#" in plantilla:
+        return ["La URL del listado lleva un fragmento (#), que no llega a la tienda."]
+    try:
+        partes = urlsplit(plantilla)
+    except ValueError:
+        partes = None
+    if partes is not None and (
+        MARCADOR_PAGINA in partes.scheme or MARCADOR_PAGINA in partes.netloc
+    ):
+        return ["{pagina} no puede ir en el esquema ni en el host: cada página sería otra web."]
+    normalizado = dominio_normalizado(dominio)
+    ejemplo = url_de_listado(plantilla, 1)
+    if partes is None or normalizado is None or not _de_la_tienda_url(ejemplo, normalizado):
+        return [
+            f"La URL del listado no es una URL http(s) del dominio {dominio} (en el puerto por "
+            "defecto y sin usuario)."
+        ]
+    return []
+
+
+def problemas_de_url_sitemap(url: object, dominio: str) -> list[str]:
+    """Por qué `url` no vale como sitemap raíz de un perfil `sitemap` (lista vacía si vale)."""
+    if not isinstance(url, str):
+        return ["url_busqueda tiene que ser texto."]
+    if "{" in url or "}" in url:
+        return ["La URL del sitemap no es una plantilla: no lleva llaves ({consulta}, {pagina})."]
+    if len(url) > MAX_URL or _caracteres_no_admitidos("La URL del sitemap", url):
+        return ["La URL del sitemap es demasiado larga o lleva caracteres no admitidos."]
+    normalizado = dominio_normalizado(dominio)
+    if "#" in url or normalizado is None or not _de_la_tienda_url(url, normalizado):
+        return [f"La URL del sitemap no es una URL http(s) del dominio {dominio}."]
+    return []
+
+
+def _caracteres_no_admitidos(que: str, url: str) -> str | None:
+    if url.isascii() and url.isprintable() and not any(c in _PROHIBIDOS for c in url):
+        return None
+    return (
+        f"{que} lleva caracteres no admitidos (espacios, comillas, <, >, barra invertida o "
+        "caracteres que no son ASCII)."
+    )
+
+
+def _de_la_tienda_url(url: str, dominio: str) -> bool:
+    """URL absoluta `http(s)` de la tienda (una relativa no tiene host que comprobar)."""
+    return url_de_la_tienda(url, url, dominio) is not None
 
 
 def consulta_fuera_del_host(plantilla: str) -> bool:

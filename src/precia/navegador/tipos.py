@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,3 +49,10 @@ class Descargador(Protocol):
     async def descargar(self, url: str) -> Pagina: ...
 
     async def cerrar(self) -> None: ...
+
+
+@runtime_checkable
+class DescargadorGrande(Descargador, Protocol):
+    """Un descargador que además baja ficheros grandes (sitemaps) con otro tope de bytes."""
+
+    async def descargar_grande(self, url: str, *, max_bytes: int) -> Pagina: ...

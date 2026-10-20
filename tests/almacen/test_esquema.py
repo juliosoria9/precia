@@ -4,6 +4,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -94,3 +95,144 @@ def test_dos_procesos_que_crean_la_base_a_la_vez(tmp_path: Path) -> None:
     otro.close()
     hilo.join()
     assert errores == []
+
+
+# --- Migración 4 (nota 16): entrada, tipos sin buscador y catálogo --------------------------------
+
+
+def _base_version_3(ruta: Path) -> None:
+    """Una base que dejó la versión anterior de PrecIA, con perfiles, precios y una alerta."""
+    Almacen(ruta, migraciones=MIGRACIONES[:3]).cerrar()
+    con = sqlite3.connect(ruta)
+    try:
+        con.execute("PRAGMA foreign_keys = ON")
+        for dominio in ("a.example", "b.example"):
+            con.execute(
+                "INSERT INTO tiendas (dominio, nombre, estado, bloqueos)"
+                " VALUES (?, ?, 'activo', 2)",
+                (dominio, dominio.upper()),
+            )
+        perfiles = [
+            ("a.example", 1, "html", 1, "Primera."),
+            ("a.example", 2, "api_shopify", 0, ""),
+            ("b.example", 1, "api_woocommerce", 0, "Nota 'con' comillas"),
+        ]
+        for dominio, version, tipo, revisado, nota in perfiles:
+            con.execute(
+                "INSERT INTO perfiles (dominio, version, url_busqueda, sel_resultado, sel_titulo,"
+                " sel_enlace, sel_precio_listado, sel_campos, necesita_js, autor, revisado,"
+                " creado, nota, tipo) VALUES (?, ?, ?, 'li', 'h2', 'a @href', NULL,"
+                " '{\"precio\": \".p\"}', 1, 'manual', ?, '2026-10-06T09:05:00', ?, ?)",
+                (dominio, version, f"https://{dominio}/?q={{consulta}}", revisado, nota, tipo),
+            )
+        con.execute("INSERT INTO productos (id, nombre) VALUES ('oem-1K0698151', 'Pastillas')")
+        con.execute(
+            "INSERT INTO precios (producto_id, tienda, url, precio, fecha, dia)"
+            " VALUES ('oem-1K0698151', 'a.example', 'https://a.example/p', '42.50',"
+            " '2026-10-06T09:05:00', '2026-10-06')"
+        )
+        con.execute(
+            "INSERT INTO alertas (producto_id, umbral, canal) VALUES ('oem-1K0698151', '40', 'web')"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _volcado(ruta: Path, sql: str) -> list[tuple[Any, ...]]:
+    con = sqlite3.connect(ruta)
+    try:
+        return con.execute(sql).fetchall()
+    finally:
+        con.close()
+
+
+def test_la_migracion_4_conserva_perfiles_precios_y_alertas(tmp_path: Path) -> None:
+    ruta = tmp_path / "precia.db"
+    _base_version_3(ruta)
+    consultas = (
+        "SELECT * FROM perfiles ORDER BY dominio, version",
+        "SELECT * FROM precios ORDER BY id",
+        "SELECT * FROM alertas ORDER BY id",
+        "SELECT * FROM productos ORDER BY id",
+    )
+    antes = [_volcado(ruta, sql) for sql in consultas]
+    with Almacen(ruta) as almacen:
+        assert almacen.pragma("user_version") == len(MIGRACIONES) >= 4
+        assert [p.version for p in almacen.versiones("a.example")] == [1, 2]
+        tienda = almacen.tienda("a.example")
+        assert tienda is not None and tienda.entrada is None and tienda.bloqueos == 2
+        assert len(tienda.versiones) == 2
+    # Las columnas antiguas siguen en su orden y con los mismos datos.
+    assert [_volcado(ruta, sql) for sql in consultas] == antes
+    assert _volcado(ruta, "PRAGMA foreign_key_check") == []
+    assert _volcado(ruta, "PRAGMA integrity_check") == [("ok",)]
+    tablas = {f[0] for f in _volcado(ruta, "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert {"catalogo", "catalogos", "perfiles"} <= tablas
+    assert not any(t.startswith("perfiles_") for t in tablas)
+
+
+def _clave_primaria(ruta: Path, tabla: str) -> list[str]:
+    # En `table_info`, la columna 5 es la posición en la clave primaria (0 si no está).
+    columnas = [f for f in _volcado(ruta, f"PRAGMA table_info({tabla})") if f[5]]
+    return [f[1] for f in sorted(columnas, key=lambda f: int(f[5]))]
+
+
+def test_la_migracion_4_mantiene_strict_clave_primaria_y_foranea(tmp_path: Path) -> None:
+    ruta = tmp_path / "precia.db"
+    _base_version_3(ruta)
+    Almacen(ruta).cerrar()
+    estrictas = {f[1]: f[5] for f in _volcado(ruta, "PRAGMA table_list")}
+    assert estrictas["perfiles"] == estrictas["catalogo"] == estrictas["catalogos"] == 1
+    assert estrictas["tiendas"] == 1
+    for tabla in ("perfiles", "catalogo", "catalogos"):
+        (foranea,) = _volcado(ruta, f"PRAGMA foreign_key_list({tabla})")
+        assert foranea[2:4] == ("tiendas", "dominio") and foranea[6] == "CASCADE"
+    assert _clave_primaria(ruta, "perfiles") == ["dominio", "version"]
+    assert _clave_primaria(ruta, "catalogo") == ["dominio", "url"]
+    con = sqlite3.connect(ruta)
+    try:
+        con.execute("PRAGMA foreign_keys = ON")
+        with pytest.raises(sqlite3.IntegrityError):
+            # PK (dominio, version) sigue siendo única.
+            con.execute(
+                "INSERT INTO perfiles SELECT * FROM perfiles WHERE dominio = 'a.example' LIMIT 1"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            # La clave foránea sigue activa: no hay perfiles de tiendas que no existen.
+            con.execute(
+                "INSERT INTO perfiles (dominio, version, url_busqueda, sel_resultado, sel_titulo,"
+                " sel_enlace, sel_campos, necesita_js, autor, creado)"
+                " VALUES ('nada.example', 1, 'u', 'li', 'h2', 'a', '{}', 0, 'm', 'c')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            # STRICT: un BLOB no cabe en una columna TEXT (sin STRICT, se guardaría).
+            con.execute("UPDATE perfiles SET sel_campos = x'00'")
+        # ON DELETE CASCADE sigue borrando los perfiles de la tienda.
+        con.execute("DELETE FROM tiendas WHERE dominio = 'b.example'")
+        assert con.execute("SELECT COUNT(*) FROM perfiles").fetchone() == (2,)
+        con.rollback()
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize("tipo", ["listado", "sitemap", "html", "api_shopify", "api_woocommerce"])
+def test_la_migracion_4_admite_los_cinco_tipos(tmp_path: Path, tipo: str) -> None:
+    ruta = tmp_path / "precia.db"
+    _base_version_3(ruta)
+    Almacen(ruta).cerrar()
+    con = sqlite3.connect(ruta)
+    try:
+        con.execute("UPDATE perfiles SET tipo = ? WHERE dominio = 'b.example'", (tipo,))
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute("UPDATE perfiles SET tipo = 'api_magento'")
+    finally:
+        con.close()
+
+
+def test_la_migracion_4_tambien_sirve_en_una_base_nueva(tmp_path: Path) -> None:
+    ruta = tmp_path / "precia.db"
+    Almacen(ruta).cerrar()
+    assert _volcado(ruta, "PRAGMA foreign_key_check") == []
+    columnas = [f[1] for f in _volcado(ruta, "PRAGMA table_info(tiendas)")]
+    assert columnas[-1] == "entrada"

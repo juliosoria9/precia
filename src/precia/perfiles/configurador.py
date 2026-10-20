@@ -15,6 +15,26 @@
 4. `necesita_js` si la búsqueda solo trae resultados al renderizarla con Chromium.
 5. Valida el perfil y, si no pasa, reintenta una única vez enviando a la IA los problemas.
 
+Tiendas sin buscador (ADR-018, nota 16). El orden completo es: API de la plataforma (0) →
+**plantilla de búsqueda del usuario** (A1: la URL de entrada con `{consulta}`, que
+`descubrimiento` prueba la primera) → buscador descubierto (1-5) → **catálogo por sitemap** (B) →
+**listado del usuario** (A2: la URL de entrada sin `{consulta}`) → `ConfiguracionFallida` con un
+mensaje que pide (o pide revisar) la URL de entrada. Si un paso no da un perfil válido se pasa al
+siguiente; un bloqueo, un error de presupuesto de la IA o un error de programación se propagan.
+
+- **B** solo se intenta si quien llama pasa `catalogo` (dónde guardarlo: el `Almacen` lo cumple)
+  y el navegador sabe leer los sitemaps del robots.txt y descargar ficheros grandes
+  (`perfiles.catalogo.NavegadorSitemaps`). Se lee el catálogo (`perfiles.catalogo`); si menos del
+  60 % de sus URL tienen palabras en el slug, no sirve. Si sirve, se prueban 3 fichas que encajan
+  con la consulta de prueba: si 2 de 3 tienen precio anclado con el JSON-LD o los metadatos, el
+  perfil `sitemap` no gasta IA; si no, 1 llamada a la IA para `sel_campos` (como en el paso 3) y
+  se valida otra vez. El catálogo solo se guarda si el perfil vale.
+- **A2**: la página 1 del listado hace de página de resultados: la IA da los selectores del
+  listado y de la ficha, y el perfil `listado` se valida sin exigir que los resultados nombren la
+  consulta. Si la página por HTTP no parece un listado se mira con Chromium (salvo un estado
+  definitivo, como en `descubrimiento`); si tampoco, se usa igual la de HTTP si respondió bien,
+  porque la URL la ha elegido el usuario.
+
 La IA no elige URL ni ejecuta nada: solo propone selectores, que se comprueban con el lenguaje
 restringido de `extraccion.selectores`, y las claves de los campos están cerradas en el propio
 esquema de la salida (y se vuelven a comprobar aquí). Las URL que se visitan salen de nuestro
@@ -39,22 +59,40 @@ from precia.extraccion.listado import extraer_listado
 from precia.extraccion.texto import resumen_para_ia
 from precia.extraccion.tipos import ResultadoListado
 from precia.fuentes.apis import plantilla_api
-from precia.fuentes.plataformas import detectar_plataforma
+from precia.fuentes.plataformas import Plataforma, detectar_plataforma, origen_de
 from precia.ia.tipos import PeticionIA
 from precia.navegador.tipos import ErrorDescarga, Pagina, ProhibidoPorRobots, URLNoPermitida
 from precia.navegador.url import Validador, validar_url
 from precia.nucleo.modelos import CAMPOS, CLAVES_CAMPOS, Campo
+from precia.perfiles.catalogo import (
+    MIN_CON_PALABRAS,
+    GuardarCatalogo,
+    NavegadorSitemaps,
+    descubrir_catalogo,
+    elegir_fichas,
+)
 from precia.perfiles.descubrimiento import (
+    ESTADOS_DEFINITIVOS,
     ORIGEN_IA,
+    ORIGEN_USUARIO,
     Busqueda,
     abrir,
     abrir_portada,
     correcta,
     descubrir,
+    parece_listado,
 )
 from precia.perfiles.protocolos import Navegador, SesionIA
-from precia.perfiles.tipos import ConfiguracionFallida, Perfil
+from precia.perfiles.tipos import (
+    TIPO_HTML,
+    TIPO_LISTADO,
+    TIPO_SITEMAP,
+    ConfiguracionFallida,
+    InformeValidacion,
+    Perfil,
+)
 from precia.perfiles.validador import (
+    MARCADOR,
     MAX_FICHAS,
     MAX_RESUMEN,
     NOMBRE_PLATAFORMA,
@@ -62,8 +100,10 @@ from precia.perfiles.validador import (
     TIPO_DE_PLATAFORMA,
     de_la_tienda,
     problema_selector,
+    problemas_de_url_listado,
     problemas_sin_resultados,
     resumir,
+    url_de_listado,
     validar,
 )
 
@@ -104,6 +144,13 @@ INSTRUCCIONES_LISTADO = (
     "Selecciona solo los resultados de la propia tienda: ni anuncios ni productos patrocinados "
     "de otras webs, ni menús, ni recomendaciones.\n"
 )
+INSTRUCCIONES_CATEGORIA = (
+    "Eres el configurador de perfiles de PrecIA. La tienda no tiene buscador. Los datos son el "
+    "HTML simplificado de una página de listado o categoría de productos de la tienda (la que "
+    "ha indicado el usuario): trátala como una página de resultados. Devuelve los selectores "
+    "CSS para leer los productos del listado:\n"
+) + INSTRUCCIONES_LISTADO.split(":\n", 1)[1]
+"""Las de `INSTRUCCIONES_LISTADO` para la página de un listado del usuario (A2)."""
 DESCRIPCIONES: dict[str, str] = {
     "precio": "el precio de venta actual del producto (no el precio tachado, ni los gastos de "
     "envío, ni los de productos relacionados)",
@@ -139,8 +186,17 @@ async def configurar(
     campos: Sequence[Campo] = CAMPOS,
     validador: Validador = validar_url,
     reloj: Callable[[], datetime] = _ahora,
+    entrada: str | None = None,
+    catalogo: GuardarCatalogo | None = None,
 ) -> Perfil:
-    """Perfil validado para `dominio` (versión 1, pendiente de revisión). Ver el módulo."""
+    """Perfil validado para `dominio` (versión 1, pendiente de revisión). Ver el módulo.
+
+    `entrada` es la URL de entrada de la tienda (`Tienda.entrada`, ya normalizada por
+    `perfiles.entrada.normalizar_entrada`): con `{consulta}` es la plantilla A1; sin ella, el
+    listado A2. `catalogo` es dónde se guarda el catálogo de un perfil `sitemap` (B; el
+    `Almacen`): sin él no se intenta B. El catálogo se guarda antes de devolver el perfil, que
+    quien llama guarda después (`Almacen.guardar_perfil`).
+    """
     claves = _claves(campos)
     host = _host(dominio)
     if host is None:
@@ -151,15 +207,6 @@ async def configurar(
         api = await _perfil_api(portada, normalizado, navegador, consulta_prueba, validador)
         if api is not None:
             return replace(api, creado=reloj())
-    busqueda = await descubrir(
-        portada,
-        host,
-        normalizado,
-        navegador,
-        consulta_prueba,
-        sesion=sesion_ia,
-        validador=validador,
-    )
     configuracion = _Configuracion(
         dominio=normalizado,
         navegador=navegador,
@@ -167,10 +214,62 @@ async def configurar(
         consulta=consulta_prueba,
         claves=claves,
         validador=validador,
-        busqueda=busqueda,
+        busqueda=None,
         creado=reloj(),
     )
-    return await configuracion.ejecutar()
+    motivos: list[str] = []
+    try:
+        configuracion.busqueda = await descubrir(
+            portada,
+            host,
+            normalizado,
+            navegador,
+            consulta_prueba,
+            sesion=sesion_ia,
+            validador=validador,
+            entrada=entrada,
+        )
+        return await configuracion.ejecutar()
+    except ConfiguracionFallida as error:
+        motivos.append(str(error))
+    if catalogo is not None and isinstance(navegador, NavegadorSitemaps):
+        try:
+            base = (portada.url_final or portada.url) if portada is not None else None
+            return await configuracion.por_sitemap(
+                origen_de(base or f"https://{host}/") or f"https://{host}",
+                detectar_plataforma(portada) if portada is not None else None,
+                navegador,
+                catalogo,
+            )
+        except ConfiguracionFallida as error:
+            motivos.append(str(error))
+    if entrada is not None and MARCADOR not in entrada:
+        try:
+            return await configuracion.por_listado(entrada)
+        except ConfiguracionFallida as error:
+            motivos.append(str(error))
+    raise ConfiguracionFallida(sin_perfil(normalizado, motivos, con_entrada=entrada is not None))
+
+
+PISTA_ENTRADA = (
+    "la de su página de búsqueda con {consulta} en el lugar del texto buscado, o la de un "
+    "listado o categoría de productos (con {pagina} en el número de página, si tiene varias)."
+)
+
+
+def sin_perfil(dominio: str, motivos: Sequence[str], *, con_entrada: bool) -> str:
+    """El mensaje de `ConfiguracionFallida` cuando nada ha servido: los motivos de cada paso y
+    qué URL de entrada hace falta (o que se revise la que hay). Se enseña al usuario."""
+    pista = (
+        "Revisa la URL de entrada de la tienda: tiene que ser "
+        if con_entrada
+        else "Si la tienda no tiene buscador, indica su URL de entrada: "
+    ) + PISTA_ENTRADA
+    detalle = " ".join(m if m.endswith(".") else m + "." for m in motivos)
+    hueco = MAX_RESUMEN - len(pista) - len(dominio) - 40
+    if len(detalle) > hueco:
+        detalle = detalle[: max(hueco - 1, 0)] + "…"
+    return f"No se ha podido configurar {dominio}. {detalle} {pista}"
 
 
 def _host(dominio: str) -> str | None:
@@ -259,9 +358,16 @@ class _Configuracion:
     consulta: str
     claves: tuple[str, ...]
     validador: Validador
-    busqueda: Busqueda
+    busqueda: Busqueda | None
+    """La página de resultados (o, en A2, la página 1 del listado) que se le enseña a la IA."""
     creado: datetime
+    tipo: str = TIPO_HTML
     _fichas: dict[str, Pagina | None] = field(default_factory=dict)
+
+    @property
+    def pagina(self) -> Busqueda:
+        assert self.busqueda is not None, "Primero hay que tener la búsqueda o el listado."
+        return self.busqueda
 
     async def ejecutar(self) -> Perfil:
         anterior: _Propuesta | None = None
@@ -272,18 +378,27 @@ class _Configuracion:
                     propuesta.perfil, self.navegador, self.consulta, validador=self.validador
                 )
                 if informe.valido:
-                    nota = resumir(informe)
-                    if self.busqueda.origen == ORIGEN_IA:
-                        # Quien revisa el perfil tiene que saber que la URL no salió de la tienda.
-                        nota = _nota("URL de búsqueda propuesta por la IA. ", nota)
-                    return replace(propuesta.perfil, nota=nota)
+                    return replace(propuesta.perfil, nota=self.nota(informe))
                 propuesta.problemas.extend(informe.problemas)
             anterior = propuesta
         assert anterior is not None
         motivo = "; ".join(anterior.problemas[:MAX_MOTIVO]) or "sin detalles"
+        con = " con el listado de la URL de entrada" if self.tipo == TIPO_LISTADO else ""
         raise ConfiguracionFallida(
-            f"La IA no ha conseguido un perfil válido para {self.dominio}: {motivo}"
+            f"La IA no ha conseguido un perfil válido para {self.dominio}{con}: {motivo}"
         )
+
+    def nota(self, informe: InformeValidacion) -> str:
+        """El resumen de la validación, con delante de dónde salió la URL (para quien revisa)."""
+        nota = resumir(informe)
+        if self.tipo == TIPO_LISTADO:
+            return _nota("Listado de la URL de entrada (sin buscador). ", nota)
+        if self.pagina.origen == ORIGEN_IA:
+            # Quien revisa el perfil tiene que saber que la URL no salió de la tienda.
+            return _nota("URL de búsqueda propuesta por la IA. ", nota)
+        if self.pagina.origen == ORIGEN_USUARIO:
+            return _nota("URL de entrada del usuario. ", nota)
+        return nota
 
     async def proponer(self, anterior: _Propuesta | None) -> _Propuesta:
         propuesta = _Propuesta()
@@ -291,10 +406,10 @@ class _Configuracion:
         if listado is None:
             return propuesta
         perfil = self.perfil(listado, {})
-        resultados = extraer_listado(self.busqueda.pagina, perfil)
+        resultados = extraer_listado(self.pagina.pagina, perfil)
         if not resultados:
             propuesta.problemas.extend(
-                problemas_sin_resultados(self.busqueda.pagina, perfil, self.consulta)
+                problemas_sin_resultados(self.pagina.pagina, perfil, self.consulta)
             )
             return propuesta
         ficha = await self.primera_ficha(resultados)
@@ -309,26 +424,28 @@ class _Configuracion:
         return Perfil(
             dominio=self.dominio,
             version=1,
-            url_busqueda=self.busqueda.plantilla,
+            url_busqueda=self.pagina.plantilla,
             sel_resultado=listado["sel_resultado"] or "",
             sel_titulo=listado["sel_titulo"] or "",
             sel_enlace=listado["sel_enlace"] or "",
             sel_precio_listado=listado["sel_precio_listado"],
             sel_campos=sel_campos,
-            necesita_js=self.busqueda.necesita_js,
+            necesita_js=self.pagina.necesita_js,
             autor=AUTOR,
             revisado=False,
             creado=self.creado,
+            tipo=self.tipo,
         )
 
     async def pedir_listado(
         self, anterior: _Propuesta | None, propuesta: _Propuesta
     ) -> dict[str, str | None] | None:
+        tarea = INSTRUCCIONES_CATEGORIA if self.tipo == TIPO_LISTADO else INSTRUCCIONES_LISTADO
         respuesta = await self.sesion.pedir(
             PeticionIA(
                 componente=COMPONENTE,
-                instrucciones=_instrucciones(INSTRUCCIONES_LISTADO, anterior),
-                datos=datos_para_ia(self.busqueda.pagina, anterior_de(anterior)),
+                instrucciones=_instrucciones(tarea, anterior),
+                datos=datos_para_ia(self.pagina.pagina, anterior_de(anterior)),
                 esquema=ESQUEMA_LISTADO,
                 max_tokens=512,
             )
@@ -337,40 +454,150 @@ class _Configuracion:
         return leer_listado(respuesta.datos, propuesta.problemas)
 
     async def primera_ficha(self, resultados: Sequence[ResultadoListado]) -> Pagina | None:
-        for resultado in resultados[:MAX_FICHAS]:
-            if resultado.url not in self._fichas:
-                pagina = await abrir(
-                    self.navegador,
-                    resultado.url,
-                    js=self.busqueda.necesita_js,
-                    validador=self.validador,
-                )
+        return await self.abrir_ficha([r.url for r in resultados], js=self.pagina.necesita_js)
+
+    async def abrir_ficha(self, urls: Sequence[str], *, js: bool) -> Pagina | None:
+        """La primera de las `MAX_FICHAS` primeras `urls` que se abre bien y sigue en la tienda."""
+        for url in urls[:MAX_FICHAS]:
+            if url not in self._fichas:
+                pagina = await abrir(self.navegador, url, js=js, validador=self.validador)
                 # Una ficha que redirige fuera de la tienda no se le enseña a la IA.
                 buena = pagina is not None and correcta(pagina)
                 buena = buena and pagina is not None and de_la_tienda(pagina, self.dominio)
-                self._fichas[resultado.url] = pagina if buena else None
-            if (pagina := self._fichas[resultado.url]) is not None:
+                self._fichas[url] = pagina if buena else None
+            if (pagina := self._fichas[url]) is not None:
                 return pagina
         return None
+
+    # --- B. Catálogo por sitemap ------------------------------------------------------------
+
+    async def por_sitemap(
+        self,
+        base: str,
+        plataforma: Plataforma | None,
+        navegador: NavegadorSitemaps,
+        destino: GuardarCatalogo,
+    ) -> Perfil:
+        """Perfil `sitemap` validado, con su catálogo ya guardado en `destino` (ver el módulo)."""
+        leido = await descubrir_catalogo(
+            base, self.dominio, navegador, plataforma, validador=self.validador
+        )
+        if leido is None:
+            raise ConfiguracionFallida(
+                f"{self.dominio} no publica un sitemap con URL de la tienda (ni en su robots.txt "
+                "ni en las rutas habituales)."
+            )
+        legibles = leido.con_palabras
+        if legibles < MIN_CON_PALABRAS:
+            raise ConfiguracionFallida(
+                f"El sitemap de {self.dominio} no sirve para buscar: solo el {legibles:.0%} de "
+                f"sus URL tienen palabras en la ruta (hace falta el {MIN_CON_PALABRAS:.0%})."
+            )
+        fichas = elegir_fichas(leido, self.consulta)
+        perfil = Perfil(
+            dominio=self.dominio,
+            version=1,
+            url_busqueda=leido.sitemap,
+            sel_resultado="",
+            sel_titulo="",
+            sel_enlace="",
+            sel_precio_listado=None,
+            sel_campos={},
+            necesita_js=False,
+            autor=AUTOR,
+            revisado=False,
+            creado=self.creado,
+            tipo=TIPO_SITEMAP,
+        )
+        informe = await self.validar_sitemap(perfil, fichas)
+        con_ia = not informe.valido
+        if con_ia:
+            # El JSON-LD y los metadatos no bastan: 1 llamada a la IA para los selectores.
+            ficha = await self.abrir_ficha(fichas, js=False)
+            if ficha is None:
+                raise ConfiguracionFallida(_no_vale_el_sitemap(self.dominio, informe))
+            propuesta = _Propuesta()
+            sel_campos = await pedir_campos(self.sesion, ficha, self.claves, None, propuesta)
+            perfil = replace(perfil, sel_campos=sel_campos)
+            informe = await self.validar_sitemap(perfil, fichas)
+            if not informe.valido:
+                raise ConfiguracionFallida(_no_vale_el_sitemap(self.dominio, informe))
+        info = destino.guardar_catalogo(
+            self.dominio, leido.sitemap, leido.entradas, parcial=leido.parcial
+        )
+        tamano = f"{info.total} URL" + (", parcial" if info.parcial else "")
+        como = "🤖 selectores de la ficha" if con_ia else "sin IA"
+        return replace(
+            perfil, nota=_nota(f"Catálogo por sitemap ({tamano}), {como}. ", resumir(informe))
+        )
+
+    async def validar_sitemap(self, perfil: Perfil, fichas: Sequence[str]) -> InformeValidacion:
+        return await validar(
+            perfil, self.navegador, self.consulta, validador=self.validador, fichas=fichas
+        )
+
+    # --- A2. Listado del usuario ------------------------------------------------------------
+
+    async def por_listado(self, entrada: str) -> Perfil:
+        """Perfil `listado` validado a partir de la URL de entrada sin `{consulta}`."""
+        problemas = problemas_de_url_listado(entrada, self.dominio)
+        if problemas:
+            raise ConfiguracionFallida(f"La URL de entrada no vale como listado: {problemas[0]}")
+        url = url_de_listado(entrada, 1)
+        pagina = await abrir(self.navegador, url, js=False, validador=self.validador)
+        elegida, js = (pagina, False) if self.es_listado(pagina) else (None, False)
+        if elegida is None and (pagina is None or pagina.estado not in ESTADOS_DEFINITIVOS):
+            renderizada = await abrir(self.navegador, url, js=True, validador=self.validador)
+            if self.es_listado(renderizada):
+                elegida, js = renderizada, True
+        bien = pagina is not None and correcta(pagina) and de_la_tienda(pagina, self.dominio)
+        if elegida is None and bien:
+            elegida = pagina  # La URL la ha elegido el usuario: que la IA la mire.
+        if elegida is None:
+            estado = f" (responde con el estado {pagina.estado})" if pagina is not None else ""
+            raise ConfiguracionFallida(f"La URL de entrada ({url}) no da un listado{estado}.")
+        self.busqueda = Busqueda(entrada, elegida, js, ORIGEN_USUARIO)
+        self.tipo = TIPO_LISTADO
+        return await self.ejecutar()
+
+    def es_listado(self, pagina: Pagina | None) -> bool:
+        """Parece un listado de la tienda (sin exigir palabras de la consulta: es una categoría)."""
+        return pagina is not None and parece_listado(pagina, self.dominio, "", portada=None)
 
     async def pedir_campos(
         self, ficha: Pagina, anterior: _Propuesta | None, propuesta: _Propuesta
     ) -> dict[str, str]:
-        # Lo que ya da el JSON-LD de la ficha no se pide, salvo el precio (ver el módulo).
-        del_jsonld = await extraer_ficha(ficha, self.claves)
-        pedidos = tuple(c for c in self.claves if c == "precio" or c not in del_jsonld.campos)
-        lista = "\n".join(f"- {c}: {DESCRIPCIONES[c]}" for c in pedidos)
-        respuesta = await self.sesion.pedir(
-            PeticionIA(
-                componente=COMPONENTE,
-                instrucciones=_instrucciones(INSTRUCCIONES_FICHA + lista + "\n", anterior),
-                datos=datos_para_ia(ficha, anterior_de(anterior), listado=False),
-                esquema=esquema_campos(pedidos),
-                max_tokens=512,
-            )
+        return await pedir_campos(self.sesion, ficha, self.claves, anterior, propuesta)
+
+
+def _no_vale_el_sitemap(dominio: str, informe: InformeValidacion) -> str:
+    motivo = "; ".join(informe.problemas[:MAX_MOTIVO]) or "sin detalles"
+    return f"El catálogo por sitemap de {dominio} no da fichas con precio: {motivo}"
+
+
+async def pedir_campos(
+    sesion: SesionIA,
+    ficha: Pagina,
+    claves: Sequence[str],
+    anterior: _Propuesta | None,
+    propuesta: _Propuesta,
+) -> dict[str, str]:
+    """🤖 Selectores de los campos de `ficha` (paso 3; también en B)."""
+    # Lo que ya da el JSON-LD de la ficha no se pide, salvo el precio (ver el módulo).
+    del_jsonld = await extraer_ficha(ficha, claves)
+    pedidos = tuple(c for c in claves if c == "precio" or c not in del_jsonld.campos)
+    lista = "\n".join(f"- {c}: {DESCRIPCIONES[c]}" for c in pedidos)
+    respuesta = await sesion.pedir(
+        PeticionIA(
+            componente=COMPONENTE,
+            instrucciones=_instrucciones(INSTRUCCIONES_FICHA + lista + "\n", anterior),
+            datos=datos_para_ia(ficha, anterior_de(anterior), listado=False),
+            esquema=esquema_campos(pedidos),
+            max_tokens=512,
         )
-        propuesta.propuesto["sel_campos"] = respuesta.datos
-        return leer_campos(respuesta.datos, pedidos, propuesta.problemas)
+    )
+    propuesta.propuesto["sel_campos"] = respuesta.datos
+    return leer_campos(respuesta.datos, pedidos, propuesta.problemas)
 
 
 def _claves(campos: Sequence[Campo]) -> tuple[str, ...]:

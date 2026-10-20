@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">
+<url><loc><![CDATA[https://tienda.es/]]></loc><priority>1.0</priority><changefreq>daily</changefreq></url>
+<url><loc><![CDATA[https://tienda.es/es/faros/123-faro-1k0941005-golf.html]]></loc><priority>0.9</priority><lastmod>2026-10-01</lastmod><changefreq>weekly</changefreq><image:image><image:loc><![CDATA[https://tienda.es/456-large_default/faro-1k0941005-golf.jpg]]></image:loc><image:caption><![CDATA[Faro <b>Golf</b> & Jetta]]></image:caption><image:title><![CDATA[Faro 1K0941005]]></image:title></image:image></url>
+<!-- productos de la categoría «frenos» -->
+<url><loc><![CDATA[https://tienda.es/es/frenos/124-disco-de-freno-brembo-09.9772.11.html?utm_source=sitemap&id=7]]></loc><priority>0.9</priority><lastmod>2026-09-28</lastmod><changefreq>weekly</changefreq></url>
+<url><loc><![CDATA[https://tienda.es/es/content/1-entrega]]></loc><priority>0.8</priority><changefreq>monthly</changefreq></url>
+</urlset>

@@ -11,6 +11,7 @@ from decimal import Decimal
 from urllib.parse import parse_qs
 
 from precia.nucleo.modelos import CLAVES_CAMPOS, ConsultaBusqueda, Modo
+from precia.perfiles.entrada import MAX_ENTRADA
 
 MAX_TEXTO = 200
 MAX_FILTRO = 300
@@ -112,6 +113,18 @@ def datos_de_alta(formulario: Parametros) -> tuple[str, str]:
             f"El nombre de la tienda puede tener hasta {MAX_NOMBRE_TIENDA} caracteres visibles."
         )
     return dominio, nombre
+
+
+def leer_entrada(formulario: Parametros) -> str:
+    """URL de entrada del formulario, sin espacios alrededor; vacía si no se escribe ninguna.
+
+    Aquí solo se mira el tamaño: las reglas (mismo host, marcadores...) las aplica la fuente con
+    `perfiles.entrada.normalizar_entrada`, que conoce el dominio de la tienda.
+    """
+    entrada = primero(formulario, "entrada").strip()
+    if len(entrada) > MAX_ENTRADA:
+        raise ErrorFormulario(f"La URL de entrada no puede pasar de {MAX_ENTRADA} caracteres.")
+    return entrada
 
 
 def leer_version(texto: str) -> int:

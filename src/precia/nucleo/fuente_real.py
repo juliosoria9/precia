@@ -15,7 +15,7 @@ from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
 
-from precia.almacen.sqlite import Almacen, DatoNoValido, TiendaDuplicada
+from precia.almacen.sqlite import Almacen, DatoNoValido, TiendaDuplicada, TiendaNoEncontrada
 from precia.ia.claude import ProveedorClaude
 from precia.ia.ollama import ProveedorOllama
 from precia.ia.servicio import ServicioIA
@@ -35,6 +35,8 @@ from precia.nucleo.fuente_datos import (
     RevisionNoValida,
     TiendaNoExiste,
     TiendaYaExiste,
+    URLEntradaNoValida,
+    entrada_normalizada,
 )
 from precia.nucleo.modelos import (
     Ajustes,
@@ -232,19 +234,32 @@ class FuenteReal:
         normalizado = normalizar_dominio(dominio)
         return self._almacen.tienda(normalizado) if normalizado else None
 
-    async def alta_tienda(self, dominio: str, nombre: str) -> Tienda:
+    async def alta_tienda(self, dominio: str, nombre: str, *, entrada: str | None = None) -> Tienda:
         normalizado = await dominio_de_tienda(dominio, validador=self._validador)
         nombre = nombre.strip() or normalizado
         if len(nombre) > MAX_NOMBRE_TIENDA or not nombre.isprintable():
             raise ErrorFuente(
                 f"El nombre de la tienda tiene que tener de 1 a {MAX_NOMBRE_TIENDA} caracteres."
             )
+        url_entrada = entrada_normalizada(normalizado, entrada)
         try:
-            return self._almacen.alta_tienda(normalizado, nombre)
+            return self._almacen.alta_tienda(normalizado, nombre, entrada=url_entrada)
         except TiendaDuplicada as error:
             raise TiendaYaExiste(f"La tienda {normalizado} ya está dada de alta.") from error
         except DatoNoValido as error:
-            raise ErrorFuente("El nombre de la tienda no es válido.") from error
+            raise ErrorFuente("Los datos de la tienda no son válidos.") from error
+
+    def cambiar_entrada(self, dominio: str, entrada: str | None) -> Tienda:
+        normalizado = normalizar_dominio(dominio)
+        if normalizado is None or self._almacen.tienda(normalizado) is None:
+            raise TiendaNoExiste(f"No hay ninguna tienda {dominio}.")
+        url_entrada = entrada_normalizada(normalizado, entrada)
+        try:
+            return self._almacen.cambiar_entrada(normalizado, url_entrada)
+        except TiendaNoEncontrada as error:
+            raise TiendaNoExiste(f"No hay ninguna tienda {normalizado}.") from error
+        except DatoNoValido as error:
+            raise URLEntradaNoValida("La URL de entrada no es válida.") from error
 
     def revisar_perfil(self, dominio: str, version: int) -> Tienda:
         normalizado = normalizar_dominio(dominio)

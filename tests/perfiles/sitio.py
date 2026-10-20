@@ -16,6 +16,7 @@ from typing import Any
 from precia.ia.servicio import ServicioIA, SesionIA
 from precia.ia.simulado import Guion, ProveedorSimulado
 from precia.navegador.tipos import ErrorDescarga, Pagina
+from precia.nucleo.modelos import InfoCatalogo
 from precia.perfiles.tipos import Perfil
 from tests.ia.falsos import RegistroFalso
 from tests.navegador.falsos import validar_con_dns_publico
@@ -283,13 +284,32 @@ class NavegadorFalso:
     pedidas: list[tuple[str, bool]] = field(default_factory=list)
     ignorados: frozenset[str] = frozenset()
     """Dominios cuyo robots.txt prohibía lo visitado, pero se ha ignorado (ADR-017)."""
+    declarados: tuple[str, ...] = ()
+    """Líneas `Sitemap:` de su robots.txt, tal cual (`sitemaps()`; nota 16 §B)."""
+    error_robots: Exception | None = None
+    """Lo que lanza `sitemaps()` (un `Bloqueado` si el robots.txt es un desafío anti-bot)."""
+    grandes: list[str] = field(default_factory=list)
+    """URL pedidas con `grande=True` (sitemaps)."""
+    robots: list[str] = field(default_factory=list)
+    """URL con las que se han pedido los sitemaps del robots.txt."""
 
     def robots_ignorado(self, dominio: str) -> bool:
         return dominio in self.ignorados
 
-    async def obtener(self, url: str, *, js: bool = False) -> Pagina:
+    async def sitemaps(self, url: str) -> tuple[str, ...]:
+        url = await validar_con_dns_publico(url)
+        self.robots.append(url)
+        if self.error_robots is not None:
+            raise self.error_robots
+        return self.declarados
+
+    async def obtener(self, url: str, *, js: bool = False, grande: bool = False) -> Pagina:
+        if js and grande:
+            raise ValueError("Un fichero grande (sitemap) nunca se descarga con Chromium.")
         url = await validar_con_dns_publico(url)
         self.pedidas.append((url, js))
+        if grande:
+            self.grandes.append(url)
         if url in self.errores:
             raise self.errores[url]
         if js and self.paginas_js is None:
@@ -349,3 +369,73 @@ def perfil(**cambios: Any) -> Perfil:
     }
     datos.update(cambios)
     return Perfil(**datos)
+
+
+# --- Tiendas sin buscador (nota 16) -----------------------------------------------------------
+
+LISTADO = f"{TIENDA}/categoria/faros?p={{pagina}}"
+"""URL de entrada de un listado o categoría (A2), con `{pagina}`."""
+LISTADO_1 = f"{TIENDA}/categoria/faros?p=1"
+SITEMAP = f"{TIENDA}/sitemap.xml"
+
+
+def xml_urlset(urls: Iterable[str], *, lastmod: str | None = "2026-10-19") -> str:
+    """Un `urlset` del protocolo sitemaps.org con `urls` (escapadas como en un XML real)."""
+    fecha = f"<lastmod>{lastmod}</lastmod>" if lastmod else ""
+    entradas = "".join(f"<url><loc>{escape(u, quote=False)}</loc>{fecha}</url>" for u in urls)
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{entradas}</urlset>'
+    )
+
+
+def xml_indice(urls: Iterable[str]) -> str:
+    """Un índice de sitemaps (`sitemapindex`) con los sitemaps hijos `urls`."""
+    hijos = "".join(f"<sitemap><loc>{escape(u, quote=False)}</loc></sitemap>" for u in urls)
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{hijos}</sitemapindex>'
+    )
+
+
+def perfil_listado(**cambios: Any) -> Perfil:
+    """Perfil `listado` (A2) de la tienda falsa: el listado de faros con `{pagina}`."""
+    datos: dict[str, Any] = {"url_busqueda": LISTADO, "tipo": "listado"}
+    datos.update(cambios)
+    return perfil(**datos)
+
+
+def perfil_sitemap(**cambios: Any) -> Perfil:
+    """Perfil `sitemap` (B) de la tienda falsa: sin selectores de listado ni de campos."""
+    datos: dict[str, Any] = {
+        "url_busqueda": SITEMAP,
+        "sel_resultado": "",
+        "sel_titulo": "",
+        "sel_enlace": "",
+        "sel_precio_listado": None,
+        "sel_campos": {},
+        "tipo": "sitemap",
+    }
+    datos.update(cambios)
+    return perfil(**datos)
+
+
+@dataclass
+class CatalogoFalso:
+    """Guarda en memoria lo que el configurador manda a `guardar_catalogo` (como el almacén)."""
+
+    guardados: list[tuple[str, str, list[tuple[str, str, str | None]], bool]] = field(
+        default_factory=list
+    )
+
+    def guardar_catalogo(
+        self,
+        dominio: str,
+        sitemap: str,
+        entradas: Iterable[tuple[str, str, str | None]],
+        *,
+        parcial: bool,
+    ) -> InfoCatalogo:
+        lista = list(entradas)
+        self.guardados.append((dominio, sitemap, lista, parcial))
+        return InfoCatalogo(dominio, sitemap, INSTANTE, len(lista), parcial)

@@ -72,6 +72,12 @@ Alimenta la memoria §3 («método de validación del código generado»).
 | 2026-10-20 | «Código … fabricante» (pintura, motor, EAN) tomado como OEM; dos OEM pegadas con «/» | Revisor adversarial F3 | Exclusiones y «/» fuera de los separadores + tests |
 | 2026-10-20 | Test parametrizado con la propia constante (no detecta que se quite un caso); informe con una afirmación falsa sobre el tope de peticiones | Revisor adversarial F4 (mutación) | Lista escrita a mano; afirmación corregida en la bitácora |
 | 2026-10-20 | Una candidata con 401/403/451 se repetía con Chromium (insistir ante un rechazo) | Revisor adversarial F4 | `RECHAZOS` en `descubrimiento.py` + 4 tests |
+| 2026-10-20 | `palabras_url` quitaba los números de modelo y medidas («308», «205 55 r16»): las búsquedas devolvían otros modelos | Revisor adversarial de corrección (test de extremo a extremo con el almacén) | `_sin_ids`: solo se quitan los ids (tramo solo numérico o al principio del slug) + tests |
+| 2026-10-20 | `de_producto` descartaba los índices paginados por parámetros (BigCommerce) | Revisor adversarial de corrección | Se clasifica por los valores de la consulta, no por los nombres + tests |
+| 2026-10-20 | `ValueError` sin capturar con corchetes IPv6 en la URL de entrada y en el almacén | Revisor adversarial de corrección | `urlsplit` dentro de `try` → `EntradaNoValida` / `DatoNoValido` + tests |
+| 2026-10-20 | Coste de CPU por URL del catálogo sin tope; `detectar_bloqueo` sobre 20 MiB en el bucle de eventos | Revisor adversarial de seguridad y coste | `MAX_RUTA_PALABRAS`; el bloqueo mira 5 MiB como mucho + tests deterministas |
+| 2026-10-20 | Topes de profundidad y de etiquetas del lector sin ningún test que los comprobara | Revisor adversarial (mutación) | `test_tope_de_profundidad` y `test_tope_de_etiquetas` |
+| 2026-10-20 | La ruta se recortaba por el principio y se perdía el slug del final | Yo, al revisar los pendientes de los revisores | Tramos enteros del final + test |
 
 ---
 
@@ -282,3 +288,23 @@ Alimenta la memoria §3 («método de validación del código generado»).
 - **Qué se hizo:** constante `RECHAZOS` = {401, 403, 429, 451}, que no se repiten con Chromium (TDD: 4 tests en rojo y luego en verde).
 - **Lección:** la línea roja no está solo en «no resolver CAPTCHAs». Insistir con otra herramienta ante un «no» explícito es el mismo gesto, más sutil. Va en la nota legal.
 - **Para la memoria:** nota legal (art. 197 bis CP), §4 · S01
+
+### 2026-10-20 17:31 · ✅ Avance · PrecIA ya puede entrar en webs sin buscador: URL de entrada del usuario (A) y catálogo por sitemap.xml (B)
+- **Qué pasó:** books.toscrape.com no tiene buscador y PrecIA no tenía por dónde entrar. Ahora el configurador prueba, por este orden: API de la plataforma → URL de búsqueda que pega el usuario (con `{consulta}`) → buscador descubierto → `sitemap.xml` → listado o categoría que pega el usuario (con `{pagina}`) → y, si nada sirve, un mensaje que pide la URL de entrada. Con el sitemap, PrecIA guarda solo las URL y las palabras de cada slug (nunca precios) y en cada búsqueda abre unas pocas fichas y lee el precio en vivo.
+- **Cómo:** 8 agentes en tres fases (base, integración y dos revisores adversariales), con TDD y sin red. Lector de sitemaps propio, sin `xml.etree`, que rechaza DTD y entidades; descompresión gzip acotada contra bombas; migración 4 probada sobre una copia de la base real.
+- **Para la memoria:** §5 (diseño: generalidad del scraper), §3 (decisiones, ADR-018), nota legal (el sitemap como vía «invitada»; art. 133 TRLPI) · S01
+
+### 2026-10-20 17:31 · 📏 Medida · Coste de una tienda sin buscador con el catálogo por sitemap
+- **Qué pasó:** en la prueba de extremo a extremo, dar de alta la tienda y hacer la 1.ª búsqueda cuesta 13 peticiones (robots, portada, 6 URL del descubrimiento de siempre, 2 sitemaps y 3 fichas) y **0 llamadas a la IA**. La 2.ª búsqueda, 0 peticiones (caché) y 0 IA. El catálogo se rehace cada 7 días. Tests: de 2240 a **2947** (707 nuevos), con ruff y mypy estricto en verde.
+- **Para la memoria:** Eval (coste por tienda), §4 (coste de la IA) · S01
+
+### 2026-10-20 17:31 · ❌ Fallo · La revisión adversarial encontró 6 fallos en el código de A + B escrito por la IA
+- **Qué pasó:** (1) `palabras_url` quitaba todos los números «sueltos»: «pastillas Peugeot 308» devolvía las de la 208, 2008, 3008… y perdía las medidas de neumático («205 55 r16»), justo el caso de los recambios. (2) Los índices de sitemap paginados por parámetros (BigCommerce, `?type=products&page=2`) se descartaban enteros porque «page» estaba entre las exclusiones. (3) Unos corchetes IPv6 sin cerrar en la URL de entrada daban un `ValueError` sin capturar en la web y en el almacén. (4) Analizar cada URL del catálogo no tenía tope: un sitemap hostil costaba unos 23 s de CPU por fichero. (5) La detección de bloqueos miraba los 20 MiB de un sitemap dentro del bucle de eventos, unos 2 s con la web parada. (6) Dos topes del lector que ningún test comprobaba (la mutación que los quitaba sobrevivía).
+- **Qué se hizo:** todos corregidos con un test en rojo primero; 34 mutaciones aplicadas a una copia del código, todas detectadas tras la corrección. Yo corregí uno más que un revisor dejó abierto: la ruta se recortaba por el principio y el slug va al final.
+- **Lección:** la nota de diseño decía «sin los números de id sueltos» y la IA lo aplicó al pie de la letra, aunque rompía el caso de uso principal. Un contrato escrito también puede estar mal; la prueba que lo destapó fue un test de extremo a extremo con una consulta realista, no un test de la función sola.
+- **Para la memoria:** §4 (riesgos de la IA en el desarrollo), metodología (revisión adversarial y mutación) · S01
+
+### 2026-10-20 17:31 · 💡 Aprendizaje · Los tests cronometrados no son fiables con la máquina cargada
+- **Qué pasó:** con 8 agentes ejecutando la batería a la vez, los tests con umbral de 1 s (`test_embebidos`, y a veces otros de descubrimiento y validador) fallaban por 0,1-0,2 s; con la máquina libre pasan todos (2947). Ya estaba apuntado como bug 6.
+- **Lección:** un test de rendimiento con cronómetro mide la máquina, no el código. Los revisores prefirieron tests deterministas («cuánto texto se analiza»), que no dependen de la carga.
+- **Para la memoria:** metodología (TDD y fiabilidad de los tests) · S01

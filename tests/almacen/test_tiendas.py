@@ -1,6 +1,7 @@
 """Tiendas: alta, consulta y actualización de su estado."""
 
 from datetime import datetime
+from typing import Any
 
 import pytest
 
@@ -108,3 +109,69 @@ def test_actualizar_valida_bloqueos_y_robots(almacen: Almacen) -> None:
         almacen.actualizar_tienda("a.example", bloqueos=2**63)
     with pytest.raises(DatoNoValido):
         almacen.actualizar_tienda("a.example", robots="x" * 2001)
+
+
+# --- URL de entrada (nota 16 §A) ----------------------------------------------------------------
+
+ENTRADA = "https://a.example/buscar?q={consulta}"
+
+
+def test_una_tienda_nueva_no_tiene_entrada(almacen: Almacen) -> None:
+    assert almacen.alta_tienda("a.example", "A").entrada is None
+
+
+def test_alta_con_entrada(almacen: Almacen) -> None:
+    tienda = almacen.alta_tienda("a.example", "A", entrada=ENTRADA)
+    assert tienda.entrada == ENTRADA
+    assert almacen.tienda("a.example") == tienda
+    assert [t.entrada for t in almacen.tiendas()] == [ENTRADA]
+
+
+def test_cambiar_y_quitar_la_entrada(almacen: Almacen) -> None:
+    almacen.alta_tienda("a.example", "A")
+    listado = "https://www.a.example/catalogo/frenos?page={pagina}"
+    assert almacen.cambiar_entrada("a.example", listado).entrada == listado
+    tienda = almacen.tienda("a.example")
+    assert tienda is not None and tienda.entrada == listado
+    assert almacen.cambiar_entrada("a.example", None).entrada is None
+
+
+def test_cambiar_entrada_de_tienda_inexistente(almacen: Almacen) -> None:
+    with pytest.raises(TiendaNoEncontrada):
+        almacen.cambiar_entrada("nada.example", "https://nada.example/")
+
+
+@pytest.mark.parametrize(
+    "entrada",
+    [
+        "",
+        "https://a.example/" + "x" * 500,
+        "https://otra.example/buscar?q={consulta}",
+        "https://a.example.otra.example/",
+        "https://otra.example/?q=a.example",
+        "ftp://a.example/catalogo",
+        "javascript:alert(1)",
+        "https://usuario@a.example/",
+        "https://a.example:8080/",
+        "/catalogo",
+        "https://a.example/\ud800",
+        3,
+    ],
+)
+def test_la_entrada_tiene_que_ser_una_url_de_la_tienda(almacen: Almacen, entrada: Any) -> None:
+    # La normaliza `perfiles.entrada`; el almacén no guarda nada que apunte a otro servidor.
+    almacen.alta_tienda("a.example", "A")
+    with pytest.raises(DatoNoValido):
+        almacen.cambiar_entrada("a.example", entrada)
+    with pytest.raises(DatoNoValido):
+        almacen.alta_tienda("b.example", "B", entrada=entrada)
+    tienda = almacen.tienda("a.example")
+    assert tienda is not None and tienda.entrada is None
+    assert almacen.tienda("b.example") is None
+
+
+def test_inyeccion_sql_en_la_entrada_se_guarda_como_texto(almacen: Almacen) -> None:
+    almacen.alta_tienda("a.example", "A")
+    mala = "https://a.example/?q=');DROP%20TABLE%20tiendas;--"
+    assert almacen.cambiar_entrada("a.example", mala).entrada == mala
+    assert len(almacen.tiendas()) == 1

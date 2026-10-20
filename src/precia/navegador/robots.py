@@ -31,6 +31,10 @@ MAXIMO_RETARDO_S = 60.0
 TTL_S = 24 * 3600.0
 # Un fallo pasajero del servidor no debe dejar la tienda prohibida un día entero.
 TTL_ERROR_S = 10 * 60.0
+MAX_SITEMAPS_ROBOTS = 20
+"""Líneas `Sitemap:` que se guardan de un robots.txt (nota 16, sección B); las demás se ignoran."""
+MAX_LONGITUD_SITEMAP = 2000
+"""Caracteres de una URL de sitemap: una más larga no es de fiar y se descarta."""
 
 _NO_RESERVADOS = frozenset(string.ascii_letters + string.digits + "-._~")
 _ESCAPE = re.compile(r"%([0-9A-Fa-f]{2})")
@@ -44,6 +48,8 @@ class ReglasRobots:
 
     reglas: tuple[tuple[bool, str], ...] = ()
     retardo: float | None = None
+    sitemaps: tuple[str, ...] = ()
+    """URL absolutas http(s) de las líneas `Sitemap:` (de fuera de grupo), sin repetir."""
 
     def permite(self, ruta: str) -> bool:
         """`ruta` es la ruta con la consulta (`/buscar?q=x`), tal como sale de la URL."""
@@ -80,13 +86,21 @@ def analizar_robots(texto: str, token: str) -> ReglasRobots:
     grupos: list[_Grupo] = []
     actual: _Grupo | None = None
     leyendo_agentes = False
+    sitemaps: list[str] = []
     for linea in _recortar(texto).removeprefix("﻿").splitlines():
         linea = linea.split("#", 1)[0].strip()
         clave, separador, valor = linea.partition(":")
         if not separador:
             continue
         clave, valor = clave.strip().lower(), valor.strip()
-        if clave == "user-agent":
+        if clave == "sitemap":
+            # Registro de fuera de grupo (RFC 9309 §2.2.4): vale esté donde esté y no corta el
+            # grupo en curso. Se guardan los primeros, sin repetir.
+            if len(sitemaps) < MAX_SITEMAPS_ROBOTS:
+                url = _url_sitemap(valor)
+                if url is not None and url not in sitemaps:
+                    sitemaps.append(url)
+        elif clave == "user-agent":
             if actual is None or not leyendo_agentes:
                 actual = _Grupo()
                 grupos.append(actual)
@@ -109,6 +123,7 @@ def analizar_robots(texto: str, token: str) -> ReglasRobots:
     return ReglasRobots(
         reglas=tuple(r for g in aplicables for r in g.reglas),
         retardo=max(retardos, default=None),
+        sitemaps=tuple(sitemaps),
     )
 
 
@@ -143,6 +158,16 @@ class ServicioRobots:
         ruta = (partes.path or "/") + (f"?{partes.query}" if partes.query else "")
         reglas = await self._reglas(f"{partes.scheme}://{partes.netloc}")
         return reglas.permite(ruta)
+
+    async def sitemaps(self, url: str) -> tuple[str, ...]:
+        """`url` ya validada. Sitemaps declarados en el robots.txt de su origen.
+
+        Usa el robots.txt ya leído o lo lee entonces, se respete o no (ADR-017). Si no hay
+        robots.txt, no se pudo leer o era un desafío anti-bot, no hay ninguno. Las URL son datos
+        de la web: quien las descargue las valida y comprueba que son de la misma tienda.
+        """
+        partes = urlsplit(url)
+        return (await self._reglas(f"{partes.scheme}://{partes.netloc}")).sitemaps
 
     def bloqueo(self, url: str) -> str | None:
         """Motivo si el robots.txt de ese origen respondió con un desafío anti-bot."""
@@ -187,6 +212,21 @@ class ServicioRobots:
 
 def _agente_coincide(agente: str, token: str) -> bool:
     return agente == token or agente.split("/", 1)[0].strip() == token
+
+
+def _url_sitemap(valor: str) -> str | None:
+    """`valor` si es una URL absoluta http(s) con host, sin espacios ni controles; si no, `None`."""
+    if not valor or len(valor) > MAX_LONGITUD_SITEMAP:
+        return None
+    if any(c.isspace() or not c.isprintable() for c in valor):
+        return None
+    try:
+        partes = urlsplit(valor)
+    except ValueError:
+        return None  # p. ej. un IPv6 sin cerrar
+    if partes.scheme.lower() not in ("http", "https") or not partes.hostname:
+        return None
+    return valor
 
 
 def _leer_retardo(valor: str) -> float | None:

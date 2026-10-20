@@ -37,6 +37,7 @@ from precia.web.formularios import (
     Parametros,
     consulta_desde_parametros,
     datos_de_alta,
+    leer_entrada,
     leer_formulario,
     leer_importe,
     leer_version,
@@ -54,6 +55,8 @@ mimetypes.add_type("image/svg+xml", ".svg")
 HOSTS_LOCALES = ("127.0.0.1", "localhost")
 CANALES = ("email", "telegram")
 PROVEEDORES = ("api", "ollama")
+MAX_ENTRADA_ESCRITA = 600
+"""Lo que se devuelve al formulario de lo que escribió el usuario, para que lo corrija."""
 
 NAVEGACION = (
     ("/", "Buscar"),
@@ -213,14 +216,17 @@ def crear_app(
         try:
             formulario = leer_formulario(await request.body())
             dominio, nombre = datos_de_alta(formulario)
-            # La fuente valida el dominio (sintaxis y anti-SSRF) antes de guardarlo.
-            nueva = await datos.alta_tienda(dominio, nombre)
+            entrada = leer_entrada(formulario)
+            # La fuente valida el dominio (sintaxis y anti-SSRF) y la URL de entrada (mismo
+            # host, marcadores...) antes de guardarlos.
+            nueva = await datos.alta_tienda(dominio, nombre, entrada=entrada)
         except (ErrorFormulario, ErrorFuente) as error:
             contexto = {
                 "tiendas": datos.tiendas(),
                 "error": str(error),
                 "dominio": primero(formulario, "dominio")[:300],
                 "nombre": primero(formulario, "nombre")[:300],
+                "entrada": primero(formulario, "entrada")[:MAX_ENTRADA_ESCRITA],
             }
             return pagina(request, "tiendas.html", contexto, 422)
         return RedirectResponse(f"/tiendas/{quote(nueva.dominio)}?alta=1", status_code=303)
@@ -234,8 +240,28 @@ def crear_app(
             "tienda": encontrada,
             "alta": request.query_params.get("alta") == "1",
             "revisado": request.query_params.get("revisado") == "1",
+            "entrada_cambiada": request.query_params.get("entrada") == "1",
         }
         return pagina(request, "tienda.html", contexto)
+
+    @app.post("/tiendas/{dominio}/entrada", response_class=HTMLResponse)
+    async def cambiar_entrada(request: Request, dominio: str) -> Response:
+        """Nota 16 §A: pone, cambia o (vacía) quita la URL de entrada de la tienda."""
+        encontrada = datos.tienda(dominio)
+        if encontrada is None:
+            raise HTTPException(404)
+        formulario: Parametros = {}
+        try:
+            formulario = leer_formulario(await request.body())
+            cambiada = datos.cambiar_entrada(encontrada.dominio, leer_entrada(formulario))
+        except (ErrorFormulario, ErrorFuente) as error:
+            contexto = {
+                "tienda": datos.tienda(encontrada.dominio) or encontrada,
+                "error_entrada": str(error),
+                "entrada": primero(formulario, "entrada")[:MAX_ENTRADA_ESCRITA],
+            }
+            return pagina(request, "tienda.html", contexto, 422)
+        return RedirectResponse(f"/tiendas/{quote(cambiada.dominio)}?entrada=1", status_code=303)
 
     @app.post("/tiendas/{dominio}/revisar", response_class=HTMLResponse)
     async def revisar_perfil(request: Request, dominio: str) -> Response:

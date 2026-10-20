@@ -10,16 +10,18 @@
   {% with estado = tienda.estado %}{% include "_estado_perfil.html" %}{% endwith %}
 </section>
 
+{% set actual = tienda.version_actual %}
 <section class="tarjeta">
   <dl class="datos datos-fila">
     <div><dt>robots.txt</dt><dd class="{{ '' if tienda.robots_permite else 'texto-error' }}">{{ tienda.robots }}</dd></div>
     <div><dt>Última visita</dt><dd>{{ tienda.ultima_visita | fecha_hora if tienda.ultima_visita else "Nunca" }}</dd></div>
     <div><dt>Bloqueos / CAPTCHA</dt><dd>{{ tienda.bloqueos }}</dd></div>
+    <div><dt>Tipo de perfil</dt><dd>{{ actual.selectores.get("tipo", "html (buscador de la tienda)") if actual else "—" }}</dd></div>
+    <div><dt>URL de entrada</dt><dd>{% if tienda.entrada %}<code>{{ tienda.entrada }}</code>{% else %}—{% endif %}</dd></div>
   </dl>
   {% if error %}<p class="mensaje mensaje-error" role="alert">{{ error }}</p>{% endif %}
   {% if alta %}<p class="mensaje mensaje-ok" role="status">Tienda añadida. Su perfil lo crea el 🤖 configurador en la primera búsqueda en modo Auto o IA.</p>{% endif %}
   {% if revisado %}<p class="mensaje mensaje-ok" role="status">Perfil revisado y fijado.</p>{% endif %}
-  {% set actual = tienda.version_actual %}
   {% set pendiente = actual and tienda.estado.value == "pendiente_revision" %}
   {% if pendiente %}
   <p class="mensaje mensaje-aviso">La IA ha generado la versión v{{ actual.numero }} de este perfil y el sistema la ha validado, pero <strong>falta tu revisión</strong> antes de fijarla. Comprueba abajo su URL de búsqueda y sus selectores.</p>
@@ -37,6 +39,29 @@
     {% endif %}
     <button class="boton boton-secundario" type="button" disabled title="Todavía no se puede lanzar desde la web">Volver a validar</button>
   </div>
+</section>
+
+<section class="tarjeta" id="entrada">
+  <h2>URL de entrada</h2>
+  <p class="tenue">El 🤖 configurador la usa al crear el perfil de la tienda: una URL de búsqueda la prueba antes que el buscador que descubra él; un listado, solo si no encuentra ni buscador ni sitemap. Cambiarla no modifica el perfil que ya tenga la tienda.</p>
+  {% if error_entrada %}<p class="mensaje mensaje-error" role="alert">{{ error_entrada }}</p>{% endif %}
+  {% if entrada_cambiada %}<p class="mensaje mensaje-ok" role="status">{{ "URL de entrada guardada." if tienda.entrada else "URL de entrada quitada." }}</p>{% endif %}
+  <form class="formulario" method="post" action="/tiendas/{{ tienda.dominio | urlencode }}/entrada">
+    <div class="campo-fila">
+      <label class="crece">URL de entrada (opcional)
+        <input name="entrada" maxlength="500" autocomplete="off" spellcheck="false" inputmode="url"
+               aria-describedby="ayuda-entrada" placeholder="https://{{ tienda.dominio }}/buscar?q={consulta}" value="{{ entrada if entrada is defined else (tienda.entrada or '') }}">
+      </label>
+      <button class="boton boton-primario" type="submit">Guardar la URL de entrada</button>
+    </div>
+    {% include "_ayuda_entrada.html" %}
+  </form>
+  {% if tienda.entrada %}
+  <form class="acciones" method="post" action="/tiendas/{{ tienda.dominio | urlencode }}/entrada">
+    <input type="hidden" name="entrada" value="">
+    <button class="boton boton-secundario" type="submit">Quitar la URL de entrada</button>
+  </form>
+  {% endif %}
 </section>
 
 <section>

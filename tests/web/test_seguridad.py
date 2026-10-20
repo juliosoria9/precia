@@ -112,7 +112,14 @@ def test_cuerpo_demasiado_grande_se_rechaza(cliente: ClienteASGI) -> None:
 
 @pytest.mark.parametrize(
     "ruta",
-    ["/", "/buscar?texto=pastillas", "/productos/pastillas-1k0698151", "/tiendas", "/ia"],
+    [
+        "/",
+        "/buscar?texto=pastillas",
+        "/productos/pastillas-1k0698151",
+        "/tiendas",
+        "/tiendas/desguacesur.example",
+        "/ia",
+    ],
 )
 def test_ninguna_pantalla_tiene_codigo_en_linea(cliente: ClienteASGI, ruta: str) -> None:
     html = cliente.get(ruta).texto

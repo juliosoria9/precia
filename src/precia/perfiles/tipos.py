@@ -4,12 +4,17 @@ Un perfil dice cómo buscar en una tienda y cómo leer sus fichas con selectores
 selectores pertenecen a un subconjunto de CSS (ver `extraccion/selectores.py`) y pueden acabar en
 ` @atributo` para leer un atributo en vez del texto: `"h2.nombre a @href"`.
 
-Hay perfiles de dos clases (`Perfil.tipo`, nota 15 §D):
+Hay estas clases de perfil (`Perfil.tipo`, nota 15 §D y nota 16):
 
 - `html`: la búsqueda es una página HTML y se lee con los selectores.
 - `api_woocommerce` y `api_shopify`: la búsqueda va a la API pública de solo lectura que la
   propia tienda usa en su buscador (`fuentes.apis`). La respuesta ya trae los productos con sus
   datos, así que el perfil no necesita selectores (pueden ir vacíos) y no se visita cada ficha.
+- `listado` (nota 16 §A2): la tienda no tiene buscador y el usuario ha dado la URL de un listado
+  o categoría, sin `{consulta}` y con `{pagina}` opcional. Se recorren unas pocas páginas con los
+  selectores del listado y se filtran los resultados por la consulta.
+- `sitemap` (nota 16 §B): la tienda no tiene buscador y se busca en el catálogo local de URL que
+  sale de su `sitemap.xml` (`url_busqueda` es el sitemap raíz). No hay selectores de listado.
 """
 
 from dataclasses import dataclass, field
@@ -18,7 +23,9 @@ from datetime import datetime
 TIPO_HTML = "html"
 TIPO_API_WOOCOMMERCE = "api_woocommerce"
 TIPO_API_SHOPIFY = "api_shopify"
-TIPOS_PERFIL = (TIPO_HTML, TIPO_API_WOOCOMMERCE, TIPO_API_SHOPIFY)
+TIPO_LISTADO = "listado"
+TIPO_SITEMAP = "sitemap"
+TIPOS_PERFIL = (TIPO_HTML, TIPO_API_WOOCOMMERCE, TIPO_API_SHOPIFY, TIPO_LISTADO, TIPO_SITEMAP)
 """Tipos admitidos; el almacén rechaza cualquier otro (también con un CHECK en la tabla)."""
 
 
@@ -27,7 +34,9 @@ class Perfil:
     dominio: str
     version: int
     url_busqueda: str
-    """Plantilla con `{consulta}`, p. ej. `https://tienda.es/buscar?q={consulta}`."""
+    """Plantilla con `{consulta}`, p. ej. `https://tienda.es/buscar?q={consulta}`. En un perfil
+    `listado` es la URL del listado (sin `{consulta}`, con `{pagina}` opcional) y en uno
+    `sitemap`, la del sitemap raíz."""
     sel_resultado: str
     """Cada resultado de la página de búsqueda."""
     sel_titulo: str
@@ -52,6 +61,16 @@ class Perfil:
     def es_api(self) -> bool:
         """La búsqueda va a la API pública de la plataforma y no se usan los selectores."""
         return self.tipo in (TIPO_API_WOOCOMMERCE, TIPO_API_SHOPIFY)
+
+    @property
+    def es_listado(self) -> bool:
+        """La búsqueda recorre un listado o categoría de la tienda (no tiene buscador)."""
+        return self.tipo == TIPO_LISTADO
+
+    @property
+    def es_sitemap(self) -> bool:
+        """La búsqueda va al catálogo local sacado del `sitemap.xml` (sin selectores de listado)."""
+        return self.tipo == TIPO_SITEMAP
 
 
 @dataclass(frozen=True, slots=True)

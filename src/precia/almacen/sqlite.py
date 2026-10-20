@@ -1,5 +1,8 @@
 """Almacén de PrecIA sobre SQLite: tiendas, perfiles, histórico, alertas, ajustes y llamadas de IA.
 
+También guarda el catálogo local de URL de las tiendas sin buscador, sacado de su `sitemap.xml`
+(nota 16 §B): solo la URL, las palabras de su slug y el `lastmod`, nunca precios ni descripciones.
+
 Todas las consultas son parametrizadas: los textos vienen de webs (no confiables) o de la IA y
 nunca se pegan en el SQL. Los importes se guardan como TEXT con `str(Decimal)` para no pasar
 nunca por coma flotante, y las fechas en ISO 8601.
@@ -12,7 +15,7 @@ import json
 import math
 import sqlite3
 import threading
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import fields, replace
 from datetime import date, datetime
@@ -20,13 +23,17 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import TracebackType
 from typing import Any, NamedTuple, Self
+from urllib.parse import urlsplit
 
+from precia.emparejado.referencias import referencias_en
+from precia.emparejado.texto import normalizar_titulo
 from precia.nucleo.modelos import (
     CLAVES_CAMPOS,
     Ajustes,
     Alerta,
     EstadoPerfil,
     GrupoProducto,
+    InfoCatalogo,
     LlamadaIA,
     Modo,
     Oferta,
@@ -37,7 +44,7 @@ from precia.nucleo.modelos import (
     ValorCampo,
     VersionPerfil,
 )
-from precia.perfiles.tipos import TIPO_HTML, TIPOS_PERFIL, Perfil
+from precia.perfiles.tipos import TIPO_HTML, TIPO_LISTADO, TIPO_SITEMAP, TIPOS_PERFIL, Perfil
 
 MIGRACIONES: tuple[str, ...] = (
     """
@@ -140,6 +147,59 @@ MIGRACIONES: tuple[str, ...] = (
     ALTER TABLE perfiles ADD COLUMN tipo TEXT NOT NULL DEFAULT 'html'
         CHECK (tipo IN ('html', 'api_woocommerce', 'api_shopify'));
     """,
+    # 4: webs sin buscador (nota 16, ADR-018). La URL de entrada que da el usuario, los tipos
+    # `listado` y `sitemap` y el catálogo local de URL del sitemap. SQLite no deja cambiar un
+    # CHECK con ALTER: la tabla `perfiles` se reconstruye con el mismo esquema (columnas en el
+    # mismo orden, clave primaria, clave foránea y STRICT) y se copian todas sus filas. Va dentro
+    # de la transacción de `_migrar`, donde `PRAGMA foreign_keys` no se puede cambiar (SQLite lo
+    # ignora): no hace falta, porque ninguna tabla apunta a `perfiles` (borrarla no dispara ningún
+    # CASCADE) y sus filas ya cumplían la clave foránea.
+    """
+    ALTER TABLE tiendas ADD COLUMN entrada TEXT;
+
+    CREATE TABLE perfiles_v4 (
+        dominio TEXT NOT NULL REFERENCES tiendas (dominio) ON DELETE CASCADE,
+        version INTEGER NOT NULL CHECK (version >= 1),
+        url_busqueda TEXT NOT NULL,
+        sel_resultado TEXT NOT NULL,
+        sel_titulo TEXT NOT NULL,
+        sel_enlace TEXT NOT NULL,
+        sel_precio_listado TEXT,
+        sel_campos TEXT NOT NULL,
+        necesita_js INTEGER NOT NULL CHECK (necesita_js IN (0, 1)),
+        autor TEXT NOT NULL,
+        revisado INTEGER NOT NULL DEFAULT 0 CHECK (revisado IN (0, 1)),
+        creado TEXT NOT NULL,
+        nota TEXT NOT NULL DEFAULT '',
+        tipo TEXT NOT NULL DEFAULT 'html'
+            CHECK (tipo IN ('html', 'api_woocommerce', 'api_shopify', 'listado', 'sitemap')),
+        PRIMARY KEY (dominio, version)
+    ) STRICT;
+    INSERT INTO perfiles_v4 (dominio, version, url_busqueda, sel_resultado, sel_titulo,
+        sel_enlace, sel_precio_listado, sel_campos, necesita_js, autor, revisado, creado, nota,
+        tipo)
+    SELECT dominio, version, url_busqueda, sel_resultado, sel_titulo, sel_enlace,
+        sel_precio_listado, sel_campos, necesita_js, autor, revisado, creado, nota, tipo
+    FROM perfiles;
+    DROP TABLE perfiles;
+    ALTER TABLE perfiles_v4 RENAME TO perfiles;
+
+    CREATE TABLE catalogo (
+        dominio TEXT NOT NULL REFERENCES tiendas (dominio) ON DELETE CASCADE,
+        url TEXT NOT NULL,
+        palabras TEXT NOT NULL,
+        lastmod TEXT,
+        PRIMARY KEY (dominio, url)
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TABLE catalogos (
+        dominio TEXT PRIMARY KEY REFERENCES tiendas (dominio) ON DELETE CASCADE,
+        sitemap TEXT NOT NULL,
+        actualizado TEXT NOT NULL,
+        total INTEGER NOT NULL CHECK (total >= 0),
+        parcial INTEGER NOT NULL CHECK (parcial IN (0, 1))
+    ) STRICT;
+    """,
 )
 
 # Solo para diagnóstico y tests: los nombres de PRAGMA no se pueden parametrizar.
@@ -169,6 +229,22 @@ MAX_TEXTO_BUSQUEDA = 500
 MAX_IMPORTE = 50
 MAX_ENTERO = 2**63 - 1
 """El mayor INTEGER de SQLite: más allá, `sqlite3` lanza `OverflowError`."""
+MAX_ENTRADA = 500
+"""Lo que admite `perfiles.entrada.normalizar_entrada` en la URL de entrada (nota 16 §A)."""
+MAX_CATALOGO = 100_000
+"""URL del catálogo de una tienda (nota 16 §B): si hay más, se guardan estas y queda `parcial`."""
+MAX_PALABRAS_URL = 300
+"""Lo que da como mucho `fuentes.sitemap.palabras_url`."""
+MAX_LASTMOD = 64
+MAX_LIMITE_CATALOGO = 100
+MIN_PALABRA_CATALOGO = 3
+"""Las palabras más cortas de la consulta no cuentan (como en `orquestador._de_la_consulta`)."""
+MAX_PALABRAS_CONSULTA = 12
+MAX_REFERENCIAS_CONSULTA = 4
+# Palabras de 3 letras o más que casi nunca salen en un slug: si contaran, «disco de freno para
+# el Golf» exigiría «para» en la URL.
+_PALABRAS_VACIAS_CATALOGO = frozenset({"con", "del", "las", "los", "para", "por", "una", "uno"})
+_PUERTOS = {"http": 80, "https": 443}
 
 
 class ErrorAlmacen(Exception):
@@ -193,6 +269,15 @@ class PerfilNoEncontrado(ErrorAlmacen, LookupError):
 
 class ProductoNoEncontrado(ErrorAlmacen, LookupError):
     """No se ha guardado nunca un precio de ese producto."""
+
+
+class EntradaCatalogo(NamedTuple):
+    """Una URL del catálogo. `guardar_catalogo` admite también tuplas `(url, palabras, lastmod)`."""
+
+    url: str
+    palabras: str
+    """Palabras del slug y de la ruta (`fuentes.sitemap.palabras_url`)."""
+    lastmod: str | None = None
 
 
 class BusquedaGuardada(NamedTuple):
@@ -237,6 +322,70 @@ def _fecha(valor: object, campo: str) -> str:
     if not isinstance(valor, datetime):
         raise DatoNoValido(f"{campo}: se espera un datetime")
     return valor.isoformat()
+
+
+def _url_de_la_tienda(valor: object, campo: str, dominio: str, maximo: int) -> str:
+    """`valor` es una URL http(s) absoluta del host de la tienda (con o sin `www.`).
+
+    El almacén no guarda nada que apunte a otro servidor: las URL del catálogo vienen de un
+    sitemap (dato de la web) y se descargan después. No sustituye a `validar_url` (anti-SSRF),
+    que se aplica siempre al descargar.
+    """
+    texto = _texto(valor, campo, maximo)
+    error = DatoNoValido(f"{campo}: se espera una URL http(s) de {dominio}")
+    # `urlsplit` quita en silencio tabuladores y saltos de línea: se rechazan antes, igual que la
+    # barra invertida, que los navegadores leen como `/`.
+    if any(c.isspace() or not c.isprintable() or c == "\\" for c in texto):
+        raise error
+    try:
+        # Unos corchetes de IPv6 sin cerrar hacen que ya `urlsplit` lance `ValueError`.
+        partes = urlsplit(texto)
+        puerto = partes.port
+    except ValueError as e:
+        raise error from e
+    if (
+        partes.scheme not in _PUERTOS
+        or "@" in partes.netloc
+        or puerto not in (None, _PUERTOS[partes.scheme])
+        or partes.hostname not in (dominio, f"www.{dominio}")
+    ):
+        raise error
+    return texto
+
+
+def _patron_like(texto: str) -> str:
+    """Patrón de `LIKE ... ESCAPE '\\'` que busca `texto` literal en cualquier sitio."""
+    escapado = texto.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escapado}%"
+
+
+def _terminos_catalogo(consulta: str) -> tuple[list[str], list[str]]:
+    """Palabras (normalizadas, de 3 letras o más) y referencias OEM de la consulta.
+
+    La normalización es `emparejado.texto.normalizar_titulo`, la misma que `guardar_catalogo`
+    aplica a las palabras de cada URL: minúsculas, sin acentos y separando por cualquier signo.
+    Las referencias van en minúsculas y sin separadores (`normalizar_referencia`).
+    """
+    texto = consulta[:MAX_TEXTO_BUSQUEDA]
+    palabras: list[str] = []
+    for palabra in normalizar_titulo(texto).split():
+        if (
+            len(palabra) >= MIN_PALABRA_CATALOGO
+            and palabra not in _PALABRAS_VACIAS_CATALOGO
+            and palabra not in palabras
+        ):
+            palabras.append(palabra)
+            if len(palabras) == MAX_PALABRAS_CONSULTA:
+                break
+    referencias = sorted(r.lower() for r in referencias_en(texto))[:MAX_REFERENCIAS_CONSULTA]
+    return palabras, referencias
+
+
+def _palabras_catalogo(palabras: object) -> str:
+    texto = _texto(palabras, "palabras", MAX_PALABRAS_URL, vacio=True)
+    # Se normalizan aquí también, con la misma función que la consulta: así las dos comparan
+    # igual aunque cambie cómo las saca `fuentes.sitemap.palabras_url`.
+    return normalizar_titulo(texto)[:MAX_PALABRAS_URL]
 
 
 def _mes(instante: datetime) -> str:
@@ -344,16 +493,35 @@ class Almacen:
 
     # --- Tiendas ---
 
-    def alta_tienda(self, dominio: str, nombre: str) -> Tienda:
+    def alta_tienda(self, dominio: str, nombre: str, *, entrada: str | None = None) -> Tienda:
+        """Da de alta la tienda con la URL de entrada del usuario, si la hay (nota 16 §A).
+
+        `entrada` llega ya normalizada por `perfiles.entrada.normalizar_entrada`; el almacén
+        solo comprueba que sea una URL http(s) del host de la tienda.
+        """
         _texto(dominio, "dominio", MAX_DOMINIO)
         _texto(nombre, "nombre", MAX_NOMBRE_TIENDA)
+        if entrada is not None:
+            _url_de_la_tienda(entrada, "entrada", dominio, MAX_ENTRADA)
         with self._transaccion() as con:
             if con.execute("SELECT 1 FROM tiendas WHERE dominio = ?", (dominio,)).fetchone():
                 raise TiendaDuplicada(dominio)
             con.execute(
-                "INSERT INTO tiendas (dominio, nombre, estado) VALUES (?, ?, ?)",
-                (dominio, nombre, EstadoPerfil.SIN_PERFIL.value),
+                "INSERT INTO tiendas (dominio, nombre, estado, entrada) VALUES (?, ?, ?, ?)",
+                (dominio, nombre, EstadoPerfil.SIN_PERFIL.value, entrada),
             )
+        return self._tienda_o_error(dominio)
+
+    def cambiar_entrada(self, dominio: str, entrada: str | None) -> Tienda:
+        """Pone (o quita, con `None`) la URL de entrada de la tienda (nota 16 §A)."""
+        if entrada is not None:
+            _url_de_la_tienda(entrada, "entrada", dominio, MAX_ENTRADA)
+        with self._transaccion() as con:
+            cursor = con.execute(
+                "UPDATE tiendas SET entrada = ? WHERE dominio = ?", (entrada, dominio)
+            )
+            if cursor.rowcount == 0:
+                raise TiendaNoEncontrada(dominio)
         return self._tienda_o_error(dominio)
 
     def tiendas(self) -> list[Tienda]:
@@ -480,6 +648,111 @@ class Almacen:
 
     def _perfiles(self, sql: str, parametros: Sequence[object] = ()) -> list[Perfil]:
         return [_perfil(f) for f in self._consultar(sql, parametros)]
+
+    # --- Catálogo por sitemap (nota 16 §B) ---
+
+    def guardar_catalogo(
+        self,
+        dominio: str,
+        sitemap: str,
+        entradas: Iterable[tuple[str, str, str | None]],
+        *,
+        parcial: bool,
+    ) -> InfoCatalogo:
+        """Sustituye todo el catálogo de la tienda, en una transacción, y devuelve su resumen.
+
+        `entradas` son `EntradaCatalogo` o tuplas `(url, palabras, lastmod)`. Cada URL (y el
+        `sitemap`) tiene que ser http(s) del host de la tienda, y `palabras` se normaliza igual
+        que la consulta de `buscar_catalogo`. Una entrada no válida es `DatoNoValido` y no
+        cambia nada. Las URL repetidas cuentan una vez. Se guardan como mucho `MAX_CATALOGO`:
+        si `entradas` trae más, el resto no se lee y el catálogo queda `parcial`.
+        """
+        _texto(dominio, "dominio", MAX_DOMINIO)
+        _url_de_la_tienda(sitemap, "sitemap", dominio, MAX_URL)
+        parcial = bool(parcial)
+        filas: list[tuple[str, str, str, str | None]] = []
+        vistas: set[str] = set()
+        for entrada in entradas:
+            if len(filas) >= MAX_CATALOGO:
+                parcial = True
+                break
+            if not isinstance(entrada, tuple) or len(entrada) != 3:
+                raise DatoNoValido("entradas: se espera (url, palabras, lastmod)")
+            url, palabras, lastmod = entrada
+            _url_de_la_tienda(url, "url", dominio, MAX_URL)
+            normalizadas = _palabras_catalogo(palabras)
+            if lastmod is not None:
+                _texto(lastmod, "lastmod", MAX_LASTMOD)
+            if url not in vistas:
+                vistas.add(url)
+                filas.append((dominio, url, normalizadas, lastmod))
+        info = InfoCatalogo(dominio, sitemap, self._reloj(), len(filas), parcial)
+        actualizado = _fecha(info.actualizado, "actualizado")
+        with self._transaccion() as con:
+            if not con.execute("SELECT 1 FROM tiendas WHERE dominio = ?", (dominio,)).fetchone():
+                raise TiendaNoEncontrada(dominio)
+            con.execute("DELETE FROM catalogo WHERE dominio = ?", (dominio,))
+            con.executemany(
+                "INSERT INTO catalogo (dominio, url, palabras, lastmod) VALUES (?, ?, ?, ?)", filas
+            )
+            con.execute(
+                "INSERT INTO catalogos (dominio, sitemap, actualizado, total, parcial)"
+                " VALUES (?, ?, ?, ?, ?) ON CONFLICT (dominio) DO UPDATE SET"
+                " sitemap = excluded.sitemap, actualizado = excluded.actualizado,"
+                " total = excluded.total, parcial = excluded.parcial",
+                (dominio, sitemap, actualizado, info.total, int(parcial)),
+            )
+        return info
+
+    def catalogo(self, dominio: str) -> InfoCatalogo | None:
+        """El resumen del catálogo de la tienda, o `None` si no se ha guardado nunca."""
+        filas = self._consultar("SELECT * FROM catalogos WHERE dominio = ?", (dominio,))
+        if not filas:
+            return None
+        fila = filas[0]
+        return InfoCatalogo(
+            dominio=fila["dominio"],
+            sitemap=fila["sitemap"],
+            actualizado=datetime.fromisoformat(fila["actualizado"]),
+            total=fila["total"],
+            parcial=bool(fila["parcial"]),
+        )
+
+    def buscar_catalogo(self, dominio: str, consulta: str, *, limite: int) -> list[str]:
+        """Las URL del catálogo que encajan con la consulta, como mucho `limite`.
+
+        Encajan las que tienen en sus palabras todas las de la consulta (normalizadas, de 3
+        letras o más, sin las vacías como «para») o alguna de sus referencias OEM, comparada sin
+        espacios («1k0 698 151» encaja con «1K0698151»). Si no hay ninguna, las que tienen más
+        palabras de la consulta (las empatadas en el máximo). Una consulta sin palabras ni
+        referencias no devuelve nada. Orden: primero las de referencia y después por URL.
+        """
+        if _entero(limite, "limite") == 0 or limite > MAX_LIMITE_CATALOGO:
+            raise DatoNoValido(f"limite: entre 1 y {MAX_LIMITE_CATALOGO}")
+        if not isinstance(consulta, str):
+            raise DatoNoValido("consulta: se espera un texto")
+        palabras, referencias = _terminos_catalogo(consulta)
+        if not palabras and not referencias:
+            return []
+        # Las expresiones solo repiten texto fijo; las palabras van siempre como parámetros.
+        aciertos = " + ".join(["(palabras LIKE ? ESCAPE '\\')"] * len(palabras)) or "0"
+        oem = " OR ".join(["(REPLACE(palabras, ' ', '') LIKE ? ESCAPE '\\')"] * len(referencias))
+        filas = self._consultar(
+            f"SELECT url, aciertos, oem FROM (SELECT url, {aciertos} AS aciertos,"
+            f" {oem or '0'} AS oem FROM catalogo WHERE dominio = ?)"
+            " WHERE aciertos > 0 OR oem ORDER BY oem DESC, aciertos DESC, url LIMIT ?",
+            (
+                *(_patron_like(p) for p in palabras),
+                *(_patron_like(r) for r in referencias),
+                dominio,
+                limite,
+            ),
+        )
+        completas = [f["url"] for f in filas if f["oem"] or f["aciertos"] == len(palabras)]
+        if completas or not filas:
+            return completas
+        maximo = filas[0]["aciertos"]
+        return [f["url"] for f in filas if f["aciertos"] == maximo]
 
     # --- Histórico de precios ---
 
@@ -843,10 +1116,22 @@ def _validar_perfil(perfil: Perfil) -> None:
     if not isinstance(perfil.tipo, str) or perfil.tipo not in TIPOS_PERFIL:
         raise DatoNoValido(f"tipo: se espera uno de {', '.join(TIPOS_PERFIL)}")
     _texto(perfil.dominio, "dominio", MAX_DOMINIO)
-    _texto(perfil.url_busqueda, "url_busqueda", MAX_URL)
-    # Un perfil `api_*` no lee HTML: sus selectores pueden ir vacíos. Uno `html` sin selectores
-    # no encontraría nunca nada.
-    sin_selectores = perfil.es_api
+    url = _texto(perfil.url_busqueda, "url_busqueda", MAX_URL)
+    if perfil.es_listado:
+        # Nota 16 §A2: la URL del listado, sin `{consulta}` y con `{pagina}` como mucho una vez.
+        if url.count("{pagina}") > 1 or _llaves(url.replace("{pagina}", "", 1)):
+            raise DatoNoValido("url_busqueda: un listado no lleva {consulta} y {pagina} va una vez")
+    elif perfil.es_sitemap and _llaves(url):
+        raise DatoNoValido("url_busqueda: la URL del sitemap no lleva plantilla")
+    if perfil.es_sitemap:
+        # Nota 16 §B: se busca en el catálogo local y no hay listado que leer.
+        if perfil.sel_resultado or perfil.sel_titulo or perfil.sel_enlace:
+            raise DatoNoValido("sel_resultado, sel_titulo y sel_enlace: un sitemap no los usa")
+        if perfil.sel_precio_listado is not None:
+            raise DatoNoValido("sel_precio_listado: un sitemap no lo usa")
+    # Un perfil `api_*` o `sitemap` no lee un listado HTML: sus selectores pueden ir vacíos. Uno
+    # `html` o `listado` sin selectores no encontraría nunca nada.
+    sin_selectores = perfil.es_api or perfil.es_sitemap
     _texto(perfil.sel_resultado, "sel_resultado", MAX_SELECTOR, vacio=sin_selectores)
     _texto(perfil.sel_titulo, "sel_titulo", MAX_SELECTOR, vacio=sin_selectores)
     _texto(perfil.sel_enlace, "sel_enlace", MAX_SELECTOR, vacio=sin_selectores)
@@ -863,6 +1148,10 @@ def _validar_perfil(perfil: Perfil) -> None:
     _texto(perfil.autor, "autor", MAX_AUTOR)
     _texto(perfil.nota, "nota", MAX_NOTA, vacio=True)
     _fecha(perfil.creado, "creado")
+
+
+def _llaves(texto: str) -> bool:
+    return "{" in texto or "}" in texto
 
 
 def _perfil(fila: sqlite3.Row) -> Perfil:
@@ -889,18 +1178,24 @@ def _perfil(fila: sqlite3.Row) -> Perfil:
     )
 
 
+_TIPOS_LEGIBLES = {
+    TIPO_LISTADO: "listado (sin buscador: se recorre el listado de la URL)",
+    TIPO_SITEMAP: "sitemap (sin buscador: catálogo de URL del sitemap)",
+}
+
+
 def _version_perfil(perfil: Perfil) -> VersionPerfil:
-    # La web enseña estos pares a quien revisa el perfil: en uno `api_*` lo que hay que revisar
-    # es el tipo (y la URL de la API), no unos selectores vacíos.
+    # La web enseña estos pares a quien revisa el perfil: en uno `api_*` o `sitemap` lo que hay
+    # que revisar es el tipo (y la URL de la API o del sitemap), no unos selectores vacíos.
     selectores: dict[str, str] = {}
     if perfil.tipo != TIPO_HTML:
-        selectores["tipo"] = perfil.tipo
+        selectores["tipo"] = _TIPOS_LEGIBLES.get(perfil.tipo, perfil.tipo)
     for nombre, selector in (
         ("resultado", perfil.sel_resultado),
         ("titulo", perfil.sel_titulo),
         ("enlace", perfil.sel_enlace),
     ):
-        if selector or not perfil.es_api:
+        if selector or not (perfil.es_api or perfil.es_sitemap):
             selectores[nombre] = selector
     if perfil.sel_precio_listado is not None:
         selectores["precio_listado"] = perfil.sel_precio_listado
@@ -928,6 +1223,7 @@ def _tienda(fila: sqlite3.Row, versiones: Sequence[VersionPerfil]) -> Tienda:
         ultima_visita=_leer_fecha(fila["ultima_visita"]),
         bloqueos=fila["bloqueos"],
         versiones=tuple(versiones),
+        entrada=fila["entrada"],
     )
 
 

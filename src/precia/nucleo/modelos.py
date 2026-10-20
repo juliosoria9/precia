@@ -164,10 +164,27 @@ class Tienda:
     ultima_visita: datetime | None
     bloqueos: int
     versiones: tuple[VersionPerfil, ...] = ()
+    entrada: str | None = None
+    """URL de entrada que da el usuario si PrecIA no encuentra el buscador (nota 16 §A): la de
+    búsqueda con `{consulta}` o la de un listado o categoría con `{pagina}` opcional."""
 
     @property
     def version_actual(self) -> VersionPerfil | None:
         return self.versiones[-1] if self.versiones else None
+
+
+@dataclass(frozen=True, slots=True)
+class InfoCatalogo:
+    """Resumen del catálogo local de URL de una tienda, sacado de su `sitemap.xml` (nota 16 §B)."""
+
+    dominio: str
+    sitemap: str
+    """URL del sitemap raíz del que salió."""
+    actualizado: datetime
+    total: int
+    """URL guardadas."""
+    parcial: bool
+    """Se llegó a algún tope (de ficheros o de URL) y faltan URL de la tienda."""
 
 
 @dataclass(frozen=True, slots=True)

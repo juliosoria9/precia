@@ -21,6 +21,7 @@ from precia.nucleo.modelos import (
     SerieHistorico,
     Tienda,
 )
+from precia.perfiles.entrada import EntradaNoValida, normalizar_entrada
 
 
 class ErrorFuente(Exception):
@@ -43,6 +44,21 @@ class RevisionNoValida(ErrorFuente):
     """No se puede fijar esa versión del perfil (no es la actual, ya está revisada...)."""
 
 
+class URLEntradaNoValida(ErrorFuente, ValueError):
+    """La URL de entrada de la tienda no cumple las reglas de `perfiles.entrada` (nota 16 §A)."""
+
+
+def entrada_normalizada(dominio: str, texto: str | None) -> str | None:
+    """La URL de entrada de la tienda `dominio` normalizada, o `None` si `texto` está vacío.
+
+    Lanza `URLEntradaNoValida` con el mensaje de `perfiles.entrada.normalizar_entrada`.
+    """
+    try:
+        return normalizar_entrada(dominio, texto or "")
+    except EntradaNoValida as error:
+        raise URLEntradaNoValida(str(error)) from error
+
+
 class FuenteDatos(Protocol):
     es_demo: bool
 
@@ -52,8 +68,19 @@ class FuenteDatos(Protocol):
 
     def tienda(self, dominio: str) -> Tienda | None: ...
 
-    async def alta_tienda(self, dominio: str, nombre: str) -> Tienda:
-        """Da de alta la tienda (sin perfil). `DominioNoValido` o `TiendaYaExiste` si no."""
+    async def alta_tienda(self, dominio: str, nombre: str, *, entrada: str | None = None) -> Tienda:
+        """Da de alta la tienda (sin perfil), con la URL de entrada si se escribe alguna.
+
+        `entrada` es el texto tal cual lo escribe el usuario: vacío o `None` es «sin entrada».
+        `DominioNoValido`, `URLEntradaNoValida` o `TiendaYaExiste` si no se puede.
+        """
+        ...
+
+    def cambiar_entrada(self, dominio: str, entrada: str | None) -> Tienda:
+        """Pone, cambia o (con un texto vacío o `None`) quita la URL de entrada de la tienda.
+
+        `TiendaNoExiste` o `URLEntradaNoValida` si no se puede; entonces no cambia nada.
+        """
         ...
 
     def revisar_perfil(self, dominio: str, version: int) -> Tienda:

@@ -17,8 +17,13 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from precia.navegador.url import validar_url
-from precia.nucleo.dominios import dominio_de_tienda
-from precia.nucleo.fuente_datos import RevisionNoValida, TiendaNoExiste, TiendaYaExiste
+from precia.nucleo.dominios import dominio_de_tienda, normalizar_dominio
+from precia.nucleo.fuente_datos import (
+    RevisionNoValida,
+    TiendaNoExiste,
+    TiendaYaExiste,
+    entrada_normalizada,
+)
 from precia.nucleo.modelos import (
     Ajustes,
     Alerta,
@@ -628,8 +633,9 @@ class FuenteDemo:
     def tienda(self, dominio: str) -> Tienda | None:
         return next((t for t in self._tiendas if t.dominio == dominio), None)
 
-    async def alta_tienda(self, dominio: str, nombre: str) -> Tienda:
+    async def alta_tienda(self, dominio: str, nombre: str, *, entrada: str | None = None) -> Tienda:
         normalizado = await dominio_de_tienda(dominio, validador=_validar_sin_dns)
+        url_entrada = entrada_normalizada(normalizado, entrada)
         if self.tienda(normalizado) is not None:
             raise TiendaYaExiste(f"La tienda {normalizado} ya está dada de alta.")
         tienda = Tienda(
@@ -640,9 +646,19 @@ class FuenteDemo:
             True,
             None,
             0,
+            entrada=url_entrada,
         )
         self._tiendas.append(tienda)
         return tienda
+
+    def cambiar_entrada(self, dominio: str, entrada: str | None) -> Tienda:
+        normalizado = normalizar_dominio(dominio)
+        tienda = self.tienda(normalizado) if normalizado else None
+        if tienda is None:
+            raise TiendaNoExiste(f"No hay ninguna tienda {dominio}.")
+        nueva = replace(tienda, entrada=entrada_normalizada(tienda.dominio, entrada))
+        self._tiendas[self._tiendas.index(tienda)] = nueva
+        return nueva
 
     def revisar_perfil(self, dominio: str, version: int) -> Tienda:
         tienda = self.tienda(dominio)

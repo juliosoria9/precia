@@ -570,8 +570,8 @@ class NavegadorConEstados(NavegadorFalso):
 
     estados: dict[str, int] = field(default_factory=dict)
 
-    async def obtener(self, url: str, *, js: bool = False) -> Pagina:
-        respuesta = await super().obtener(url, js=js)
+    async def obtener(self, url: str, *, js: bool = False, grande: bool = False) -> Pagina:
+        respuesta = await super().obtener(url, js=js, grande=grande)
         estado = self.estados.get(respuesta.url)
         if estado is None:
             return respuesta

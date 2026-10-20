@@ -26,6 +26,7 @@ from precia.nucleo.fuente_datos import (
     RevisionNoValida,
     TiendaNoExiste,
     TiendaYaExiste,
+    URLEntradaNoValida,
 )
 from precia.nucleo.fuente_real import FuenteReal, proveedor_desde_ajustes
 from precia.nucleo.modelos import (
@@ -240,6 +241,86 @@ def test_alta_de_un_dominio_que_resuelve_a_una_ip_interna(tmp_path: Path) -> Non
 def test_alta_con_nombre_demasiado_largo(fuente: FuenteReal) -> None:
     with pytest.raises(ErrorFuente):
         asyncio.run(fuente.alta_tienda(DOMINIO, "n" * 201))
+
+
+# --- URL de entrada (nota 16 §A) ------------------------------------------------------------
+
+ENTRADA = f"https://www.{DOMINIO}/buscar?q={{consulta}}"
+
+
+def test_alta_con_url_de_entrada_la_guarda_normalizada(fuente: FuenteReal) -> None:
+    tienda = asyncio.run(
+        fuente.alta_tienda(
+            " WWW.Recambios-Prueba.ES ",
+            "Prueba",
+            entrada=f"  HTTPS://WWW.{DOMINIO.upper()}:443/buscar?q={{consulta}}  ",
+        )
+    )
+    assert tienda.entrada == ENTRADA
+    assert fuente.tienda(DOMINIO) == tienda
+    assert fuente.almacen.tienda(DOMINIO) == tienda
+
+
+@pytest.mark.parametrize("entrada", ["", "   ", None])
+def test_alta_sin_url_de_entrada(fuente: FuenteReal, entrada: str | None) -> None:
+    assert asyncio.run(fuente.alta_tienda(DOMINIO, "Prueba", entrada=entrada)).entrada is None
+
+
+@pytest.mark.parametrize(
+    "entrada",
+    [
+        "https://otra.es/buscar?q={consulta}",
+        f"https://{DOMINIO}.atacante.com/buscar?q={{consulta}}",
+        f"https://{DOMINIO}:8080/listado",
+        f"javascript://{DOMINIO}/%0aalert(1)",
+        f"https://{DOMINIO}/b/{{consulta}}?q={{consulta}}",
+        f"https://{DOMINIO}/buscar?q={{query}}",
+    ],
+)
+def test_alta_con_url_de_entrada_no_valida_no_da_de_alta(fuente: FuenteReal, entrada: str) -> None:
+    with pytest.raises(URLEntradaNoValida) as error:
+        asyncio.run(fuente.alta_tienda(DOMINIO, "Prueba", entrada=entrada))
+    assert isinstance(error.value, ErrorFuente)
+    assert fuente.tiendas() == []
+
+
+def test_cambiar_la_url_de_entrada(fuente: FuenteReal) -> None:
+    asyncio.run(fuente.alta_tienda(DOMINIO, "Prueba"))
+    listado = f"https://{DOMINIO}/catalogo/frenos?page={{pagina}}"
+    tienda = fuente.cambiar_entrada(f"WWW.{DOMINIO}", f" {listado} ")
+    assert tienda.entrada == listado
+    assert fuente.tienda(DOMINIO) == tienda
+    assert fuente.cambiar_entrada(DOMINIO, ENTRADA).entrada == ENTRADA
+
+
+@pytest.mark.parametrize("vacia", ["", "  ", None])
+def test_quitar_la_url_de_entrada(fuente: FuenteReal, vacia: str | None) -> None:
+    asyncio.run(fuente.alta_tienda(DOMINIO, "Prueba", entrada=ENTRADA))
+    assert fuente.cambiar_entrada(DOMINIO, vacia).entrada is None
+    tienda = fuente.tienda(DOMINIO)
+    assert tienda is not None and tienda.entrada is None
+
+
+def test_cambiar_la_entrada_a_una_no_valida_no_cambia_nada(fuente: FuenteReal) -> None:
+    asyncio.run(fuente.alta_tienda(DOMINIO, "Prueba", entrada=ENTRADA))
+    with pytest.raises(URLEntradaNoValida):
+        fuente.cambiar_entrada(DOMINIO, "https://otra.es/buscar?q={consulta}")
+    tienda = fuente.tienda(DOMINIO)
+    assert tienda is not None and tienda.entrada == ENTRADA
+
+
+@pytest.mark.parametrize("dominio", ["no-existe.es", "otra.es#x", "", "localhost"])
+def test_cambiar_la_entrada_de_una_tienda_que_no_existe(fuente: FuenteReal, dominio: str) -> None:
+    with pytest.raises(TiendaNoExiste):
+        fuente.cambiar_entrada(dominio, "")
+
+
+def test_la_entrada_se_comprueba_con_el_dominio_de_la_tienda(fuente: FuenteReal) -> None:
+    asyncio.run(fuente.alta_tienda(DOMINIO, "Prueba"))
+    asyncio.run(fuente.alta_tienda("otra-tienda.es", "Otra"))
+    # La URL es buena para «otra-tienda.es», no para esta.
+    with pytest.raises(URLEntradaNoValida):
+        fuente.cambiar_entrada(DOMINIO, "https://otra-tienda.es/listado")
 
 
 def _con_perfil(fuente: FuenteReal, **cambios: object) -> None:

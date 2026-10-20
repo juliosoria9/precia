@@ -6,7 +6,10 @@ Defensas, porque todo lo que manda la web es no confiable:
   `validar_url`, así una tienda no puede mandarnos a `http://169.254.169.254/`.
 - Al abrir el socket se vuelve a resolver el nombre y se comprueba la IP a la que se conecta de
   verdad (contra el *DNS rebinding*: la IP validada antes podría no ser la de ahora).
-- Sin proxies del entorno, sin cookies y sin compresión.
+- Sin proxies del entorno, sin cookies y sin compresión. La única excepción son los sitemaps en
+  gzip (nota 16): los tipos `application/gzip` y `application/x-gzip`, y en una URL `.xml.gz`
+  también `Content-Encoding: gzip` y `application/octet-stream`. Se descomprime con un tope de
+  bytes **descomprimidos** (contra las bombas gzip) y por trozos con `max_length`.
 - El cuerpo se lee por trozos con un tope de bytes y de tiempo total, y solo se acepta HTML o texto
   y, para las APIs públicas de plataforma y el descriptor OpenSearch (nota 15), JSON o XML, con el
   mismo límite de bytes. Esos datos llegan tal cual en `Pagina.html`: no se interpretan aquí.
@@ -25,16 +28,32 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zlib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from precia.navegador.tipos import ErrorDescarga, Pagina, URLNoPermitida
 from precia.navegador.url import IP, Validador, ip_publica, validar_url
 
 MAXIMO_BYTES = 5 * 1024 * 1024
+MAX_BYTES_SITEMAP = 20 * 1024 * 1024
+"""Tope de `descargar_grande` (sitemaps, nota 16): leídos y, si viene en gzip, descomprimidos."""
+MAX_MIEMBROS_GZIP = 64
+"""Miembros gzip concatenados en un fichero (los sitemaps reales traen uno): cada uno es un
+descompresor nuevo y miles de miembros vacíos serían trabajo sin salida."""
+MAX_CAPAS_GZIP = 2
+"""Un `.xml.gz` servido además con `Content-Encoding: gzip` llega comprimido dos veces."""
+FACTOR_TIEMPO_GRANDE = 3
+"""`descargar_grande` lee hasta 4 veces más bytes: tiene el triple de tiempo total."""
+MAGIA_GZIP = b"\x1f\x8b"
+TIPOS_GZIP = frozenset({"application/gzip", "application/x-gzip"})
+CODIFICACIONES_GZIP = frozenset({"gzip", "x-gzip"})
+_TIPOS_BINARIOS = frozenset({"application/octet-stream", "binary/octet-stream"})
+"""Tipos genéricos con los que muchos servidores (nginx sin `gz` en `mime.types`, S3, CDN) sirven
+un `.xml.gz`. Solo valen en una URL `.xml.gz` y si el cuerpo empieza por la firma de gzip."""
 MAXIMO_REDIRECCIONES = 5
 TAMANO_TROZO = 64 * 1024
 TIPOS_ADMITIDOS = frozenset({"text/html", "application/xhtml+xml", "text/plain"})
@@ -113,10 +132,20 @@ class DescargadorHTTP:
         }
 
     async def descargar(self, url: str) -> Pagina:
+        return await self._descargar(url, self._max_bytes, self._timeout)
+
+    async def descargar_grande(self, url: str, *, max_bytes: int = MAX_BYTES_SITEMAP) -> Pagina:
+        """Como `descargar`, con otro tope de bytes (leídos y descomprimidos) y más tiempo total.
+
+        Para los sitemaps (nota 16): mismas validaciones en cada redirección y mismos tipos.
+        """
+        return await self._descargar(url, max_bytes, self._timeout * FACTOR_TIEMPO_GRANDE)
+
+    async def _descargar(self, url: str, max_bytes: int, tiempo: float) -> Pagina:
         pedida = await self._validador(url)
         actual = pedida
         for salto in range(MAXIMO_REDIRECCIONES + 1):
-            resultado = await asyncio.to_thread(self._pedir, actual)
+            resultado = await asyncio.to_thread(self._pedir, actual, max_bytes, tiempo)
             if resultado.destino is None:
                 return Pagina(
                     url=pedida,
@@ -134,42 +163,60 @@ class DescargadorHTTP:
     async def cerrar(self) -> None:
         """No hay conexiones persistentes que cerrar; existe para cumplir `Descargador`."""
 
-    def _pedir(self, url: str) -> "_Resultado":
+    def _pedir(self, url: str, max_bytes: int, tiempo: float) -> "_Resultado":
         try:
             crudo = self._transporte(url, self._cabeceras, self._timeout)
         except (OSError, http.client.HTTPException) as error:
             raise ErrorDescarga("No se pudo conectar con la tienda.") from error
         try:
-            return self._procesar(crudo)
+            return self._procesar(crudo, url, max_bytes, tiempo)
         except (OSError, http.client.HTTPException) as error:
             raise ErrorDescarga("La conexión con la tienda se cortó.") from error
         finally:
             crudo.cuerpo.close()
 
-    def _procesar(self, crudo: RespuestaCruda) -> "_Resultado":
+    def _procesar(
+        self, crudo: RespuestaCruda, url: str, max_bytes: int, tiempo: float
+    ) -> "_Resultado":
         cabeceras = {k.lower(): v for k, v in crudo.cabeceras.items()}
         destino = cabeceras.get("location", "").strip()
         if crudo.estado in REDIRECCIONES and destino:
             return _Resultado(crudo.estado, destino=destino)
 
         mime, charset = _tipo_contenido(cabeceras.get("content-type"))
-        if mime not in _TIPOS_DESCARGABLES:
+        xml_gz = urlsplit(url).path.lower().endswith(".xml.gz")
+        # El tipo genérico solo vale en un 2xx: en un error no hay sitemap que leer.
+        binario = xml_gz and mime in _TIPOS_BINARIOS and 200 <= crudo.estado < 300
+        if mime not in _TIPOS_DESCARGABLES and mime not in TIPOS_GZIP and not binario:
             if 200 <= crudo.estado < 300:
                 raise ErrorDescarga(f"La respuesta no es una página web (tipo «{mime}»).")
             # En un error (404, 503...) lo que importa es el estado: el cuerpo ni se lee.
             return _Resultado(crudo.estado, tipo=mime)
-        if cabeceras.get("content-encoding", "identity").strip().lower() not in ("", "identity"):
+        codificacion = cabeceras.get("content-encoding", "identity").strip().lower()
+        if codificacion not in ("", "identity") and not (
+            xml_gz and codificacion in CODIFICACIONES_GZIP
+        ):
+            # Pedimos `identity`: comprimir sin pedirlo solo se tolera en el fichero `.xml.gz`.
             raise ErrorDescarga("La tienda envió el contenido comprimido sin pedirlo.")
         longitud = cabeceras.get("content-length", "").strip()
-        if longitud.isdigit() and int(longitud) > self._max_bytes:
+        if longitud.isdigit() and int(longitud) > max_bytes:
             raise ErrorDescarga("La página es demasiado grande.")
-        datos = self._leer(crudo.cuerpo)
+        datos = self._leer(crudo.cuerpo, max_bytes, tiempo)
+        con_firma = datos.startswith(MAGIA_GZIP)
+        if binario and not con_firma:
+            raise ErrorDescarga(f"La respuesta no es una página web (tipo «{mime}»).")
+        if mime in TIPOS_GZIP or codificacion in CODIFICACIONES_GZIP or (xml_gz and con_firma):
+            # Un XML nunca empieza por la firma de gzip: en un `.xml.gz` con el tipo del `.xml` y
+            # sin `Content-Encoding` (servidor mal configurado) no hay ambigüedad.
+            datos = descomprimir_gzip(datos, max_bytes)
+            if mime not in _TIPOS_DESCARGABLES:
+                mime = "application/xml"  # lo de dentro de un sitemap `.xml.gz`
         return _Resultado(crudo.estado, html=decodificar(datos, charset, mime=mime), tipo=mime)
 
-    def _leer(self, cuerpo: Lector) -> bytes:
+    def _leer(self, cuerpo: Lector, max_bytes: int, tiempo: float) -> bytes:
         # El timeout del socket solo limita cada lectura: una web que suelta un byte cada pocos
         # segundos lo esquivaría. Por eso también hay un límite de tiempo total.
-        limite = self._reloj() + self._timeout
+        limite = self._reloj() + tiempo
         trozos: list[bytes] = []
         total = 0
         while True:
@@ -179,7 +226,7 @@ class DescargadorHTTP:
             if not trozo:
                 return b"".join(trozos)
             total += len(trozo)
-            if total > self._max_bytes:
+            if total > max_bytes:
                 raise ErrorDescarga("La página es demasiado grande.")
             trozos.append(trozo)
 
@@ -222,6 +269,56 @@ def decodificar(datos: bytes, charset: str | None = None, *, mime: str = "text/h
         except (LookupError, ValueError):
             continue  # «base64», «rot13»...: códecs que no son de texto
     return datos.decode("utf-8", "replace")
+
+
+def descomprimir_gzip(datos: bytes, max_bytes: int) -> bytes:
+    """Descomprime gzip (hasta `MAX_CAPAS_GZIP` capas) sin pasar de `max_bytes` descomprimidos.
+
+    Lanza `ErrorDescarga` si el fichero está dañado, cortado, con el CRC o el tamaño mal, o si lo
+    descomprimido pasa del tope: una bomba gzip se para ahí sin agotar la memoria.
+    """
+    for _ in range(MAX_CAPAS_GZIP):
+        datos = _descomprimir_capa(datos, max_bytes)
+        if not datos.startswith(MAGIA_GZIP):
+            return datos
+    raise ErrorDescarga("El fichero comprimido tiene demasiadas capas.")
+
+
+def _descomprimir_capa(datos: bytes, max_bytes: int) -> bytes:
+    """Una capa: uno o varios miembros gzip seguidos y, como mucho, relleno de ceros al final.
+
+    Se alimenta el descompresor por trozos con `max_length` = lo que queda de tope + 1: nunca
+    produce más de eso de una vez, y si lo produce es que se ha pasado. Cada vuelta consume entrada
+    o produce salida, así que el bucle está acotado por los bytes de entrada.
+    """
+    vista = memoryview(datos)
+    salida: list[bytes] = []
+    total = posicion = miembros = 0
+    while True:
+        if vista[posicion : posicion + 2] != MAGIA_GZIP:
+            # Tras el último miembro solo puede quedar relleno de ceros (se mira una sola vez).
+            if miembros and not bytes(vista[posicion:]).strip(b"\x00"):
+                return b"".join(salida)
+            raise ErrorDescarga("El fichero comprimido está dañado.")
+        miembros += 1
+        if miembros > MAX_MIEMBROS_GZIP:
+            raise ErrorDescarga("El fichero comprimido tiene demasiados trozos.")
+        descompresor = zlib.decompressobj(16 + zlib.MAX_WBITS)  # solo gzip, con CRC y tamaño
+        while not descompresor.eof:
+            entrada = vista[posicion : posicion + TAMANO_TROZO]
+            if not entrada:
+                raise ErrorDescarga("El fichero comprimido está cortado.")
+            try:
+                trozo = descompresor.decompress(entrada, max_bytes - total + 1)
+            except zlib.error as error:
+                raise ErrorDescarga("El fichero comprimido está dañado.") from error
+            total += len(trozo)
+            if total > max_bytes:
+                raise ErrorDescarga("La página es demasiado grande.")
+            salida.append(trozo)
+            posicion += len(entrada) - len(descompresor.unconsumed_tail)
+        # Lo que sobró del último trozo es lo que va detrás de este miembro.
+        posicion -= len(descompresor.unused_data)
 
 
 def conexion_validada(

@@ -8,6 +8,7 @@ from precia.nucleo.fuente_datos import (
     RevisionNoValida,
     TiendaNoExiste,
     TiendaYaExiste,
+    URLEntradaNoValida,
 )
 from precia.nucleo.fuente_demo import FuenteDemo
 from precia.nucleo.modelos import (
@@ -190,6 +191,54 @@ def test_alta_rechaza_dominios_no_validos(dominio: str) -> None:
 def test_alta_de_una_tienda_que_ya_existe() -> None:
     with pytest.raises(TiendaYaExiste):
         asyncio.run(FuenteDemo().alta_tienda("www.recambiosnorte.example", "Otra vez"))
+
+
+def test_alta_con_url_de_entrada_la_guarda_normalizada() -> None:
+    fuente = FuenteDemo()
+    tienda = asyncio.run(
+        fuente.alta_tienda(
+            "nueva-tienda.es", "Nueva", entrada=" HTTPS://Nueva-Tienda.ES/catalogo?p={pagina} "
+        )
+    )
+    assert tienda.entrada == "https://nueva-tienda.es/catalogo?p={pagina}"
+    assert fuente.tienda("nueva-tienda.es") == tienda
+
+
+@pytest.mark.parametrize(
+    "entrada",
+    [
+        "https://otra.es/buscar?q={consulta}",
+        "https://nueva-tienda.es@otra.es/",
+        "data:text/html,hola",
+        "https://nueva-tienda.es/buscar?q={consulta}&p={pagina}",
+    ],
+)
+def test_alta_con_url_de_entrada_no_valida(entrada: str) -> None:
+    fuente = FuenteDemo()
+    with pytest.raises(URLEntradaNoValida):
+        asyncio.run(fuente.alta_tienda("nueva-tienda.es", "Nueva", entrada=entrada))
+    assert fuente.tienda("nueva-tienda.es") is None
+
+
+def test_cambiar_y_quitar_la_url_de_entrada() -> None:
+    fuente = FuenteDemo()
+    busqueda = "https://www.recambiosnorte.example/buscar?q={consulta}"
+    tienda = fuente.cambiar_entrada("WWW.recambiosnorte.example", busqueda)
+    assert tienda.entrada == busqueda and tienda.dominio == "recambiosnorte.example"
+    assert fuente.tienda("recambiosnorte.example") == tienda
+    # El resto de la tienda (perfil, estado...) no cambia.
+    original = next(t for t in FuenteDemo().tiendas() if t.dominio == tienda.dominio)
+    assert tienda.versiones == original.versiones and tienda.estado is original.estado
+    with pytest.raises(URLEntradaNoValida):
+        fuente.cambiar_entrada("recambiosnorte.example", "https://piezasya.example/")
+    assert fuente.tienda("recambiosnorte.example") == tienda
+    assert fuente.cambiar_entrada("recambiosnorte.example", "  ").entrada is None
+    assert FuenteDemo().tienda("recambiosnorte.example") == original
+
+
+def test_cambiar_la_entrada_de_una_tienda_que_no_existe() -> None:
+    with pytest.raises(TiendaNoExiste):
+        FuenteDemo().cambiar_entrada("no-existe.example", "")
 
 
 def test_tienda_nueva_sale_sin_perfil_en_la_busqueda() -> None:

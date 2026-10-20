@@ -15,7 +15,14 @@ from precia.almacen.sqlite import (
     PerfilNoEncontrado,
     TiendaNoEncontrada,
 )
-from precia.perfiles.tipos import TIPO_API_SHOPIFY, TIPO_API_WOOCOMMERCE, TIPO_HTML, Perfil
+from precia.perfiles.tipos import (
+    TIPO_API_SHOPIFY,
+    TIPO_API_WOOCOMMERCE,
+    TIPO_HTML,
+    TIPO_LISTADO,
+    TIPO_SITEMAP,
+    Perfil,
+)
 
 DOMINIO = "piezasya.example"
 
@@ -264,3 +271,125 @@ def test_la_base_rechaza_un_tipo_desconocido(tmp_path: Path) -> None:
             con.execute("UPDATE perfiles SET tipo = 'api_magento'")
     finally:
         con.close()
+
+
+# --- Tipos sin buscador (nota 16) ---------------------------------------------------------------
+
+
+def _perfil_listado(**cambios: Any) -> Perfil:
+    datos: dict[str, Any] = {
+        "url_busqueda": "https://piezasya.example/catalogo/frenos?page={pagina}",
+        "tipo": TIPO_LISTADO,
+    }
+    datos.update(cambios)
+    return _perfil(**datos)
+
+
+def _perfil_sitemap(**cambios: Any) -> Perfil:
+    datos: dict[str, Any] = {
+        "url_busqueda": "https://piezasya.example/sitemap_index.xml",
+        "sel_resultado": "",
+        "sel_titulo": "",
+        "sel_enlace": "",
+        "sel_precio_listado": None,
+        "sel_campos": {},
+        "tipo": TIPO_SITEMAP,
+    }
+    datos.update(cambios)
+    return _perfil(**datos)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://piezasya.example/catalogo/frenos?page={pagina}",
+        "https://piezasya.example/catalogo/frenos/pagina-{pagina}.html",
+        "https://piezasya.example/catalogo/frenos",
+    ],
+)
+def test_perfil_listado_se_guarda_y_se_lee(con_tienda: Almacen, url: str) -> None:
+    perfil = _perfil_listado(url_busqueda=url)
+    assert perfil.es_listado
+    assert con_tienda.guardar_perfil(perfil) == perfil
+    assert con_tienda.perfil_vigente(DOMINIO) == perfil
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://piezasya.example/buscar?q={consulta}",
+        "https://piezasya.example/catalogo?q={consulta}&page={pagina}",
+        "https://piezasya.example/catalogo/{pagina}?page={pagina}",
+        "https://piezasya.example/catalogo?page={pag}",
+        "https://piezasya.example/catalogo?page={pagina",
+        "https://piezasya.example/catalogo?page=}",
+    ],
+)
+def test_perfil_listado_sin_consulta_y_como_mucho_una_pagina(con_tienda: Almacen, url: str) -> None:
+    with pytest.raises(DatoNoValido):
+        con_tienda.guardar_perfil(_perfil_listado(url_busqueda=url))
+    assert con_tienda.versiones(DOMINIO) == []
+
+
+@pytest.mark.parametrize("campo", ["sel_resultado", "sel_titulo", "sel_enlace"])
+def test_perfil_listado_necesita_los_selectores_del_listado(
+    con_tienda: Almacen, campo: str
+) -> None:
+    vacios: dict[str, Any] = {campo: ""}
+    with pytest.raises(DatoNoValido):
+        con_tienda.guardar_perfil(_perfil_listado(**vacios))
+    assert con_tienda.versiones(DOMINIO) == []
+
+
+def test_perfil_sitemap_se_guarda_y_se_lee(con_tienda: Almacen) -> None:
+    perfil = _perfil_sitemap()
+    assert perfil.es_sitemap
+    assert con_tienda.guardar_perfil(perfil) == perfil
+    assert con_tienda.perfil_vigente(DOMINIO) == perfil
+    # Con `sel_campos` si el JSON-LD o los metadatos de la ficha no bastan.
+    con_campos = _perfil_sitemap(sel_campos={"precio": ".precio"})
+    assert con_tienda.guardar_perfil(con_campos).version == 2
+
+
+@pytest.mark.parametrize(
+    "cambios",
+    [
+        {"sel_resultado": "li.producto"},
+        {"sel_titulo": "h2"},
+        {"sel_enlace": "a @href"},
+        {"sel_precio_listado": ".precio"},
+        {"url_busqueda": "https://piezasya.example/sitemap.xml?q={consulta}"},
+        {"url_busqueda": "https://piezasya.example/sitemap-{pagina}.xml"},
+    ],
+)
+def test_perfil_sitemap_sin_selectores_de_listado_ni_plantilla(
+    con_tienda: Almacen, cambios: dict[str, Any]
+) -> None:
+    with pytest.raises(DatoNoValido):
+        con_tienda.guardar_perfil(_perfil_sitemap(**cambios))
+    assert con_tienda.versiones(DOMINIO) == []
+
+
+def test_la_version_de_un_perfil_listado_ensena_tipo_y_selectores(con_tienda: Almacen) -> None:
+    con_tienda.guardar_perfil(_perfil_listado(sel_campos={}))
+    tienda = con_tienda.tienda(DOMINIO)
+    assert tienda is not None
+    assert tienda.versiones[0].selectores == {
+        "tipo": "listado (sin buscador: se recorre el listado de la URL)",
+        "resultado": "ul.listado > li.producto",
+        "titulo": "h2.nombre a",
+        "enlace": "h2.nombre a @href",
+        "precio_listado": ".precio .importe",
+    }
+
+
+def test_la_version_de_un_perfil_sitemap_ensena_su_tipo(con_tienda: Almacen) -> None:
+    # Quien lo revisa tiene que ver que no hay selectores de listado porque se usa el catálogo.
+    con_tienda.guardar_perfil(_perfil_sitemap(sel_campos={"marca": ".marca"}))
+    tienda = con_tienda.tienda(DOMINIO)
+    assert tienda is not None
+    assert tienda.versiones[0].selectores == {
+        "tipo": "sitemap (sin buscador: catálogo de URL del sitemap)",
+        "marca": ".marca",
+    }
+    assert tienda.versiones[0].url_busqueda == "https://piezasya.example/sitemap_index.xml"
