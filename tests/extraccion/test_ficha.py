@@ -1,4 +1,4 @@
-"""Cascada de extracción de una ficha: JSON-LD → perfil → IA, con anclaje de cada valor."""
+"""Cascada de extracción de una ficha: JSON-LD → metadatos → perfil → IA, con anclaje."""
 
 import asyncio
 import json
@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from precia.extraccion.ficha import extraer_ficha, formatear_precio
+from precia.extraccion.ficha import CONFIANZA, extraer_ficha, formatear_precio
 from precia.extraccion.tipos import ExtractorIA, FichaExtraida, Precio
 from precia.ia.tipos import IANoDisponible, PresupuestoAgotado
 from precia.navegador.tipos import Pagina
@@ -351,3 +351,115 @@ def test_descripcion_larga_del_perfil_se_recorta_sin_partir_palabras() -> None:
     valor = ficha.campos["descripcion"].valor
     assert len(valor) <= 5_000
     assert texto.startswith(valor + " ")
+
+
+# --- Metadatos (OpenGraph y microdatos) ---------------------------------------------------------
+
+
+def _microdatos(cuerpo: str) -> str:
+    return f'<div itemscope itemtype="https://schema.org/Product">{cuerpo}</div>'
+
+
+def test_confianza_de_los_metadatos() -> None:
+    assert CONFIANZA[OrigenDato.METADATOS] == 0.95
+    assert CONFIANZA[OrigenDato.JSONLD] > CONFIANZA[OrigenDato.METADATOS]
+    assert CONFIANZA[OrigenDato.METADATOS] > CONFIANZA[OrigenDato.PERFIL]
+
+
+def test_prestashop_sin_jsonld_sale_de_los_microdatos() -> None:
+    ia = ExtractorFalso({})
+    ficha = _extraer(_fixture("ficha_prestashop_microdatos.html"), TODOS, extractor_ia=ia)
+    assert ficha.titulo == "Bomba de agua SEAT Ibiza 1.4 TDI"
+    assert ficha.precio == Precio(Decimal("45.9"), "EUR", "45.9")
+    metadatos = OrigenDato.METADATOS
+    assert ficha.campos == {
+        "precio": ValorCampo("45,90 €", metadatos, confianza=0.95),
+        "referencia_oem": ValorCampo("045121011H", metadatos, confianza=0.95),
+        "marca": ValorCampo("SKF", metadatos, confianza=0.95),
+        "estado": ValorCampo("Nuevo", metadatos, confianza=0.95),
+        "descripcion": ValorCampo(
+            "Bomba de agua con junta para motores 1.4 TDI (BNM, BNV).", metadatos, confianza=0.95
+        ),
+        "fotos": ValorCampo("3 fotos", metadatos, confianza=0.95),
+    }
+    assert ficha.avisos == ()
+    assert ia.llamadas == []
+
+
+def test_shopify_con_og_price_y_la_ia_para_lo_que_falta() -> None:
+    ia = ExtractorFalso({"marca": "MANN-FILTER"})
+    ficha = _extraer(_fixture("ficha_shopify_og.html"), TODOS, extractor_ia=ia)
+    assert ficha.titulo == "Filtro de aceite MANN-FILTER W 712/75"
+    assert ficha.precio == Precio(Decimal("12.90"), "EUR", "12,90")
+    assert ficha.campos["precio"] == ValorCampo("12,90 €", OrigenDato.METADATOS, confianza=0.95)
+    assert ficha.campos["fotos"] == ValorCampo("2 fotos", OrigenDato.METADATOS, confianza=0.95)
+    assert ficha.campos["marca"] == ValorCampo("MANN-FILTER", OrigenDato.IA, confianza=0.7)
+    [(_, campos)] = ia.llamadas
+    assert campos == ("referencia_oem", "marca", "estado")
+    assert ficha.avisos == ()
+
+
+def test_orden_de_la_cascada_jsonld_metadatos_perfil() -> None:
+    perfil = _perfil(marca=".marca", estado=".estado", referencia_oem=".ref")
+    html = _jsonld({"@type": "Product", "name": "Faro", "brand": "Valeo"})
+    html += _microdatos(
+        '<h1 itemprop="name">Faro</h1><meta itemprop="brand" content="Hella">'
+        '<meta itemprop="mpn" content="1EL009">'
+    )
+    html += '<p class="marca">Bosch</p><p class="ref">999</p><p class="estado">Usado</p>'
+    ficha = _extraer(_pagina(html), ("marca", "referencia_oem", "estado"), perfil=perfil)
+    assert ficha.campos == {
+        "marca": ValorCampo("Valeo", OrigenDato.JSONLD),
+        "referencia_oem": ValorCampo("1EL009", OrigenDato.METADATOS, confianza=0.95),
+        "estado": ValorCampo("Usado", OrigenDato.PERFIL, confianza=0.9),
+    }
+
+
+def test_precio_de_los_metadatos_que_no_se_ve() -> None:
+    html = '<meta property="og:type" content="product">'
+    html += '<meta property="product:price:amount" content="50.00"><p>45 €</p>'
+    ficha = _extraer(_pagina(html), ("precio",))
+    # Viene del marcado de la propia página: vale, pero se avisa de la discrepancia.
+    assert ficha.precio == Precio(Decimal("50.00"), "EUR", "50.00")
+    assert ficha.campos["precio"] == ValorCampo("50,00 €", OrigenDato.METADATOS, confianza=0.95)
+    assert any("metadatos" in aviso and "no se ve" in aviso for aviso in ficha.avisos)
+
+
+def test_precio_absurdo_en_los_metadatos_pasa_al_perfil() -> None:
+    html = _microdatos('<span itemprop="name">Faro</span><meta itemprop="price" content="-1">')
+    html += '<b class="precio">45,90 €</b>'
+    ficha = _extraer(_pagina(html), ("precio",), perfil=_perfil(precio=".precio"))
+    assert ficha.campos["precio"] == ValorCampo("45,90 €", OrigenDato.PERFIL, confianza=0.9)
+
+
+def test_titulo_desde_los_microdatos_si_no_hay_h1() -> None:
+    html = _microdatos('<span itemprop="name">Faro Golf</span>') + "<title>Tienda</title>"
+    assert _extraer(_pagina(html), ()).titulo == "Faro Golf"
+    html = "<h1>Faro H1</h1>" + html
+    assert _extraer(_pagina(html), ()).titulo == "Faro H1"
+
+
+def test_los_microdatos_de_los_relacionados_no_dan_el_precio_de_la_ficha() -> None:
+    ficha = _extraer(
+        _fixture("ficha_relacionados_microdatos.html"),
+        ("precio", "marca", "estado"),
+        perfil=_perfil(precio=".current-price-value"),
+    )
+    assert ficha.titulo == "Faro delantero izquierdo Golf VI"
+    assert ficha.precio == Precio(Decimal("120.00"), "EUR", "120,00 €")
+    # Ni la marca («Osram», «Valeo») ni el estado de las miniaturas son los de la ficha.
+    assert ficha.campos == {"precio": ValorCampo("120,00 €", OrigenDato.PERFIL, confianza=0.9)}
+
+
+def test_sin_canonical_la_url_de_la_pagina_descarta_los_relacionados() -> None:
+    relacionado = _microdatos(
+        '<meta itemprop="url" content="/p/bombilla-h7"><span itemprop="name">Bombilla H7</span>'
+        '<meta itemprop="brand" content="Osram">'
+        '<div itemprop="offers" itemscope itemtype="https://schema.org/Offer">'
+        '<span itemprop="price" content="4.90">4,90 €</span></div>'
+    )
+    html = f'<h1>Faro</h1><b class="precio">120,00 €</b><section>{relacionado}</section>'
+    pagina = _pagina(html, "https://tienda.es/p/faro")
+    ficha = _extraer(pagina, ("precio", "marca"), perfil=_perfil(precio=".precio"))
+    assert ficha.titulo == "Faro"
+    assert ficha.campos == {"precio": ValorCampo("120,00 €", OrigenDato.PERFIL, confianza=0.9)}

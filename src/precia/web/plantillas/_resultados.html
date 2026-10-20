@@ -1,6 +1,8 @@
 {%- macro origen(valor) -%}
   {%- if valor.origen.value == "ia" -%}<span class="origen origen-ia" title="Extraído por el extractor de respaldo con IA">🤖 IA</span>
   {%- elif valor.origen.value == "jsonld" -%}<span class="origen origen-jsonld" title="Datos estructurados schema.org/Product">JSON-LD</span>
+  {%- elif valor.origen.value == "metadatos" -%}<span class="origen origen-jsonld" title="Metadatos de la página (OpenGraph o microdatos)">Metadatos</span>
+  {%- elif valor.origen.value == "api" -%}<span class="origen origen-jsonld" title="API pública de la plataforma de la tienda">API tienda</span>
   {%- else -%}<span class="origen origen-perfil" title="Selectores del perfil de la tienda">Perfil</span>
   {%- endif -%}
 {%- endmacro -%}

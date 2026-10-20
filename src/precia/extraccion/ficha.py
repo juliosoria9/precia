@@ -1,11 +1,15 @@
 """Extracción de los campos de una ficha de producto (memoria §4 y §5).
 
-Cascada por campo: JSON-LD de la página → selector del perfil → extractor de respaldo con IA
-(solo si lo hay y faltan campos). Todo valor se ancla contra el texto visible de la página:
+Cascada por campo: JSON-LD de la página → metadatos (microdatos y OpenGraph) → selector del
+perfil → extractor de respaldo con IA (solo si lo hay y faltan campos). Todo valor se ancla
+contra el texto visible de la página:
 
-- Lo que sale del JSON-LD o de un atributo HTML lo lee nuestro código del propio marcado de la
-  página, así que está anclado por construcción. El precio del JSON-LD vale si el mismo importe
-  está en la página o en el propio JSON; si no se ve en el texto, se avisa.
+- Lo que sale del JSON-LD, de los metadatos o de un atributo HTML lo lee nuestro código del propio
+  marcado de la página, así que está anclado por construcción. El precio del JSON-LD vale si el
+  mismo importe está en la página o en el propio JSON, y el de los metadatos sale de un atributo
+  o del texto de la página; si no se ve en el texto, se avisa. Los metadatos llevan algo menos de
+  confianza que el JSON-LD: OpenGraph se escribe para las redes sociales y algún tema lo deja
+  desactualizado (precio sin rebaja, imagen genérica).
 - El texto que lee un selector del perfil debe aparecer en el texto visible (un elemento oculto
   no cuenta) y su precio, estar escrito como precio en la página. Si no, se descarta y el campo
   pasa a la vía siguiente.
@@ -21,6 +25,7 @@ from urllib.parse import urldefrag, urljoin
 from precia.extraccion.anclaje import anclado
 from precia.extraccion.dom import Nodo, analizar
 from precia.extraccion.jsonld import bloques_jsonld, productos_de_arbol
+from precia.extraccion.metadatos import producto_metadatos
 from precia.extraccion.precios import MAX_IMPORTE, buscar_precios, leer_precio
 from precia.extraccion.selectores import dividir_selector, extraer_valor, seleccionar
 from precia.extraccion.tipos import (
@@ -35,7 +40,12 @@ from precia.navegador.tipos import Pagina
 from precia.nucleo.modelos import CLAVES_CAMPOS, OrigenDato, ValorCampo
 from precia.perfiles.tipos import Perfil
 
-CONFIANZA = {OrigenDato.JSONLD: 1.0, OrigenDato.PERFIL: 0.9, OrigenDato.IA: 0.7}
+CONFIANZA = {
+    OrigenDato.JSONLD: 1.0,
+    OrigenDato.METADATOS: 0.95,
+    OrigenDato.PERFIL: 0.9,
+    OrigenDato.IA: 0.7,
+}
 CONFIANZA_NO_ANCLADO = 0.0
 MAX_TEXTO_IA = 60_000
 """Texto de la página que se pasa al extractor de IA (el paquete `ia` recorta aún más)."""
@@ -63,7 +73,7 @@ async def extraer_ficha(
     pedidos = extraccion.campos_validos(campos)
 
     for campo in dict.fromkeys(("precio", *pedidos)):
-        if not extraccion.desde_jsonld(campo):
+        if not (extraccion.desde_jsonld(campo) or extraccion.desde_metadatos(campo)):
             extraccion.desde_perfil(campo)
 
     faltan = tuple(c for c in pedidos if c not in extraccion.valores)
@@ -89,6 +99,7 @@ class _Extraccion:
         self.texto = raiz.texto()
         self.bloques = bloques_jsonld(raiz)
         self.producto = _principal(productos_de_arbol(raiz), self.url)
+        self.metadatos = producto_metadatos(raiz, url=self.url)
         self.valores: dict[str, ValorCampo] = {}
         self.precio: Precio | None = None
         self.avisos: list[str] = []
@@ -117,6 +128,7 @@ class _Extraccion:
             except SelectorNoValido as error:
                 self.avisos.append(f"Selector del perfil para «titulo» no válido: {error}")
         candidatos.append(_primer_texto(self.raiz, "h1"))
+        candidatos.append(self.metadatos.nombre if self.metadatos else None)
         candidatos.append(_meta(self.raiz, "og:title"))
         candidatos.append(_primer_texto(self.raiz, "title"))
         return next((_recortar(c, MAX_TITULO) for c in candidatos if c), "")
@@ -128,25 +140,32 @@ class _Extraccion:
     # --- 1. JSON-LD -------------------------------------------------------------------------
 
     def desde_jsonld(self, campo: str) -> bool:
-        producto = self.producto
+        return self._desde_estructurado(self.producto, campo, OrigenDato.JSONLD, "del JSON-LD")
+
+    def _desde_estructurado(
+        self, producto: ProductoJSONLD | None, campo: str, origen: OrigenDato, de: str
+    ) -> bool:
+        """Campo de un producto estructurado (JSON-LD o metadatos), anclado por construcción."""
         if producto is None:
             return False
         if campo == "precio":
             precio = producto.precio
-            if precio is None or not self._precio_jsonld_anclado(precio):
+            if precio is None:
+                return False
+            if origen is OrigenDato.JSONLD and not self._precio_jsonld_anclado(precio):
                 return False
             if not self.precio_en_pagina(precio.importe):
                 self.avisos.append(
-                    f"El precio del JSON-LD ({formatear_precio(precio)}) no se ve en el texto de "
+                    f"El precio {de} ({formatear_precio(precio)}) no se ve en el texto de "
                     "la página."
                 )
             self.precio = precio
-            self.anotar(campo, formatear_precio(precio), OrigenDato.JSONLD, True)
+            self.anotar(campo, formatear_precio(precio), origen, True)
             return True
         valor = _campo_jsonld(producto, campo)
         if valor is None:
             return False
-        self.anotar(campo, valor, OrigenDato.JSONLD, True)
+        self.anotar(campo, valor, origen, True)
         return True
 
     def _precio_jsonld_anclado(self, precio: Precio) -> bool:
@@ -154,7 +173,14 @@ class _Extraccion:
             precio.texto in bloque for bloque in self.bloques
         )
 
-    # --- 2. Perfil --------------------------------------------------------------------------
+    # --- 2. Metadatos (microdatos y OpenGraph) ----------------------------------------------
+
+    def desde_metadatos(self, campo: str) -> bool:
+        return self._desde_estructurado(
+            self.metadatos, campo, OrigenDato.METADATOS, "de los metadatos"
+        )
+
+    # --- 3. Perfil --------------------------------------------------------------------------
 
     def desde_perfil(self, campo: str) -> bool:
         if self.perfil is None or campo not in self.perfil.sel_campos:
@@ -211,7 +237,7 @@ class _Extraccion:
         self.anotar("fotos", _fotos(len(nodos)), OrigenDato.PERFIL, True)
         return True
 
-    # --- 3. IA ------------------------------------------------------------------------------
+    # --- 4. IA ------------------------------------------------------------------------------
 
     async def desde_ia(self, extractor: ExtractorIA, faltan: tuple[str, ...]) -> None:
         try:

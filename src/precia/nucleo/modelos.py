@@ -18,6 +18,10 @@ class OrigenDato(StrEnum):
     """Vía de la cascada de extracción que produjo un valor."""
 
     JSONLD = "jsonld"
+    METADATOS = "metadatos"
+    """OpenGraph (`og:*`, `product:*`) o microdatos `itemprop` de schema.org."""
+    API = "api"
+    """API pública de la plataforma de la tienda (WooCommerce Store API, Shopify)."""
     PERFIL = "perfil"
     IA = "ia"
 
