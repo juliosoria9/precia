@@ -1,7 +1,12 @@
 """🤖 Configurador: crea el perfil de una tienda nueva con ayuda de la IA (memoria §4 y §5).
 
-1. Descubre la URL de búsqueda: el formulario de búsqueda de la portada (GET, al mismo dominio)
-   o, si no lo hay o no funciona, los patrones habituales de las plataformas de tienda.
+0. Si la portada es de WooCommerce o Shopify y su API pública de solo lectura devuelve productos
+   con precio para la consulta de prueba, el perfil es `api_woocommerce` o `api_shopify`: la
+   búsqueda va a la API (`fuentes.apis`) y no hace falta ningún selector, así que **no se llama
+   a la IA** (coste 0). Si la API no responde, no existe o no da productos, se sigue como siempre.
+1. Descubre la URL de búsqueda (`perfiles.descubrimiento`): OpenSearch, formularios y enlaces de
+   búsqueda de la portada, rutas de la plataforma, patrones habituales y, como último recurso,
+   🤖 las plantillas que proponga la IA (validadas como cualquier otra).
 2. En la primera página de resultados que parece un listado, pide a la IA los selectores del
    listado a partir de `resumen_para_ia` (el HTML simplificado, como datos no confiables).
 3. Abre la primera ficha y pide los selectores de los campos. Si la ficha trae JSON-LD, solo los
@@ -24,58 +29,47 @@ propagan tal cual para que quien llama decida; si no se consigue un perfil váli
 
 import json
 import re
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import quote_plus, urlencode, urlsplit, urlunsplit
 
-from precia.extraccion.anclaje import normalizar
-from precia.extraccion.dom import Nodo, analizar
 from precia.extraccion.ficha import extraer_ficha
-from precia.extraccion.listado import extraer_listado, url_de_la_tienda
-from precia.extraccion.precios import buscar_precios
+from precia.extraccion.listado import extraer_listado
 from precia.extraccion.texto import resumen_para_ia
 from precia.extraccion.tipos import ResultadoListado
+from precia.fuentes.apis import plantilla_api
+from precia.fuentes.plataformas import detectar_plataforma
 from precia.ia.tipos import PeticionIA
 from precia.navegador.tipos import ErrorDescarga, Pagina, ProhibidoPorRobots, URLNoPermitida
 from precia.navegador.url import Validador, validar_url
 from precia.nucleo.modelos import CAMPOS, CLAVES_CAMPOS, Campo
+from precia.perfiles.descubrimiento import (
+    ORIGEN_IA,
+    Busqueda,
+    abrir,
+    abrir_portada,
+    correcta,
+    descubrir,
+)
 from precia.perfiles.protocolos import Navegador, SesionIA
 from precia.perfiles.tipos import ConfiguracionFallida, Perfil
 from precia.perfiles.validador import (
-    MARCADOR,
     MAX_FICHAS,
+    MAX_RESUMEN,
+    NOMBRE_PLATAFORMA,
+    PLATAFORMA_DE_TIPO,
+    TIPO_DE_PLATAFORMA,
     de_la_tienda,
     problema_selector,
     problema_sin_resultados,
     resumir,
-    url_de_busqueda,
     validar,
 )
 
 COMPONENTE = "configurador"
 AUTOR = "🤖 configurador"
-PATRONES = (
-    "/busqueda?controller=search&s={consulta}",  # PrestaShop
-    "/buscar?q={consulta}",
-    "/search?q={consulta}",
-    "/?s={consulta}&post_type=product",  # WooCommerce
-    "/catalogsearch/result/?q={consulta}",  # Magento
-    "/buscar/{consulta}",
-)
-"""Rutas de búsqueda habituales, en el orden en que se prueban si no hay formulario."""
-NOMBRES_BUSQUEDA = frozenset({"q", "s", "search", "query", "buscar", "text"})
-MAX_FORMULARIOS = 3
-"""Plantillas de formulario que se prueban como mucho: cada una cuesta dos descargas."""
-MAX_OCULTOS = 5
-MAX_VALOR_OCULTO = 100
 MAX_SELECTOR = 300
-MIN_PRODUCTOS = 2
-"""Enlaces a productos con precio para que una página parezca un listado."""
-MAX_TEXTO_CONTENEDOR = 600
-NIVELES_CONTENEDOR = 4
-MIN_PALABRA = 3
 MAX_PROBLEMAS_IA = 20
 MAX_MOTIVO = 3
 
@@ -149,7 +143,20 @@ async def configurar(
     if host is None:
         raise ConfiguracionFallida(f"El dominio «{dominio}» no es válido.")
     normalizado = host.removeprefix("www.")
-    busqueda = await _descubrir(host, normalizado, navegador, consulta_prueba, validador)
+    portada = await abrir_portada(host, normalizado, navegador, validador=validador)
+    if portada is not None:
+        api = await _perfil_api(portada, normalizado, navegador, consulta_prueba, validador)
+        if api is not None:
+            return replace(api, creado=reloj())
+    busqueda = await descubrir(
+        portada,
+        host,
+        normalizado,
+        navegador,
+        consulta_prueba,
+        sesion=sesion_ia,
+        validador=validador,
+    )
     configuracion = _Configuracion(
         dominio=normalizado,
         navegador=navegador,
@@ -181,172 +188,51 @@ def _host(dominio: str) -> str | None:
     return host if all(_ETIQUETA.fullmatch(e) for e in etiquetas) else None
 
 
-# --- 1. Descubrimiento de la búsqueda ---------------------------------------------------------
+# --- 0. Perfil de la API pública --------------------------------------------------------------
 
 
-@dataclass(frozen=True, slots=True)
-class _Busqueda:
-    plantilla: str
-    pagina: Pagina
-    necesita_js: bool
+async def _perfil_api(
+    portada: Pagina, dominio: str, navegador: Navegador, consulta: str, validador: Validador
+) -> Perfil | None:
+    """Perfil `api_*` validado si la plataforma de la portada tiene API pública y responde.
 
-
-async def _descubrir(
-    dominio: str, normalizado: str, navegador: Navegador, consulta: str, validador: Validador
-) -> _Busqueda:
-    portada = await _abrir(navegador, f"https://{dominio}/", js=False, validador=validador)
-    final = (portada.url_final or portada.url) if portada is not None else ""
-    if portada is not None and _correcta(portada) and url_de_la_tienda(final, final, normalizado):
-        plantillas = plantillas_de_formularios(portada, normalizado)
-        # Los patrones, en el host al que redirige la portada (`www.` o no).
-        partes = urlsplit(final)
-        base = f"{partes.scheme}://{partes.netloc}"
-    else:
-        portada, plantillas, base = None, [], f"https://{dominio}"
-    candidatas = list(dict.fromkeys([*plantillas, *(base + patron for patron in PATRONES)]))
-
-    # Primero todas por HTTP (barato) y, solo si ninguna da resultados, con Chromium.
-    for js in (False, True):
-        for plantilla in candidatas:
-            pagina = await _abrir(
-                navegador, url_de_busqueda(plantilla, consulta), js=js, validador=validador
-            )
-            if pagina is not None and parece_listado(
-                pagina, normalizado, consulta, portada=portada
-            ):
-                return _Busqueda(plantilla, pagina, js)
-    raise ConfiguracionFallida(
-        f"No se encuentra la página de búsqueda de {normalizado}: ni la portada tiene un "
-        "formulario de búsqueda que funcione ni responde ninguna de las rutas habituales."
+    Un fallo al descargar la API (no existe, robots, URL no permitida) solo quiere decir que no
+    se puede usar: se sigue por el HTML. Un bloqueo sí se propaga.
+    """
+    plataforma = detectar_plataforma(portada)
+    if plataforma is None or (tipo := TIPO_DE_PLATAFORMA.get(plataforma)) is None:
+        return None
+    plantilla = plantilla_api(plataforma, portada.url_final or portada.url)
+    if plantilla is None:
+        return None
+    perfil = Perfil(
+        dominio=dominio,
+        version=1,
+        url_busqueda=plantilla,
+        sel_resultado="",
+        sel_titulo="",
+        sel_enlace="",
+        sel_precio_listado=None,
+        sel_campos={},
+        necesita_js=False,
+        autor=AUTOR,
+        revisado=False,
+        creado=_ahora(),
+        tipo=tipo,
     )
-
-
-async def _abrir(
-    navegador: Navegador, url: str, *, js: bool, validador: Validador
-) -> Pagina | None:
-    """La página, o `None` si no se puede abrir. Los bloqueos sí se propagan: hay que parar."""
     try:
-        return await navegador.obtener(await validador(url), js=js)
+        informe = await validar(perfil, navegador, consulta, validador=validador)
     except (ErrorDescarga, ProhibidoPorRobots, URLNoPermitida):
         return None
-
-
-def plantillas_de_formularios(pagina: Pagina, dominio: str) -> list[str]:
-    """Plantillas de búsqueda (con `{consulta}`) de los formularios de búsqueda de `pagina`.
-
-    Solo formularios GET cuyo `action` es del propio `dominio` y que tienen un campo de búsqueda
-    (`type=search` o un nombre típico). Los campos ocultos se conservan en el orden del
-    formulario, como los enviaría el navegador (PrestaShop necesita `controller=search`). Como
-    mucho `MAX_FORMULARIOS`, los primeros: una portada no puede multiplicar las descargas.
-    """
-    raiz = analizar(pagina.html)
-    base = pagina.url_final or pagina.url
-    plantillas: list[str] = []
-    for formulario in _elementos(raiz, "form"):
-        metodo = (formulario.atributo("method") or "get").strip().lower()
-        if metodo != "get":
-            continue
-        accion = url_de_la_tienda(formulario.atributo("action") or base, base, dominio)
-        if accion is None:
-            continue
-        plantilla = _plantilla(formulario, accion)
-        if plantilla is not None and plantilla not in plantillas:
-            plantillas.append(plantilla)
-            if len(plantillas) >= MAX_FORMULARIOS:
-                break
-    return plantillas
-
-
-def _plantilla(formulario: Nodo, accion: str) -> str | None:
-    pares: list[str] = []
-    ocultos = 0
-    busqueda = False
-    for entrada in _elementos(formulario, "input"):
-        nombre = (entrada.atributo("name") or "").strip()
-        tipo = (entrada.atributo("type") or "text").strip().lower()
-        if not nombre:
-            continue
-        if tipo == "hidden":
-            ocultos += 1
-            valor = entrada.atributo("value") or ""
-            if ocultos > MAX_OCULTOS or len(valor) > MAX_VALOR_OCULTO:
-                return None
-            pares.append(urlencode([(nombre, valor)]))
-        elif not busqueda and (
-            tipo == "search" or (tipo == "text" and nombre.lower() in NOMBRES_BUSQUEDA)
-        ):
-            busqueda = True
-            pares.append(f"{quote_plus(nombre)}={MARCADOR}")
-    if not busqueda:
+    if not informe.valido:
         return None
-    # Al enviar un formulario GET, su consulta sustituye a la que tuviera `action`.
-    esquema, host, ruta, _, _ = urlsplit(accion)
-    return urlunsplit((esquema, host, ruta, "", "")) + "?" + "&".join(pares)
+    nombre = NOMBRE_PLATAFORMA[PLATAFORMA_DE_TIPO[tipo]]
+    return replace(perfil, nota=_nota(f"API pública de {nombre}, sin IA. ", resumir(informe)))
 
 
-def parece_listado(pagina: Pagina, dominio: str, consulta: str, *, portada: Pagina | None) -> bool:
-    """Heurística: ¿es `pagina` una página de resultados de la tienda para `consulta`?
-
-    Responde bien, sin haber redirigido fuera de la tienda, menciona alguna palabra de la
-    consulta y tiene al menos `MIN_PRODUCTOS` enlaces a la tienda junto a un precio, que no son
-    los mismos que los de la portada (muchas tiendas devuelven la portada, con sus destacados,
-    cuando no entienden la ruta).
-    """
-    if not _correcta(pagina) or not de_la_tienda(pagina, dominio):
-        return False
-    raiz = analizar(pagina.html)
-    texto = normalizar(raiz.texto())
-    palabras = [p for p in normalizar(consulta).split() if len(p) >= MIN_PALABRA]
-    if palabras and not any(p in texto for p in palabras):
-        return False
-    productos = _enlaces_con_precio(raiz, pagina, dominio)
-    if len(productos) < MIN_PRODUCTOS:
-        return False
-    return portada is None or productos != _enlaces_con_precio(
-        analizar(portada.html), portada, dominio
-    )
-
-
-def _enlaces_con_precio(raiz: Nodo, pagina: Pagina, dominio: str) -> set[str]:
-    base = pagina.url_final or pagina.url
-    propia = url_de_la_tienda(base, base, dominio)
-    enlaces: set[str] = set()
-    for enlace in _elementos(raiz, "a"):
-        href = enlace.atributo("href")
-        url = url_de_la_tienda(href, base, dominio) if href else None
-        if url is None or url == propia or url in enlaces:
-            continue
-        # El precio tiene que estar en la «tarjeta» del producto: se sube por los ancestros
-        # mientras no se llegue a un bloque grande ni a uno con enlaces a otras páginas.
-        contenedor: Nodo | None = enlace
-        for _ in range(NIVELES_CONTENEDOR):
-            if contenedor is None or contenedor.padre is None:
-                break
-            texto = contenedor.texto()
-            if len(texto) > MAX_TEXTO_CONTENEDOR or _enlaza_a_otras(contenedor, url, base, dominio):
-                break
-            if next(buscar_precios(texto), None) is not None:
-                enlaces.add(url)
-                break
-            contenedor = contenedor.padre
-    return enlaces
-
-
-def _enlaza_a_otras(contenedor: Nodo, url: str, base: str, dominio: str) -> bool:
-    for enlace in _elementos(contenedor, "a"):
-        href = enlace.atributo("href")
-        otra = url_de_la_tienda(href, base, dominio) if href else None
-        if otra is not None and otra != url:
-            return True
-    return False
-
-
-def _elementos(raiz: Nodo, etiqueta: str) -> Iterable[Nodo]:
-    return (n for n in raiz.descendientes() if n.etiqueta == etiqueta)
-
-
-def _correcta(pagina: Pagina) -> bool:
-    return 200 <= pagina.estado < 300
+def _nota(prefijo: str, resumen: str) -> str:
+    texto = prefijo + resumen
+    return texto if len(texto) <= MAX_RESUMEN else texto[: MAX_RESUMEN - 1] + "…"
 
 
 # --- 2 y 3. Selectores con IA, validación y reintento ----------------------------------------
@@ -370,7 +256,7 @@ class _Configuracion:
     consulta: str
     claves: tuple[str, ...]
     validador: Validador
-    busqueda: _Busqueda
+    busqueda: Busqueda
     creado: datetime
     _fichas: dict[str, Pagina | None] = field(default_factory=dict)
 
@@ -383,7 +269,11 @@ class _Configuracion:
                     propuesta.perfil, self.navegador, self.consulta, validador=self.validador
                 )
                 if informe.valido:
-                    return replace(propuesta.perfil, nota=resumir(informe))
+                    nota = resumir(informe)
+                    if self.busqueda.origen == ORIGEN_IA:
+                        # Quien revisa el perfil tiene que saber que la URL no salió de la tienda.
+                        nota = _nota("URL de búsqueda propuesta por la IA. ", nota)
+                    return replace(propuesta.perfil, nota=nota)
                 propuesta.problemas.extend(informe.problemas)
             anterior = propuesta
         assert anterior is not None
@@ -446,14 +336,14 @@ class _Configuracion:
     async def primera_ficha(self, resultados: Sequence[ResultadoListado]) -> Pagina | None:
         for resultado in resultados[:MAX_FICHAS]:
             if resultado.url not in self._fichas:
-                pagina = await _abrir(
+                pagina = await abrir(
                     self.navegador,
                     resultado.url,
                     js=self.busqueda.necesita_js,
                     validador=self.validador,
                 )
                 # Una ficha que redirige fuera de la tienda no se le enseña a la IA.
-                buena = pagina is not None and _correcta(pagina)
+                buena = pagina is not None and correcta(pagina)
                 buena = buena and pagina is not None and de_la_tienda(pagina, self.dominio)
                 self._fichas[resultado.url] = pagina if buena else None
             if (pagina := self._fichas[resultado.url]) is not None:

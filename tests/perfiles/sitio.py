@@ -143,6 +143,51 @@ def html_listado(productos: Iterable[Producto] = PRODUCTOS, *, formulario: bool 
     )
 
 
+def next_data(productos: Iterable[Producto] = PRODUCTOS) -> str:
+    """El `<script id="__NEXT_DATA__">` de una búsqueda en Next.js, con la forma de los reales."""
+    datos = {
+        "props": {
+            "pageProps": {
+                "busqueda": {
+                    "consulta": CONSULTA,
+                    "total": len(tuple(productos)),
+                    "productos": [
+                        {
+                            "id": i,
+                            "name": p.titulo,
+                            "slug": p.ruta.rsplit("/", 1)[1],
+                            "url": p.ruta,
+                            "price": {"amount": p.importe, "currency": "EUR"},
+                        }
+                        for i, p in enumerate(productos)
+                    ],
+                }
+            }
+        },
+        "page": "/buscar",
+        "buildId": "x1y2z3",
+    }
+    return f'<script id="__NEXT_DATA__" type="application/json">{json.dumps(datos)}</script>'
+
+
+def html_next(productos: Iterable[Producto] = PRODUCTOS, *, tarjetas: bool = False) -> str:
+    """Búsqueda de una tienda Next.js: los resultados van en `__NEXT_DATA__` y, con `tarjetas`,
+    también pintados en el HTML (con clases de CSS modules, que cambian en cada despliegue)."""
+    lista = tuple(productos)
+    pintadas = "".join(
+        f'<div class="Tarjeta_tarjeta__k2J9s"><a class="Tarjeta_enlace__aB3dE" href="{p.ruta}">'
+        f'{escape(p.titulo)}</a> <span class="Tarjeta_precio__Zx81Q">{p.precio}</span></div>'
+        for p in lista
+    )
+    return (
+        "<html><head><title>Buscar «faro golf» - Recambios Prueba</title></head><body>"
+        '<div id="__next"><header><a href="/">Recambios Prueba</a></header>'
+        "<main><h1>Resultados para «faro golf»</h1>"
+        f"{pintadas if tarjetas else '<div>Cargando…</div>'}</main></div>"
+        f"{next_data(lista)}</body></html>"
+    )
+
+
 def html_vacio() -> str:
     """La búsqueda servida sin JavaScript en una tienda que pinta los resultados en el cliente."""
     return (

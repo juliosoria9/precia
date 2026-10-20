@@ -12,12 +12,11 @@ from precia.ia.simulado import Guion
 from precia.ia.tipos import PeticionIA, PresupuestoAgotado, RespuestaIA, SalidaNoValida
 from precia.navegador.tipos import Bloqueado
 from precia.nucleo.modelos import CAMPOS, CLAVES_CAMPOS, Campo
-from precia.perfiles.configurador import (
-    AUTOR,
-    COMPONENTE,
+from precia.perfiles.configurador import AUTOR, COMPONENTE, configurar
+from precia.perfiles.descubrimiento import (
+    ESQUEMA_PLANTILLAS,
     MAX_FORMULARIOS,
     PATRONES,
-    configurar,
     parece_listado,
     plantillas_de_formularios,
 )
@@ -188,12 +187,15 @@ def test_patrones_habituales_en_orden_si_no_hay_formulario() -> None:
     perfil, _ = ejecutar(navegador, [LISTADO_OK, CAMPOS_OK], dominio=f"www.{DOMINIO}")
     assert perfil.url_busqueda == f"{TIENDA}/?s={{consulta}}&post_type=product"
     assert perfil.dominio == DOMINIO
-    assert navegador.urls[:5] == [
-        PORTADA,
-        f"{TIENDA}/busqueda?controller=search&s=faro+golf",
-        f"{TIENDA}/buscar?q=faro+golf",
-        f"{TIENDA}/search?q=faro+golf",
-        woo,
+    # Sin formulario ni enlaces de búsqueda se mira la portada con Chromium (aquí no hay) antes
+    # de los patrones (nota 15 §D).
+    assert navegador.pedidas[:6] == [
+        (PORTADA, False),
+        (PORTADA, True),
+        (f"{TIENDA}/busqueda?controller=search&s=faro+golf", False),
+        (f"{TIENDA}/buscar?q=faro+golf", False),
+        (f"{TIENDA}/search?q=faro+golf", False),
+        (woo, False),
     ]
     assert PATRONES[0] == "/busqueda?controller=search&s={consulta}"
     assert PATRONES[-1] == "/buscar/{consulta}"
@@ -462,7 +464,8 @@ def test_los_formularios_de_la_portada_tienen_tope() -> None:
     )
     motivo, peticiones = fallo(navegador, [])
     assert "búsqueda" in motivo
-    assert peticiones == []
+    # Como último recurso se pide una propuesta a la IA (aquí no responde): una sola petición.
+    assert [p.esquema for p in peticiones] == [ESQUEMA_PLANTILLAS]
     assert len(navegador.pedidas) == 1 + 2 * (MAX_FORMULARIOS + len(PATRONES))
 
 

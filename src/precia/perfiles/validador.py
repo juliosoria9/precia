@@ -29,13 +29,19 @@ Los `problemas` del informe explican qué falla con detalle suficiente para que 
 configurador se los devuelva a la IA en su reintento; pueden contener texto de la tienda, así
 que solo viajan en los `datos` de una petición, nunca en las instrucciones.
 
+Un perfil `api_*` (nota 15 §D) no tiene selectores: se comprueban su tipo y su URL, se descarga
+la búsqueda de la API (sin JavaScript) y vale si `fuentes.apis.ofertas_api` saca de la respuesta
+al menos un producto con precio. No se abre ninguna ficha: los datos vienen de la propia tienda.
+En Shopify la moneda sale de la portada (`Shopify.currency`); si no se sabe, el perfil no vale,
+porque leer libras como euros daría precios falsos con confianza 1.
+
 Los bloqueos (`Bloqueado`) y las prohibiciones de robots.txt se propagan: no son un fallo del
 perfil y quien llama tiene que pararse y registrarlos. También se propaga un error al descargar
 la búsqueda (la tienda no responde); el de una ficha cuenta como ficha fallida.
 """
 
-from collections.abc import Iterable, Mapping
-from urllib.parse import quote, quote_plus
+from collections.abc import Iterable, Mapping, Sequence
+from urllib.parse import quote, quote_plus, urlsplit
 
 from precia.extraccion.dom import analizar
 from precia.extraccion.ficha import extraer_ficha, formatear_precio
@@ -43,11 +49,20 @@ from precia.extraccion.listado import dominio_normalizado, extraer_listado, url_
 from precia.extraccion.precios import leer_precio
 from precia.extraccion.selectores import extraer_valor, seleccionar
 from precia.extraccion.tipos import FichaExtraida, Precio, SelectorNoValido
-from precia.navegador.tipos import ErrorDescarga, Pagina, URLNoPermitida
+from precia.fuentes.apis import MAX_FICHAS as MAX_FICHAS_API
+from precia.fuentes.apis import ofertas_api
+from precia.fuentes.plataformas import Plataforma, moneda_shopify, origen_de
+from precia.navegador.tipos import ErrorDescarga, Pagina, ProhibidoPorRobots, URLNoPermitida
 from precia.navegador.url import Validador, validar_url
 from precia.nucleo.modelos import CAMPOS, CLAVES_CAMPOS, OrigenDato
 from precia.perfiles.protocolos import Navegador
-from precia.perfiles.tipos import InformeValidacion, Perfil
+from precia.perfiles.tipos import (
+    TIPO_API_SHOPIFY,
+    TIPO_API_WOOCOMMERCE,
+    TIPO_HTML,
+    InformeValidacion,
+    Perfil,
+)
 
 MAX_FICHAS = 3
 MIN_FICHAS_OK = 2
@@ -61,6 +76,12 @@ MAX_CITA = 80
 CLAVES = tuple(c.clave for c in CAMPOS)
 SELECTORES_LISTADO = ("sel_resultado", "sel_titulo", "sel_enlace", "sel_precio_listado")
 _RAIZ_VACIA = analizar("")
+PLATAFORMA_DE_TIPO: dict[str, Plataforma] = {
+    TIPO_API_WOOCOMMERCE: Plataforma.WOOCOMMERCE,
+    TIPO_API_SHOPIFY: Plataforma.SHOPIFY,
+}
+TIPO_DE_PLATAFORMA = {plataforma: tipo for tipo, plataforma in PLATAFORMA_DE_TIPO.items()}
+NOMBRE_PLATAFORMA = {Plataforma.WOOCOMMERCE: "WooCommerce", Plataforma.SHOPIFY: "Shopify"}
 
 
 async def validar(
@@ -71,6 +92,8 @@ async def validar(
     validador: Validador = validar_url,
 ) -> InformeValidacion:
     """Prueba `perfil` en su tienda buscando `consulta_prueba`. Ver el docstring del módulo."""
+    if perfil.tipo != TIPO_HTML:
+        return await _validar_api(perfil, navegador, consulta_prueba, validador)
     problemas = _Problemas()
     problemas.extend(problemas_de_sintaxis(perfil))
     problemas.extend(problemas_de_url(perfil))
@@ -162,6 +185,97 @@ async def validar(
     )
 
 
+async def _validar_api(
+    perfil: Perfil, navegador: Navegador, consulta: str, validador: Validador
+) -> InformeValidacion:
+    problemas = _Problemas()
+    plataforma = PLATAFORMA_DE_TIPO.get(perfil.tipo) if isinstance(perfil.tipo, str) else None
+    if plataforma is None:
+        problemas.add(f"El tipo de perfil {_cita(str(perfil.tipo))} no es válido.")
+        return problemas.informe(valido=False)
+    problemas.extend(problemas_de_url(perfil))
+    if problemas:
+        return problemas.informe(valido=False)
+    try:
+        url = await validador(url_de_busqueda(perfil.url_busqueda, consulta))
+    except URLNoPermitida as error:
+        problemas.add(f"url_busqueda no está permitida: {error}")
+        return problemas.informe(valido=False)
+    pagina = await navegador.obtener(url, js=False)
+    nombre = NOMBRE_PLATAFORMA[plataforma]
+    if not _correcta(pagina):
+        problemas.add(f"La API de {nombre} responde con el estado {pagina.estado}.")
+        return problemas.informe(valido=False)
+    if not de_la_tienda(pagina, perfil.dominio):
+        problemas.add(f"La API de {nombre} redirige a otro dominio ({pagina.url_final}).")
+        return problemas.informe(valido=False)
+    moneda = await moneda_de_la_api(plataforma, pagina, navegador, validador)
+    if moneda is None:
+        problemas.add(
+            f"No se sabe la moneda de la tienda {nombre}: su portada no declara Shopify.currency."
+        )
+        return problemas.informe(valido=False)
+    fichas = ofertas_api(plataforma, pagina, perfil.dominio, CLAVES, moneda=moneda)
+    con_precio = sum(f.precio is not None for f in fichas)
+    if not fichas:
+        problemas.add(f"La API de {nombre} no devuelve productos de la tienda para «{consulta}».")
+    elif not con_precio:
+        problemas.add(f"La API de {nombre} devuelve productos para «{consulta}», pero sin precio.")
+    cuenta: dict[str, int] = {}
+    for ficha in fichas:
+        for campo in ficha.campos:
+            cuenta[campo] = cuenta.get(campo, 0) + 1
+    return problemas.informe(
+        valido=con_precio > 0,
+        resultados=len(fichas),
+        fichas_ok=con_precio,
+        fichas_total=len(fichas),
+        campos={c: cuenta[c] for c in CLAVES if cuenta.get(c)},
+    )
+
+
+async def moneda_de_la_api(
+    plataforma: Plataforma, pagina: Pagina, navegador: Navegador, validador: Validador
+) -> str | None:
+    """Moneda de los precios de la API, o `None` si no se sabe.
+
+    WooCommerce trae la suya en cada producto (lo que se devuelve aquí no se usa). Shopify no:
+    sale de `Shopify.currency` en la portada de la tienda que sirvió la respuesta. Si la
+    portada no se puede abrir o no la declara, `None`. Los bloqueos se propagan.
+    """
+    if plataforma is not Plataforma.SHOPIFY:
+        return "EUR"
+    origen = origen_de(pagina.url_final or pagina.url)
+    if origen is None:
+        return None
+    try:
+        portada = await navegador.obtener(await validador(origen + "/"), js=False)
+    except (ErrorDescarga, ProhibidoPorRobots, URLNoPermitida):
+        return None
+    if not _correcta(portada):
+        return None
+    return moneda_shopify(portada)
+
+
+async def ofertas_de_api(
+    perfil: Perfil,
+    pagina: Pagina,
+    navegador: Navegador,
+    campos: Sequence[str],
+    *,
+    validador: Validador = validar_url,
+    maximo: int = MAX_FICHAS_API,
+) -> list[FichaExtraida]:
+    """Fichas de la respuesta de la API de un perfil `api_*` (lista vacía si no es `api_*`)."""
+    plataforma = PLATAFORMA_DE_TIPO.get(perfil.tipo)
+    if plataforma is None:
+        return []
+    moneda = await moneda_de_la_api(plataforma, pagina, navegador, validador)
+    if moneda is None:
+        return []
+    return ofertas_api(plataforma, pagina, perfil.dominio, campos, moneda=moneda, maximo=maximo)
+
+
 def url_de_busqueda(plantilla: str, consulta: str) -> str:
     """`plantilla` con la consulta codificada en lugar de `{consulta}`.
 
@@ -224,6 +338,8 @@ def problemas_de_url(perfil: Perfil) -> list[str]:
     if 0 <= plantilla.find("#") < plantilla.find(MARCADOR):
         # El fragmento no se envía: la tienda recibiría siempre la misma búsqueda.
         return ["url_busqueda lleva {consulta} en el fragmento (#), que no llega a la tienda."]
+    if not consulta_fuera_del_host(plantilla):
+        return ["url_busqueda lleva {consulta} en el host: cada búsqueda iría a otra web."]
     dominio = dominio_normalizado(perfil.dominio)
     ejemplo = url_de_busqueda(plantilla, "prueba")
     if dominio is None or url_de_la_tienda(ejemplo, ejemplo, dominio) is None:
@@ -232,6 +348,21 @@ def problemas_de_url(perfil: Perfil) -> list[str]:
             "(en el puerto por defecto y sin usuario)."
         ]
     return []
+
+
+def consulta_fuera_del_host(plantilla: str) -> bool:
+    """`{consulta}` no está en el esquema ni en el host (ni en el usuario o el puerto).
+
+    La comprobación de dominio se hace con una consulta de ejemplo («prueba»): en la tienda
+    `recambios-prueba.es`, la plantilla `https://recambios-{consulta}.es/` la pasaría y luego
+    cada búsqueda iría a una web distinta (`recambios-x.es`). La plantilla tiene que ser
+    absoluta: una relativa no tiene host que comprobar.
+    """
+    try:
+        partes = urlsplit(plantilla)
+    except ValueError:
+        return False
+    return MARCADOR not in partes.scheme and MARCADOR not in partes.netloc
 
 
 def resumir(informe: InformeValidacion) -> str:

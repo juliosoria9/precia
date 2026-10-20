@@ -6,7 +6,7 @@ el `ProveedorSimulado` detrás de un `ServicioIA` de verdad con el almacén como
 
 import asyncio
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -23,13 +23,25 @@ from precia.nucleo.modelos import (
     EstadoPaso,
     EstadoPerfil,
     Modo,
+    OrigenDato,
     Paso,
     ProgresoTienda,
     ResultadoBusqueda,
 )
-from precia.nucleo.orquestador import Orquestador
-from precia.perfiles.tipos import Perfil
+from precia.nucleo.orquestador import ESTRUCTURADOS, Orquestador
+from precia.perfiles.tipos import TIPO_API_SHOPIFY, TIPO_API_WOOCOMMERCE, Perfil
 from tests.navegador.falsos import validar_con_dns_publico
+from tests.perfiles.plataformas import (
+    SHOPIFY,
+    SHOPIFY_API,
+    SHOPIFY_PORTADA,
+    WOO,
+    WOO_API,
+    WOO_TITULOS,
+    paginas_shopify,
+    paginas_woo,
+    perfil_api,
+)
 from tests.perfiles.sitio import (
     BUSQUEDA,
     CAMPOS_OK,
@@ -40,7 +52,10 @@ from tests.perfiles.sitio import (
     PRODUCTOS,
     TIENDA,
     NavegadorFalso,
+    html_ficha,
     html_listado,
+    html_next,
+    next_data,
     paginas_sitio,
     perfil,
 )
@@ -676,3 +691,167 @@ def test_un_error_de_ia_en_el_extractor_deja_la_tienda_sin_ia() -> None:
     aviso = paso(r, "IA")
     assert aviso.estado is EstadoPaso.AVISO and "no responde" in aviso.detalle
     assert len(ofertas(r)) == len(PRODUCTOS)
+
+
+# --- Perfiles api_* y datos estructurados (nota 15 §D) --------------------------------------------
+
+
+def test_perfil_api_busca_en_la_api_sin_abrir_fichas() -> None:
+    almacen = nuevo_almacen(perfil_api(revisado=True), tiendas=(WOO,))
+    m = montar(almacen, NavegadorFalso(paginas_woo()), {})
+    r = m.buscar(modo=Modo.AUTO, campos=("precio", "referencia_oem"))
+    # Una sola petición, a la API, sin JavaScript ni fichas; y sin IA.
+    assert m.navegador.pedidas == [(WOO_API, False)]
+    assert m.peticiones_ia == []
+    leidas = ofertas(r)
+    assert {o.titulo for o in leidas} == {WOO_TITULOS[0], WOO_TITULOS[1]}
+    assert all(o.campos["precio"].origen is OrigenDato.API for o in leidas)
+    assert all(o.url.startswith(f"https://{WOO}/producto/") for o in leidas)
+    # La tienda marca las pastillas como agotadas.
+    assert {o.titulo: o.disponible for o in leidas}[WOO_TITULOS[1]] is False
+    extraccion = paso(r, "extracción", WOO)
+    assert "API pública de WooCommerce" in extraccion.detalle
+    assert "3 productos" in extraccion.detalle and "1 sin precio" in extraccion.detalle
+    assert paso(r, "verificación", WOO).estado is EstadoPaso.OK
+    tienda = m.almacen.tienda(WOO)
+    assert tienda is not None and tienda.estado is EstadoPerfil.ACTIVO
+
+
+def test_perfil_api_respeta_max_fichas() -> None:
+    almacen = nuevo_almacen(perfil_api(revisado=True), tiendas=(WOO,))
+    m = montar(almacen, NavegadorFalso(paginas_woo()), {}, max_fichas=1)
+    r = m.buscar(modo=Modo.CLASICO)
+    assert [o.titulo for o in ofertas(r)] == [WOO_TITULOS[0]]
+
+
+def test_perfil_api_shopify_usa_la_moneda_de_la_portada() -> None:
+    almacen = nuevo_almacen(perfil_api(TIPO_API_SHOPIFY, revisado=True), tiendas=(SHOPIFY,))
+    m = montar(almacen, NavegadorFalso(paginas_shopify()), {})
+    r = m.buscar(modo=Modo.CLASICO)
+    assert m.navegador.urls == [SHOPIFY_API, SHOPIFY_PORTADA]
+    assert len(ofertas(r)) == 2
+
+
+def test_perfil_api_sin_resultados_no_es_un_perfil_roto() -> None:
+    paginas = paginas_woo()
+    paginas[WOO_API] = "[]"
+    almacen = nuevo_almacen(perfil_api(revisado=True), tiendas=(WOO,))
+    m = montar(almacen, NavegadorFalso(paginas), {"reparador": [PROPUESTA]})
+    r = m.buscar(modo=Modo.AUTO)
+    assert paso(r, "extracción", WOO).estado is EstadoPaso.AVISO
+    assert "Sin resultados" in paso(r, "extracción", WOO).detalle
+    assert m.peticiones_ia == []
+    tienda = m.almacen.tienda(WOO)
+    assert tienda is not None and tienda.estado is EstadoPerfil.ACTIVO
+
+
+def test_perfil_api_con_error_http_es_un_error_de_la_busqueda() -> None:
+    almacen = nuevo_almacen(perfil_api(revisado=True), tiendas=(WOO,))
+    m = montar(almacen, NavegadorFalso({}), {})
+    r = m.buscar(modo=Modo.CLASICO)
+    assert paso(r, "búsqueda", WOO).estado is EstadoPaso.ERROR
+    assert "404" in paso(r, "búsqueda", WOO).detalle
+
+
+def test_bloqueo_en_la_api_se_para() -> None:
+    bloqueo = Bloqueado(WOO_API, "La tienda rechaza el acceso automático (HTTP 403)")
+    almacen = nuevo_almacen(perfil_api(revisado=True), tiendas=(WOO,))
+    m = montar(almacen, NavegadorFalso(paginas_woo(), errores={WOO_API: bloqueo}), {})
+    r = m.buscar(modo=Modo.CLASICO)
+    errores = [p for p in progreso(r, WOO).pasos if p.estado is EstadoPaso.ERROR]
+    assert len(errores) == 1
+    assert errores[0].detalle.startswith("Bloqueo (CAPTCHA o anti-bot): no se evade")
+    tienda = m.almacen.tienda(WOO)
+    assert tienda is not None and tienda.bloqueos == 1
+
+
+def test_auto_configura_un_perfil_api_sin_ia() -> None:
+    m = montar(nuevo_almacen(tiendas=(WOO,)), NavegadorFalso(paginas_woo()), {})
+    r = m.buscar(modo=Modo.AUTO)
+    assert m.peticiones_ia == [] and r.llamadas_ia == 0
+    nuevo = m.almacen.perfil_vigente(WOO)
+    assert nuevo is not None and nuevo.tipo == TIPO_API_WOOCOMMERCE and not nuevo.revisado
+    configuracion = paso(r, "perfil", WOO)
+    assert configuracion.estado is EstadoPaso.AVISO
+    assert "API pública de WooCommerce" in configuracion.detalle
+    assert "sin IA" in configuracion.detalle and "pendiente de revisión" in configuracion.detalle
+    assert len(ofertas(r)) == 2
+    tienda = m.almacen.tienda(WOO)
+    assert tienda is not None and tienda.estado is EstadoPerfil.PENDIENTE_REVISION
+
+
+def test_selectores_sin_resultados_usan_los_datos_estructurados() -> None:
+    sitio = paginas_sitio()
+    sitio[BUSQUEDA] = html_next()
+    m = montar(nuevo_almacen(ROTO), NavegadorFalso(sitio), {"reparador": [PROPUESTA]})
+    r = m.buscar(modo=Modo.AUTO)
+    aviso = Paso(
+        "perfil",
+        EstadoPaso.AVISO,
+        "Selectores sin resultados: se usan los datos estructurados de la página",
+    )
+    assert aviso in progreso(r).pasos
+    # Ni reparador ni perfil roto: las ofertas salen y son válidas.
+    assert m.peticiones_ia == []
+    assert len(ofertas(r)) == len(PRODUCTOS)
+    assert m.almacen.perfil_vigente(DOMINIO) == ROTO
+    tienda = m.almacen.tienda(DOMINIO)
+    assert tienda is not None and tienda.estado is EstadoPerfil.ACTIVO
+
+
+def test_datos_estructurados_tambien_en_clasico() -> None:
+    sitio = paginas_sitio()
+    sitio[BUSQUEDA] = html_next()
+    m = montar(nuevo_almacen(ROTO), NavegadorFalso(sitio), {})
+    r = m.buscar(modo=Modo.CLASICO)
+    assert len(ofertas(r)) == len(PRODUCTOS)
+    assert not any(p.estado is EstadoPaso.ERROR for p in progreso(r).pasos)
+
+
+def test_datos_estructurados_sin_ofertas_validas_si_es_un_perfil_roto() -> None:
+    # El JSON embebido enlaza a fichas que ya no existen: no salen ofertas válidas y el listado
+    # visible sí tiene productos con precio, así que el perfil está roto y se repara.
+    viejos = [replace(p, ruta=p.ruta + "-retirado") for p in PRODUCTOS]
+    sitio = paginas_sitio()
+    sitio[BUSQUEDA] = html_listado().replace("</body>", next_data(viejos) + "</body>")
+    m = montar(nuevo_almacen(ROTO), NavegadorFalso(sitio), {"reparador": [PROPUESTA]})
+    r = m.buscar(modo=Modo.AUTO)
+    assert ESTRUCTURADOS in [p.detalle for p in progreso(r).pasos]
+    assert m.peticiones_ia == ["reparador"]
+    reparado = m.almacen.perfil_vigente(DOMINIO)
+    assert reparado is not None and reparado.version == 2
+    assert len(ofertas(r)) == len(PRODUCTOS)
+
+
+def test_selector_no_valido_no_se_tapa_con_los_datos_estructurados() -> None:
+    sitio = paginas_sitio()
+    sitio[BUSQUEDA] = html_next()
+    roto = perfil(sel_resultado="li.producto:has(a)")
+    m = montar(nuevo_almacen(roto), NavegadorFalso(sitio), {})
+    r = m.buscar(modo=Modo.CLASICO)
+    tienda = m.almacen.tienda(DOMINIO)
+    assert tienda is not None and tienda.estado is EstadoPerfil.ROTO
+    assert r.grupos == ()
+
+
+DESTACADOS = (
+    replace(PRODUCTOS[0], ruta="/p/bateria-varta-70ah", titulo="Batería Varta Blue 70Ah"),
+    replace(PRODUCTOS[1], ruta="/p/aceite-castrol-5w30", titulo="Aceite Castrol Edge 5W30 5L"),
+)
+
+
+def test_destacados_del_json_embebido_no_son_resultados_de_la_busqueda() -> None:
+    # Revisión adversarial: la página dice que no hay resultados, pero su `__NEXT_DATA__` trae
+    # los «destacados» de la tienda (con precio), como en casi todas las tiendas Next.js. No
+    # son la pieza buscada: ni se abren sus fichas ni salen como ofertas.
+    sitio = paginas_sitio()
+    sitio[BUSQUEDA] = SIN_RESULTADOS.replace("</body>", next_data(DESTACADOS) + "</body>")
+    for producto in DESTACADOS:
+        sitio[f"{TIENDA}{producto.ruta}"] = html_ficha(producto)
+    m = montar(nuevo_almacen(ROTO), NavegadorFalso(sitio), {"reparador": [PROPUESTA]})
+    r = m.buscar(modo=Modo.AUTO)
+    assert ESTRUCTURADOS not in [p.detalle for p in progreso(r).pasos]
+    assert ofertas(r) == []
+    assert m.navegador.urls == [BUSQUEDA]
+    assert m.peticiones_ia == []
+    assert "Sin resultados" in paso(r, "extracción").detalle

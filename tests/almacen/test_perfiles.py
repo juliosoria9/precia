@@ -1,18 +1,21 @@
 """Perfiles versionados de las tiendas."""
 
+import sqlite3
 from dataclasses import replace
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from precia.almacen.sqlite import (
+    MIGRACIONES,
     Almacen,
     DatoNoValido,
     PerfilNoEncontrado,
     TiendaNoEncontrada,
 )
-from precia.perfiles.tipos import Perfil
+from precia.perfiles.tipos import TIPO_API_SHOPIFY, TIPO_API_WOOCOMMERCE, TIPO_HTML, Perfil
 
 DOMINIO = "piezasya.example"
 
@@ -170,3 +173,94 @@ def test_sel_campos_solo_admite_campos_conocidos(con_tienda: Almacen, clave: str
     with pytest.raises(DatoNoValido):
         con_tienda.guardar_perfil(_perfil(sel_campos={clave: "h1"}))
     assert con_tienda.versiones(DOMINIO) == []
+
+
+# --- Tipo de perfil (nota 15 §D) ----------------------------------------------------------------
+
+
+def _perfil_api(**cambios: Any) -> Perfil:
+    datos: dict[str, Any] = {
+        "url_busqueda": "https://piezasya.example/wp-json/wc/store/v1/products?search={consulta}",
+        "sel_resultado": "",
+        "sel_titulo": "",
+        "sel_enlace": "",
+        "sel_precio_listado": None,
+        "sel_campos": {},
+        "tipo": TIPO_API_WOOCOMMERCE,
+    }
+    datos.update(cambios)
+    return _perfil(**datos)
+
+
+def test_un_perfil_es_html_por_defecto(con_tienda: Almacen) -> None:
+    assert _perfil().tipo == TIPO_HTML == "html"
+    con_tienda.guardar_perfil(_perfil())
+    vigente = con_tienda.perfil_vigente(DOMINIO)
+    assert vigente is not None and vigente.tipo == TIPO_HTML
+
+
+@pytest.mark.parametrize("tipo", [TIPO_API_WOOCOMMERCE, TIPO_API_SHOPIFY])
+def test_perfil_api_sin_selectores_se_guarda_y_se_lee(con_tienda: Almacen, tipo: str) -> None:
+    perfil = _perfil_api(tipo=tipo)
+    assert perfil.es_api
+    assert con_tienda.guardar_perfil(perfil) == perfil
+    assert con_tienda.perfil_vigente(DOMINIO) == perfil
+
+
+@pytest.mark.parametrize("campo", ["sel_resultado", "sel_titulo", "sel_enlace"])
+def test_selectores_vacios_solo_en_perfiles_api(con_tienda: Almacen, campo: str) -> None:
+    with pytest.raises(DatoNoValido):
+        vacios: dict[str, Any] = {campo: ""}
+        con_tienda.guardar_perfil(_perfil(**vacios))
+    assert con_tienda.versiones(DOMINIO) == []
+
+
+@pytest.mark.parametrize("tipo", ["", "api", "API_WOOCOMMERCE", "api_magento", "html ", 3])
+def test_tipo_desconocido_no_se_guarda(con_tienda: Almacen, tipo: Any) -> None:
+    with pytest.raises(DatoNoValido):
+        con_tienda.guardar_perfil(_perfil(tipo=tipo))
+    assert con_tienda.versiones(DOMINIO) == []
+
+
+def test_la_version_de_un_perfil_api_ensena_su_tipo(con_tienda: Almacen) -> None:
+    # La persona que lo revisa tiene que ver que no hay selectores porque se lee una API.
+    con_tienda.guardar_perfil(_perfil_api())
+    tienda = con_tienda.tienda(DOMINIO)
+    assert tienda is not None
+    assert tienda.versiones[0].selectores == {"tipo": TIPO_API_WOOCOMMERCE}
+
+
+def test_una_base_de_la_version_2_migra_sus_perfiles_a_html(tmp_path: Path) -> None:
+    ruta = tmp_path / "precia.db"
+    Almacen(ruta, migraciones=MIGRACIONES[:2]).cerrar()
+    # Un perfil escrito por la versión anterior del código, sin la columna `tipo`.
+    con = sqlite3.connect(ruta)
+    con.execute(
+        "INSERT INTO tiendas (dominio, nombre, estado) VALUES (?, 'P', 'activo')", (DOMINIO,)
+    )
+    con.execute(
+        "INSERT INTO perfiles (dominio, version, url_busqueda, sel_resultado, sel_titulo,"
+        " sel_enlace, sel_campos, necesita_js, autor, creado)"
+        " VALUES (?, 1, 'https://piezasya.example/?q={consulta}', 'li', 'h2', 'a @href', '{}',"
+        " 0, 'manual', '2026-10-06T09:05:00')",
+        (DOMINIO,),
+    )
+    con.commit()
+    con.close()
+    with Almacen(ruta) as almacen:
+        vigente = almacen.perfil_vigente(DOMINIO)
+    assert vigente is not None and vigente.tipo == TIPO_HTML
+
+
+def test_la_base_rechaza_un_tipo_desconocido(tmp_path: Path) -> None:
+    # Defensa en profundidad: aunque alguien se salte `guardar_perfil`, la columna tiene CHECK.
+    ruta = tmp_path / "precia.db"
+    with Almacen(ruta) as almacen:
+        almacen.alta_tienda(DOMINIO, "PiezasYa")
+        almacen.guardar_perfil(_perfil())
+    con = sqlite3.connect(ruta)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute("UPDATE perfiles SET tipo = 'api_magento'")
+    finally:
+        con.close()

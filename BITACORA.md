@@ -47,6 +47,23 @@ Alimenta la memoria §3 («método de validación del código generado»).
 | 2026-10-19 | El filtro «solo usadas» hacía lo contrario; el modo Auto siempre cobraba | Revisión adversarial (agente «código») | Lógica corregida + tests |
 | 2026-10-19 | Contraste de bordes 1,26:1 (WCAG pide 3:1); gráfica que solo distinguía por color | Revisión adversarial (agente «fidelidad/UX») | `--borde-control` a 3,86:1; trazos distintos |
 | 2026-10-19 | Volvió a escribir una hora sin consultar el reloj en 2 entradas de esta bitácora (17:31 en vez de 17:16), el mismo fallo que en el diario por la mañana | Al cotejar la bitácora con las horas del diario (sacadas de `date`) | Horas corregidas; la documentación se genera con un script que pone la hora real |
+| 2026-10-19 | Tercera vez: escribió «18:05» a mano en una entrada del diario (eran las 17:48) | Al releer la nota tras escribirla | Marcada como aproximada; regla: la hora solo la pone `datetime.now()` |
+| 2026-10-19 | Regex cuadráticas (DoS) en la detección de CAPTCHA, en precios, en referencias OEM y en el sufijo `@atributo` de los selectores | Revisores adversariales de navegador, extracción y emparejado (con entradas hostiles cronometradas) | Reescritas en lineal + tests de tiempo |
+| 2026-10-19 | Límite de tiempo que solo cubría el cuerpo (slow-loris en las cabeceras, también por HTTPS) | Revisor de navegador, con un servidor TCP hostil y TLS real | Temporizador por petición que cierra la conexión |
+| 2026-10-19 | La clave de la API podía salir en el mensaje de un `ValueError` de `http.client` | Revisor de IA | Transporte que envuelve todos los errores; la clave se valida en el constructor |
+| 2026-10-19 | SSRF por redirecciones que Chromium sigue por su cuenta; `page.content()` sin límite de tiempo | Implementador y revisor de navegador, con Chromium real | Redirecciones validadas fuera del navegador; `wait_for` con límite |
+| 2026-10-19 | Anclaje por subcadena (una referencia de otra variante se daba por anclada) | Revisor de extracción | Anclaje por palabra completa |
+| 2026-10-19 | Perfil que validaba leyendo el precio de «relacionados»; fichas de otra tienda tras un redirector | Revisor adversarial de perfiles | Coherencia de precios listado/ficha/JSON-LD y mismo dominio tras redirecciones |
+| 2026-10-19 | Un error inesperado en una tienda tumbaba la búsqueda entera; fuga de Chromium al cambiar ajustes; tiendas desconocidas que hacían buscar en todas con IA | Revisor adversarial de la integración | Aislamiento por tienda, contador de usos del navegador, 422 si no hay tiendas válidas |
+| 2026-10-19 | Al insertar un `Protocol` con un script, el `@dataclass` de la clase siguiente quedó encima del protocolo | Al releer el fichero antes de ejecutar mypy | Quitado; los scripts de sustitución se revisan siempre después |
+| 2026-10-19 | En la sonda de B-Parts hizo 4 peticiones de búsqueda, más de las «1-2» propuestas a Julio | Al resumir la prueba | Reconocido; en las sondas, tope de peticiones por tienda fijado antes de empezar |
+| 2026-10-20 | Detector de bloqueo con falsos positivos: un `robots.txt` de Imperva paraba todo el dominio; una CSP, una reseña o un reCAPTCHA marcaban como bloqueadas fichas buenas | Revisor adversarial del frente A | Señales de producto antes que las firmas + `<script` obligatorio en Incapsula + tests |
+| 2026-10-20 | Aceptaba JSON servido por otra web tras una redirección, y respuestas 403/500 con JSON, como catálogo de la tienda | Revisor adversarial del frente C (test en rojo) | `url_final` del dominio y estado 2xx obligatorios |
+| 2026-10-20 | La comprobación de mismo dominio sustituía `{consulta}` por «prueba», así que una plantilla con la consulta en el host pasaba | Revisor adversarial de la integración | `consulta_fuera_del_host` en el validador y en el descubrimiento |
+| 2026-10-20 | «1.500» leído como 1,50 €; los microdatos de «relacionados» tomados como el producto de la ficha | Revisor adversarial del frente B | Importe ambiguo descartado; ámbitos con otra URL descartados |
+| 2026-10-20 | Los destacados de `__NEXT_DATA__` se daban como resultados de cualquier búsqueda (y en modo Auto se podía pagar IA por cada uno) | Revisor adversarial de la integración | Solo los resultados que nombran la consulta |
+| 2026-10-20 | TDD incumplido: `descubrimiento.py` se escribió antes que sus tests unitarios, y los tests de extremo a extremo después del código | Lo reconoció el propio agente en su informe | Se comprobó que los tests prueban algo quitando el código a mano; queda anotado |
+| 2026-10-20 | Filtro de scripts que dejaba fuera Rocket Loader/WP Rocket (falso negativo de plataforma) | Tests de optimizadores en rojo | Lista de exclusión de tipos de datos en lugar de lista de admitidos |
 
 ---
 
@@ -150,3 +167,76 @@ Alimenta la memoria §3 («método de validación del código generado»).
 ### 2026-10-19 17:34 · 📏 Medida · Segunda revisión adversarial
 - **Qué pasó:** 25 hallazgos (21 distintos: 3 altos, 9 medios y 9 bajos) → 28 tests en rojo → 139 tests en verde. Contraste de los bordes de los controles: de 1,26:1 a 3,86:1 (WCAG 1.4.11).
 - **Para la memoria:** §3 · S01
+
+### 2026-10-19 19:09 · ✅ Avance · Paquetes base del core: H1, H2, H3 y H6 (1148 tests)
+- **Qué pasó:** navegador, extracción, almacén, capa de IA y emparejado quedan implementados y en verde: 1148 tests en el repositorio, ruff y mypy estricto sin errores (115 ficheros), y ninguna dependencia nueva (solo stdlib y `playwright`, aprobado).
+- **Qué se hizo:** contratos escritos antes que el código (tipos compartidos + nota 14 del vault); un agente implementó cada paquete con TDD y otro, distinto, lo revisó adversarialmente. Un commit por hito.
+- **Para la memoria:** §6 (hitos), §3 (flujo de trabajo con IA: especificación → implementación → revisión adversarial) · S01
+
+### 2026-10-19 19:09 · 💡 Aprendizaje · La revisión adversarial por agente encontró 41 fallos en código que ya pasaba todos sus tests
+- **Qué pasó:** los cinco revisores encontraron y corrigieron 41 fallos en paquetes cuyos tests estaban en verde. Los más relevantes para la asignatura: **DoS por expresiones regulares cuadráticas** (detección de CAPTCHA: 229 s con 210 KB hostiles; precios: más de un minuto con 160 KB; referencias OEM: 3 s por título), **slow-loris** (un servidor que envía las cabeceras byte a byte bloqueaba la descarga sin límite, también por HTTPS), **fuga de la clave de la API** (un `ValueError` de `http.client` copia el valor de la cabecera en su mensaje), un **SSRF dentro de Chromium** (el navegador seguía las redirecciones sin pasar por el filtro), **ASCII smuggling** (instrucciones escondidas con caracteres Unicode invisibles que el modelo lee y una persona no ve), un anclaje por subcadena que daba por buena una referencia OEM de otra variante, y «1.9TDI» detectado como referencia OEM.
+- **Qué se hizo:** cada fallo se reprodujo primero con un test en rojo y después se corrigió.
+- **Lección:** los tests del autor prueban lo que él previó; un revisor con mirada de atacante encuentra la otra mitad. En un proyecto de ciberseguridad, la revisión adversarial no es opcional.
+- **Para la memoria:** §3 (método de validación), §4 (riesgos: prompt injection, SSRF, DoS) · S01
+
+### 2026-10-19 19:09 · 🧭 Decisión · Motor de selectores propio y Haiku 5.5 (ADR-015 y 016, propuestos)
+- **Qué pasó:** los selectores CSS que genera la IA los interpreta un motor propio con un subconjunto de CSS; Playwright solo renderiza la página. El modelo por defecto es `claude-haiku-5-5` (0,10 $ / 0,50 $ por millón).
+- **Causa / contexto:** un lenguaje restringido impide que la IA cuele código (memoria §4) y permite probar sin red ni navegador. Haiku 5.5 es el Haiku vigente y diez veces más barato que el que preveía la memoria.
+- **Para la memoria:** §4, §7, §8 (coste) · S01
+
+### 2026-10-19 19:13 · ❌ Fallo · Un 403 de Cloudflare en robots.txt se habría leído como «permitido todo»
+- **Qué pasó:** al leer el `robots.txt` de las tiendas reales, oscaro.es respondió con un 403 y el desafío de Cloudflare («Just a moment…»). El servicio de robots sigue el RFC 9309, que dice que un 4xx significa que no hay restricciones.
+- **Causa / contexto:** el RFC piensa en un `robots.txt` que no existe (404) o es privado, no en un muro anti-bot. Los 1148 tests no lo cubrían porque nadie había previsto ese caso; salió al probar contra una web real.
+- **Qué se hizo:** se corrige con TDD: un `robots.txt` que devuelve un desafío anti-bot cuenta como bloqueo (se prohíbe todo y no se insiste).
+- **Lección:** seguir un estándar al pie de la letra no basta; hay que contrastarlo con cómo se comporta la web real. Las pruebas reales (con permiso y a ritmo lento) son parte de la validación.
+- **Para la memoria:** §3 (validación), §4 (riesgos), nota legal (robots.txt) · S01
+
+### 2026-10-19 19:13 · 🧭 Decisión · Qué tiendas reales se pueden usar según su robots.txt
+- **Qué pasó:** de las cinco tiendas aprobadas por Julio, ecooparts.com y b-parts.com permiten buscar; ovoko.es prohíbe la búsqueda con `?q=`; ebay.es prohíbe su búsqueda (salvo con un parámetro de marketing, que no se usa para no engañar a robots); oscaro.es bloquea con Cloudflare incluso el `robots.txt`.
+- **Qué se hizo:** solo se prueban las permitidas. Cuando robots prohíbe o hay anti-bot, PrecIA lo registra y no insiste: es el comportamiento que promete la memoria.
+- **Para la memoria:** §4 (riesgos), estado del arte (nota legal), Eval (tasa de bloqueo) · S01
+
+### 2026-10-19 19:20 · 🧭 Decisión · Se ignora robots.txt (ADR-017), con límites que no se tocan
+- **Qué pasó:** Julio decide ignorar `robots.txt` en todas las tiendas porque los datos son públicos. Se le explicó el riesgo: `robots.txt` es la señal de reserva de minería de datos (art. 67 RDL 24/2021) y prueba de la voluntad del titular (*Ryanair c. PR Aviation*), y la memoria entregada prometía respetarlo.
+- **Qué se hizo:** ajuste `respetar_robots` desactivado. Se sigue leyendo `robots.txt` para mostrarlo en el progreso y respetar el `Crawl-delay`. Lo que no cambia: nunca se evade un CAPTCHA o un anti-bot (art. 197 bis CP), la frecuencia por dominio está limitada y el User-Agent dice quién es.
+- **Lección:** «público» no equivale a «sin condiciones»; la diferencia entre ignorar una preferencia (`robots.txt`) y saltarse una medida técnica (anti-bot) es la línea legal importante.
+- **Para la memoria:** nota legal (estado del arte §7), §4 (riesgos). Hay que justificar el cambio respecto a la memoria entregada · S01
+
+### 2026-10-19 20:28 · ✅ Avance · Perfiles con IA (H4) e integración del core con la web
+- **Qué pasó:** el configurador descubre el buscador de una tienda nueva y pide a la IA los selectores; el validador los ejecuta antes de aceptarlos; el reparador propone versiones nuevas; el orquestador une navegador, extracción, IA, emparejado y almacén con los modos clásico, auto e IA; la web da de alta tiendas y fija perfiles revisados por una persona. 1464 tests.
+- **Para la memoria:** §5 (flujo real), §6 (H4 y la integración), §4 (revisión humana del perfil) · S01
+
+### 2026-10-19 20:28 · ❌ Fallo · Un perfil generado por IA podía «validar» con datos falsos
+- **Qué pasó:** el revisor demostró que un perfil que lee el precio de «productos relacionados» (12 € en todas las fichas) pasaba la validación 3/3: el precio aparece en la página, así que el anclaje lo daba por bueno. Una prompt injection que llevara a la IA hacia ese bloque produciría un perfil con precios falsos. También contaban como fichas válidas páginas de otra tienda a las que se llegaba por un redirector de afiliados.
+- **Qué se hizo:** el validador exige que el precio de la ficha coincida con el del listado y con el del selector cuando hay JSON-LD, y que la ficha siga en la tienda tras las redirecciones.
+- **Lección:** el anclaje demuestra que un valor está en la página, no que sea el valor correcto; hace falta coherencia entre fuentes. Por eso, además, el perfil no se fija sin revisión humana.
+- **Para la memoria:** §4 (riesgos: prompt injection, datos inventados) · S01
+
+### 2026-10-19 20:30 · 📏 Medida · Primera prueba real: 5 de 5 tiendas bloquean a un cliente automático
+- **Qué pasó:** de las cinco tiendas aprobadas, oscaro.es, ecooparts.com y ovoko.es responden con el desafío de Cloudflare («Just a moment…»), b-parts.com devuelve 405 en su búsqueda (control de bots) y ebay.es, 403. PrecIA lo detecta, para, no evade y no gasta IA (0 llamadas, 0 $).
+- **Causa / contexto:** las grandes tiendas y marketplaces de recambios protegen su catálogo con servicios anti-bot. Ignorar el `robots.txt` (ADR-017) no cambia nada: el freno real es técnico, y saltárselo sería eludir una medida de seguridad.
+- **Qué se hizo:** se documenta como resultado. Siguiente paso: tiendas más pequeñas sin anti-bot y una web pensada para practicar scraping, para validar el configurador con IA de punta a punta.
+- **Lección:** la «tasa de bloqueo» no es una métrica secundaria del banco de evaluación: decide qué tiendas se pueden comparar. Es un argumento para la memoria a favor de las tiendas pequeñas, justo el hueco que dice cubrir PrecIA.
+- **Para la memoria:** Eval (tasa de bloqueo), §1 (hueco: tiendas pequeñas), §4 (riesgos), nota legal · S01
+
+### 2026-10-20 12:16 · ✅ Avance · Scrapers mejorados sin evadir anti-bots: bloqueos de WAF, datos embebidos, APIs de plataforma y descubrimiento del buscador
+- **Qué pasó:** tras la prueba real (5 de 5 tiendas bloquean), se mejora lo que es legítimo. (1) **Detectar mejor**: firmas de 8 WAF y rechazos secos (el 403 de eBay y el 405 de B-Parts ya se identifican como bloqueo). (2) **Leer mejor** lo que la página ya entrega: OpenGraph, microdatos, JSON-LD `ItemList` y JSON embebido de Next.js (`__NEXT_DATA__`). (3) **Plataformas**: detección de WooCommerce, Shopify, PrestaShop y Magento, y lectura de sus APIs públicas de búsqueda (las que usa su propio buscador), con lo que se configura una tienda **sin gastar IA**. (4) **Descubrir el buscador** sin `<form>`: OpenSearch, enlaces, plantillas de la plataforma y, en último caso, una propuesta de la IA validada. De 1464 a 2110 tests.
+- **Línea roja:** nada supera un CAPTCHA, un desafío JS, un WAF ni un login; el User-Agent sigue siendo honesto. Las tiendas con Cloudflare siguen bloqueadas.
+- **Para la memoria:** §5 (flujo real: cascada JSON-LD → metadatos → perfil → IA; perfiles API), §6 (avance), §4 (riesgos), Eval (coste de configuración 0 $ con API) · S01
+
+### 2026-10-20 12:16 · ❌ Fallo · Los detectores de bloqueo daban falsos positivos que habrían dejado fuera tiendas válidas
+- **Qué pasó:** el revisor adversarial encontró que un `robots.txt` normal de una tienda detrás de Imperva (`Disallow: /_Incapsula_Resource`) se tomaba por la página de bloqueo de Incapsula y paraba **todo el dominio**. También se marcaban como bloqueadas fichas buenas con una CSP que nombra a DataDome, con una reseña que cita «Incapsula incident ID» o con un reCAPTCHA en el formulario de contacto (este último fallo ya existía antes).
+- **Qué se hizo:** las señales de producto (JSON-LD, microdatos, OpenGraph, precios) se miran primero: una página con productos y precios nunca es un bloqueo (salvo un 429). La firma de Incapsula exige además un `<script>`.
+- **Lección:** detectar un bloqueo también tiene falsos positivos, y cuestan tanto como los negativos: una tienda descartada por error es una tienda que no se compara. El texto de una reseña lo escribe un tercero y no se puede tratar como una señal fiable.
+- **Para la memoria:** §4 (riesgos), Eval (tasa de bloqueo) · S01
+
+### 2026-10-20 12:16 · ❌ Fallo · Datos de otra web o mal leídos que se daban como de la tienda
+- **Qué pasó:** las revisiones encontraron cinco formas de meter datos falsos con confianza alta. (1) Una API de la tienda que redirige a otra web: su JSON se aceptaba como `OrigenDato.API`, con el dato anclado. (2) En una plantilla de búsqueda propuesta por la IA, o inyectada desde la portada, `https://recambios-{consulta}.es/` pasaba la comprobación de mismo dominio, porque esta sustituía `{consulta}` por «prueba», y cada búsqueda habría ido a otro host. (3) «1.500» se leía como 1,50 € (Shopify sin decimales escribe así 1500 €). (4) Los microdatos de «productos relacionados» daban el precio de una bombilla a un faro. (5) Los «destacados» de `__NEXT_DATA__`, que vienen incluso en la página «sin resultados», se daban como resultados de cualquier búsqueda.
+- **Qué se hizo:** la respuesta tiene que venir de la tienda y con un 2xx; `{consulta}` no puede ir en el esquema ni en el host; un importe ambiguo se descarta (la cascada pasa al perfil o a la IA, que se anclan en el texto visible); se descartan los ámbitos con la URL de otra página; solo cuentan los resultados estructurados que nombran la consulta.
+- **Lección:** que un dato sea «estructurado» no lo hace fiable. Hay que comprobar quién lo sirve, a qué producto pertenece y si responde a la búsqueda. Fiarse de la estructura es otra forma de la prompt injection.
+- **Para la memoria:** §4 (riesgos: datos inventados, SSRF, prompt injection) · S01
+
+### 2026-10-20 12:16 · 💡 Aprendizaje · Una tienda con API pública se configura sin IA
+- **Qué pasó:** si la portada revela WooCommerce o Shopify y su API pública devuelve productos con precio, el configurador crea un perfil `api_*` directamente: 0 llamadas a la IA y sin selectores que se rompan en un rediseño. La IA queda para las tiendas sin plataforma conocida.
+- **Lección:** el uso de la IA tiene que ser el último recurso de una cascada, no el primero: abarata, es más fiable y deja menos superficie a la prompt injection. Conecta con el modo Auto (ADR-002).
+- **Para la memoria:** §5 (arquitectura), Eval (coste por tienda), §4 · S01

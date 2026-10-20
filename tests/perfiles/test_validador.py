@@ -9,9 +9,18 @@ from precia.ia.servicio import SesionIA as SesionReal
 from precia.navegador.navegador import Navegador as NavegadorReal
 from precia.navegador.tipos import Bloqueado, ErrorDescarga, ProhibidoPorRobots, URLNoPermitida
 from precia.perfiles.protocolos import Navegador, SesionIA
-from precia.perfiles.tipos import InformeValidacion, Perfil
+from precia.perfiles.tipos import TIPO_API_SHOPIFY, InformeValidacion, Perfil
 from precia.perfiles.validador import MAX_FICHAS, resumir, url_de_busqueda, validar
 from tests.navegador.falsos import validar_con_dns_publico
+from tests.perfiles.plataformas import (
+    SHOPIFY_API,
+    SHOPIFY_PORTADA,
+    WOO_API,
+    fixture,
+    paginas_shopify,
+    paginas_woo,
+    perfil_api,
+)
 from tests.perfiles.sitio import (
     ANUNCIO,
     BUSQUEDA,
@@ -97,6 +106,9 @@ def test_clave_de_campo_desconocida_invalida() -> None:
         ("https://otra-tienda.es/buscar?q={consulta}", "dominio"),
         ("ftp://www.recambios-prueba.es/buscar?q={consulta}", "dominio"),
         ("https://127.0.0.1/buscar?q={consulta}", "dominio"),
+        # Con «prueba» el host sería el de la tienda; con otra consulta, otra web.
+        ("https://www.recambios-{consulta}.es/buscar", "host"),
+        ("https://recambios-{consulta}.es/?q=faro", "host"),
     ],
 )
 def test_url_de_busqueda_no_valida(plantilla: str, motivo: str) -> None:
@@ -344,3 +356,87 @@ def test_cada_ficha_pasa_por_el_validador_antes_de_descargarse() -> None:
     assert PRODUCTOS[0].url not in navegador.urls
     assert (informe.fichas_ok, informe.fichas_total) == (2, 3)
     assert any("no pública" in p for p in informe.problemas)
+
+
+# --- Perfiles `api_*` (nota 15 §D) --------------------------------------------------------------
+
+
+def test_perfil_api_woocommerce_valida_con_la_api_sin_abrir_fichas() -> None:
+    navegador = NavegadorFalso(paginas_woo())
+    informe = ejecutar(perfil_api(), navegador)
+    assert informe.valido
+    # Tres productos en la respuesta, dos con precio (el tercero es «consultar precio»).
+    assert (informe.resultados, informe.fichas_ok, informe.fichas_total) == (3, 2, 3)
+    assert informe.campos_encontrados["precio"] == 2
+    # Una sola petición, a la API y sin JavaScript: ni la portada ni las fichas.
+    assert navegador.pedidas == [(WOO_API, False)]
+
+
+def test_perfil_api_shopify_lee_la_moneda_de_la_portada() -> None:
+    navegador = NavegadorFalso(paginas_shopify())
+    informe = ejecutar(perfil_api(TIPO_API_SHOPIFY), navegador)
+    assert informe.valido and informe.fichas_ok == 2
+    assert navegador.urls == [SHOPIFY_API, SHOPIFY_PORTADA]
+
+
+def test_perfil_api_shopify_sin_moneda_conocida_no_valida() -> None:
+    # Sin `Shopify.currency` en la portada no se sabe en qué moneda están los precios: mejor
+    # sin perfil API que un precio en libras leído como euros con confianza 1.
+    paginas = paginas_shopify()
+    paginas[SHOPIFY_PORTADA] = "<html><body><h1>Recambios Rápidos</h1></body></html>"
+    informe = ejecutar(perfil_api(TIPO_API_SHOPIFY), NavegadorFalso(paginas))
+    assert not informe.valido
+    assert any("moneda" in p for p in informe.problemas)
+
+
+@pytest.mark.parametrize("respuesta", ["[]", "{}", "no es json", '{"code": "rest_no_route"}'])
+def test_perfil_api_sin_productos_no_valida(respuesta: str) -> None:
+    paginas = paginas_woo()
+    paginas[WOO_API] = respuesta
+    informe = ejecutar(perfil_api(), NavegadorFalso(paginas))
+    assert not informe.valido
+    assert any("API" in p and "productos" in p for p in informe.problemas)
+
+
+def test_perfil_api_que_responde_con_error_no_valida() -> None:
+    informe = ejecutar(perfil_api(), NavegadorFalso({}))
+    assert not informe.valido
+    assert any("404" in p for p in informe.problemas)
+
+
+def test_perfil_api_que_redirige_fuera_no_valida() -> None:
+    fuera = "https://otra-tienda.es/wp-json/wc/store/v1/products?search=faro+golf"
+    paginas = {fuera: fixture("woocommerce_store_api.json")}
+    navegador = NavegadorFalso(paginas, redirecciones={WOO_API: fuera})
+    informe = ejecutar(perfil_api(), navegador)
+    assert not informe.valido
+    assert any("otro dominio" in p for p in informe.problemas)
+
+
+def test_perfil_api_de_otro_dominio_no_descarga_nada() -> None:
+    navegador = NavegadorFalso(paginas_woo())
+    otra = "https://otra-tienda.es/wp-json/wc/store/v1/products?search={consulta}"
+    informe = ejecutar(perfil_api(url_busqueda=otra), navegador)
+    assert not informe.valido
+    assert navegador.pedidas == []
+
+
+def test_selectores_vacios_solo_valen_en_perfiles_api() -> None:
+    navegador = NavegadorFalso(paginas_sitio())
+    informe = ejecutar(perfil(sel_resultado="", sel_titulo=""), navegador)
+    assert not informe.valido
+    assert navegador.pedidas == []
+
+
+def test_tipo_de_perfil_desconocido_no_valida() -> None:
+    navegador = NavegadorFalso(paginas_woo())
+    informe = ejecutar(perfil_api(tipo="api_magento"), navegador)
+    assert not informe.valido
+    assert any("tipo" in p for p in informe.problemas)
+    assert navegador.pedidas == []
+
+
+def test_bloqueo_en_la_api_se_propaga() -> None:
+    navegador = NavegadorFalso(paginas_woo(), errores={WOO_API: Bloqueado(WOO_API, "DataDome")})
+    with pytest.raises(Bloqueado):
+        ejecutar(perfil_api(), navegador)

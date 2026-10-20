@@ -4,11 +4,19 @@ Por cada tienda elegida, en paralelo (la cortesía por dominio la pone el navega
 
 1. Perfil vigente del almacén. Si no hay, en modo Auto o IA lo crea el 🤖 configurador; se
    guarda pendiente de revisión (`revisado=False`) y se usa de forma provisional.
-2. Búsqueda con la URL del perfil y extracción del listado. Si el listado sale vacío pero la
-   página tiene productos con precio (o un selector no es válido), el perfil está roto: en
-   clásico se marca como roto; en Auto o IA el 🤖 reparador propone una versión nueva.
-3. Fichas de los `max_fichas` primeros resultados: JSON-LD → selectores → 🤖 extractor de
-   respaldo (solo si se permite la IA) y anclaje de todo valor.
+2. Búsqueda con la URL del perfil y extracción del listado. Si los selectores no dan nada pero
+   la página trae los resultados como datos (`extraccion.embebidos.listado_estructurado`:
+   JSON-LD `ItemList`, `__NEXT_DATA__`...), se usan los que nombran la consulta (los
+   «destacados» que trae cualquier página no son resultados) con un aviso y el perfil no se da
+   por roto mientras así salgan ofertas con precio (nota 15 §D). Si no, y la página tiene productos
+   con precio (o un selector no es válido), el perfil está roto: en clásico se marca como roto;
+   en Auto o IA el 🤖 reparador propone una versión nueva.
+3. Fichas de los `max_fichas` primeros resultados: JSON-LD → metadatos → selectores → 🤖
+   extractor de respaldo (solo si se permite la IA) y anclaje de todo valor.
+
+Un perfil `api_*` (WooCommerce, Shopify) busca en la API pública de la tienda, sin JavaScript, y
+las ofertas salen directamente de su respuesta (`fuentes.apis.ofertas_api`): no se abre ninguna
+ficha ni hay selectores que reparar. Una respuesta sin productos es «sin resultados».
 
 Después, el emparejado de todas las ofertas (como mucho `max_ofertas`) y el histórico.
 
@@ -38,9 +46,12 @@ from urllib.parse import urlsplit
 from precia.almacen.sqlite import Almacen, ErrorAlmacen
 from precia.emparejado.agrupador import agrupar
 from precia.emparejado.tipos import OfertaCandidata
+from precia.extraccion.anclaje import normalizar
+from precia.extraccion.embebidos import listado_estructurado
 from precia.extraccion.ficha import extraer_ficha
 from precia.extraccion.listado import extraer_listado
 from precia.extraccion.tipos import ExtractorIA, ResultadoListado, SelectorNoValido
+from precia.fuentes.apis import AVISO_AGOTADO
 from precia.ia.extractor import ExtractorRespaldoIA
 from precia.ia.servicio import ServicioIA, SesionIA
 from precia.ia.tipos import ErrorIA
@@ -66,11 +77,18 @@ from precia.nucleo.modelos import (
     ResultadoBusqueda,
     Tienda,
 )
-from precia.perfiles.configurador import configurar, parece_listado
+from precia.perfiles.configurador import configurar
+from precia.perfiles.descubrimiento import MIN_PALABRA, parece_listado
 from precia.perfiles.protocolos import Navegador as NavegadorDePerfiles
 from precia.perfiles.reparador import reparar
 from precia.perfiles.tipos import ConfiguracionFallida, Perfil, ReparacionFallida
-from precia.perfiles.validador import de_la_tienda, url_de_busqueda
+from precia.perfiles.validador import (
+    NOMBRE_PLATAFORMA,
+    PLATAFORMA_DE_TIPO,
+    de_la_tienda,
+    ofertas_de_api,
+    url_de_busqueda,
+)
 
 MAX_FICHAS = 5
 MAX_OFERTAS = 60
@@ -83,6 +101,7 @@ MAX_DETALLE = 300
 PERMITE = "Permite la búsqueda"
 IGNORADO = "Lo prohíbe; se ignora por decisión del usuario (ADR-017)"
 INESPERADO = "Error inesperado: la tienda se salta en esta búsqueda (detalle en el registro)"
+ESTRUCTURADOS = "Selectores sin resultados: se usan los datos estructurados de la página"
 
 registro = logging.getLogger(__name__)
 
@@ -359,6 +378,10 @@ class _EnTienda:
     def con_ia(self) -> bool:
         return self.sesion is not None
 
+    @property
+    def campos(self) -> tuple[str, ...]:
+        return tuple(self.consulta.campos)
+
     def paso(self, nombre: str, estado: EstadoPaso, detalle: str = "") -> None:
         self.pasos.append(Paso(nombre, estado, _recortar(detalle)))
 
@@ -406,18 +429,29 @@ class _EnTienda:
         pagina = await self._buscar(perfil, nuevo)
         if pagina is None:
             return []
+        if perfil.es_api:
+            return await self._de_la_api(perfil, pagina)
         listado = await self._listado(perfil, pagina)
         if listado is None:
             return []
-        perfil, resultados = listado
+        perfil, resultados, estructurado = listado
         if not resultados:
-            self.paso(
-                "extracción",
-                EstadoPaso.AVISO,
-                f"Sin resultados para «{self.consulta.texto}» en esta tienda",
-            )
+            self._sin_resultados()
             return []
-        return await self._fichas(perfil, resultados)
+        candidatas = await self._fichas(perfil, resultados)
+        if not estructurado or self.bloqueado or any(_valida(c) for c in candidatas):
+            return candidatas
+        # Los datos estructurados no han dado ninguna oferta con precio: el perfil sigue roto.
+        roto = await self._perfil_roto(perfil, pagina, "")
+        if roto is None:
+            return candidatas
+        perfil, resultados = roto
+        return await self._fichas(perfil, resultados) if resultados else candidatas
+
+    def _sin_resultados(self, donde: str = "en esta tienda") -> None:
+        self.paso(
+            "extracción", EstadoPaso.AVISO, f"Sin resultados para «{self.consulta.texto}» {donde}"
+        )
 
     # --- Perfil -----------------------------------------------------------------------------
 
@@ -461,12 +495,22 @@ class _EnTienda:
             return None
         guardado = self.o._almacen.guardar_perfil(perfil)
         self.estado = EstadoPerfil.PENDIENTE_REVISION
-        self.paso(
-            "perfil",
-            EstadoPaso.IA,
-            f"🤖 Configurador: perfil nuevo v{guardado.version}, pendiente de revisión "
-            "(se usa de forma provisional)",
-        )
+        if guardado.es_api:
+            # Sin IA: el perfil sale de la API pública de la plataforma (coste 0).
+            nombre = NOMBRE_PLATAFORMA[PLATAFORMA_DE_TIPO[guardado.tipo]]
+            self.paso(
+                "perfil",
+                EstadoPaso.AVISO,
+                f"Configurador: perfil nuevo v{guardado.version} con la API pública de {nombre}, "
+                "sin IA; pendiente de revisión (se usa de forma provisional)",
+            )
+        else:
+            self.paso(
+                "perfil",
+                EstadoPaso.IA,
+                f"🤖 Configurador: perfil nuevo v{guardado.version}, pendiente de revisión "
+                "(se usa de forma provisional)",
+            )
         return guardado
 
     def _paso_perfil(self, perfil: Perfil) -> None:
@@ -487,7 +531,9 @@ class _EnTienda:
         self.visitada = True
         try:
             url = await self.o._validador(url_de_busqueda(perfil.url_busqueda, self.consulta.texto))
-            pagina = await self.o._navegador.obtener(url, js=perfil.necesita_js)
+            # Una API devuelve JSON: Chromium no pinta nada ahí.
+            js = perfil.necesita_js and not perfil.es_api
+            pagina = await self.o._navegador.obtener(url, js=js)
         except (ErrorDescarga, URLNoPermitida, Bloqueado) as error:
             # Si el robots.txt lo prohíbe, la tienda sale solo como omitida (sin el perfil).
             if not nuevo:
@@ -514,7 +560,9 @@ class _EnTienda:
             self.paso("búsqueda", EstadoPaso.ERROR, "La búsqueda redirige fuera de la tienda")
             return None
         detalle = "Resultados descargados"
-        if perfil.necesita_js:
+        if perfil.es_api:
+            detalle += " de la API pública de la tienda"
+        elif perfil.necesita_js:
             detalle += " con Chromium"
         if pagina.desde_cache:
             detalle += " (caché)"
@@ -523,18 +571,41 @@ class _EnTienda:
 
     async def _listado(
         self, perfil: Perfil, pagina: Pagina
-    ) -> tuple[Perfil, list[ResultadoListado]] | None:
-        """El listado con el perfil (reparado si hace falta), o `None` si está roto."""
+    ) -> tuple[Perfil, list[ResultadoListado], bool] | None:
+        """El listado con el perfil (reparado si hace falta), o `None` si está roto.
+
+        El tercer valor dice si los resultados salen de los datos estructurados de la página y
+        no de los selectores: entonces aún hay que ver si dan ofertas válidas.
+        """
         self.fase = "perfil"
-        motivo = ""
         try:
             resultados = extraer_listado(pagina, perfil)
         except SelectorNoValido as error:
-            motivo = f"selector no válido: {error}"
-            resultados = []
+            # Un selector fuera del subconjunto es un perfil roto aunque haya datos estructurados.
+            roto = await self._perfil_roto(perfil, pagina, f"selector no válido: {error}")
+            return None if roto is None else (*roto, False)
         if resultados:
             self.estado = self.estado or estado_de(perfil)
-            return perfil, resultados
+            return perfil, resultados, False
+        estructurados = _de_la_consulta(
+            listado_estructurado(pagina, self.dominio), self.consulta.texto
+        )
+        if estructurados:
+            self.paso("perfil", EstadoPaso.AVISO, ESTRUCTURADOS)
+            self.estado = self.estado or estado_de(perfil)
+            return perfil, estructurados, True
+        roto = await self._perfil_roto(perfil, pagina, "")
+        return None if roto is None else (*roto, False)
+
+    async def _perfil_roto(
+        self, perfil: Perfil, pagina: Pagina, motivo: str
+    ) -> tuple[Perfil, list[ResultadoListado]] | None:
+        """Listado vacío con el perfil: sin resultados de verdad, reparado o `None` (roto).
+
+        Sin `motivo` (no hay un selector inválido), solo está roto si la página tiene productos
+        con precio.
+        """
+        self.fase = "perfil"
         if not motivo:
             # Una página sin productos con precio no es un perfil roto: la tienda no tiene lo
             # buscado. Así tampoco se gasta una llamada al reparador cada vez que pasa (ni si
@@ -592,6 +663,40 @@ class _EnTienda:
         )
         return guardado
 
+    # --- API pública ------------------------------------------------------------------------
+
+    async def _de_la_api(self, perfil: Perfil, pagina: Pagina) -> list[OfertaCandidata]:
+        """Ofertas de la respuesta de la API de un perfil `api_*`, sin abrir ninguna ficha."""
+        self.fase = "extracción"
+        self.estado = self.estado or estado_de(perfil)
+        fichas = await ofertas_de_api(
+            perfil,
+            pagina,
+            self.o._navegador,
+            self.campos,
+            validador=self.o._validador,
+            maximo=self.o._max_fichas,
+        )
+        if not fichas:
+            self._sin_resultados("en la API de esta tienda")
+            return []
+        nombre = NOMBRE_PLATAFORMA[PLATAFORMA_DE_TIPO[perfil.tipo]]
+        sin_precio = sum(f.precio is None for f in fichas)
+        detalle = f"{len(fichas)} productos de la API pública de {nombre}, sin abrir cada ficha"
+        if sin_precio:
+            detalle += f" · {sin_precio} sin precio"
+        self.paso("extracción", EstadoPaso.AVISO if sin_precio else EstadoPaso.OK, detalle)
+        avisos = [a for f in fichas for a in f.avisos if a != AVISO_AGOTADO]
+        self.paso(
+            *self._paso_verificacion(0, avisos)
+            if avisos
+            else ("verificación", EstadoPaso.OK, "Datos de la propia tienda (su API pública)")
+        )
+        return [
+            OfertaCandidata(self.dominio, f, f.url, disponible=AVISO_AGOTADO not in f.avisos)
+            for f in fichas
+        ]
+
     # --- Fichas -----------------------------------------------------------------------------
 
     async def _fichas(
@@ -620,9 +725,7 @@ class _EnTienda:
                 continue
             # Si la IA ha fallado en una ficha anterior, la tienda sigue sin IA.
             extractor = vigilado if vigilado is not None and vigilado.error is None else None
-            ficha = await extraer_ficha(
-                pagina, self.consulta.campos, perfil=perfil, extractor_ia=extractor
-            )
+            ficha = await extraer_ficha(pagina, self.campos, perfil=perfil, extractor_ia=extractor)
             con_ia += any(v.origen is OrigenDato.IA for v in ficha.campos.values())
             no_anclados += sum(not v.anclado for v in ficha.campos.values())
             sin_precio += ficha.precio is None
@@ -689,3 +792,31 @@ class _EnTienda:
             )
         except ErrorAlmacen as error:
             self.paso("tienda", EstadoPaso.AVISO, f"No se pudo actualizar la tienda: {error}")
+
+
+def _de_la_consulta(
+    resultados: Sequence[ResultadoListado], consulta: str
+) -> list[ResultadoListado]:
+    """Los resultados de los datos estructurados que mencionan la consulta.
+
+    El JSON embebido de una página sin resultados suele traer igualmente productos (los
+    «destacados» o «más vendidos» del diseño de la tienda), con título, enlace y precio: si se
+    usaran, cada búsqueda sin resultados abriría fichas de otras piezas y las daría como
+    ofertas. Por eso cada resultado tiene que nombrar alguna palabra de la consulta (como en
+    `parece_listado`) en su título o en la ruta de su enlace, que suele llevar el nombre o la
+    referencia. Solo comparaciones de subcadenas: los títulos y rutas ya vienen recortados.
+    """
+    palabras = [p for p in normalizar(consulta).split() if len(p) >= MIN_PALABRA]
+    if not palabras:
+        return list(resultados)
+    relacionados: list[ResultadoListado] = []
+    for resultado in resultados:
+        texto = normalizar(f"{resultado.titulo} {urlsplit(resultado.url).path}")
+        if any(palabra in texto for palabra in palabras):
+            relacionados.append(resultado)
+    return relacionados
+
+
+def _valida(candidata: OfertaCandidata) -> bool:
+    """Oferta con un precio leído y anclado en la página (el único que cuenta como precio)."""
+    return candidata.ficha.precio is not None

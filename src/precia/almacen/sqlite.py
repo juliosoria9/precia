@@ -37,7 +37,7 @@ from precia.nucleo.modelos import (
     ValorCampo,
     VersionPerfil,
 )
-from precia.perfiles.tipos import Perfil
+from precia.perfiles.tipos import TIPO_HTML, TIPOS_PERFIL, Perfil
 
 MIGRACIONES: tuple[str, ...] = (
     """
@@ -133,6 +133,12 @@ MIGRACIONES: tuple[str, ...] = (
     ALTER TABLE precios ADD COLUMN disponible INTEGER NOT NULL DEFAULT 1
         CHECK (disponible IN (0, 1));
     ALTER TABLE productos ADD COLUMN criterio TEXT NOT NULL DEFAULT '';
+    """,
+    # 3: tipo de perfil (nota 15 §D). Los perfiles anteriores leían HTML con selectores; los
+    # `api_*` leen la API pública de la plataforma de la tienda y pueden no tener selectores.
+    """
+    ALTER TABLE perfiles ADD COLUMN tipo TEXT NOT NULL DEFAULT 'html'
+        CHECK (tipo IN ('html', 'api_woocommerce', 'api_shopify'));
     """,
 )
 
@@ -428,7 +434,7 @@ class Almacen:
             con.execute(
                 "INSERT INTO perfiles (dominio, version, url_busqueda, sel_resultado, sel_titulo,"
                 " sel_enlace, sel_precio_listado, sel_campos, necesita_js, autor, revisado,"
-                " creado, nota) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " creado, nota, tipo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     guardado.dominio,
                     guardado.version,
@@ -443,6 +449,7 @@ class Almacen:
                     int(guardado.revisado),
                     guardado.creado.isoformat(),
                     guardado.nota,
+                    guardado.tipo,
                 ),
             )
         return guardado
@@ -833,11 +840,16 @@ def _decodificar_campos(texto: str) -> dict[str, ValorCampo]:
 
 
 def _validar_perfil(perfil: Perfil) -> None:
+    if not isinstance(perfil.tipo, str) or perfil.tipo not in TIPOS_PERFIL:
+        raise DatoNoValido(f"tipo: se espera uno de {', '.join(TIPOS_PERFIL)}")
     _texto(perfil.dominio, "dominio", MAX_DOMINIO)
     _texto(perfil.url_busqueda, "url_busqueda", MAX_URL)
-    _texto(perfil.sel_resultado, "sel_resultado", MAX_SELECTOR)
-    _texto(perfil.sel_titulo, "sel_titulo", MAX_SELECTOR)
-    _texto(perfil.sel_enlace, "sel_enlace", MAX_SELECTOR)
+    # Un perfil `api_*` no lee HTML: sus selectores pueden ir vacíos. Uno `html` sin selectores
+    # no encontraría nunca nada.
+    sin_selectores = perfil.es_api
+    _texto(perfil.sel_resultado, "sel_resultado", MAX_SELECTOR, vacio=sin_selectores)
+    _texto(perfil.sel_titulo, "sel_titulo", MAX_SELECTOR, vacio=sin_selectores)
+    _texto(perfil.sel_enlace, "sel_enlace", MAX_SELECTOR, vacio=sin_selectores)
     if perfil.sel_precio_listado is not None:
         _texto(perfil.sel_precio_listado, "sel_precio_listado", MAX_SELECTOR)
     if not isinstance(perfil.sel_campos, dict):
@@ -873,15 +885,23 @@ def _perfil(fila: sqlite3.Row) -> Perfil:
         revisado=bool(fila["revisado"]),
         creado=datetime.fromisoformat(fila["creado"]),
         nota=fila["nota"],
+        tipo=fila["tipo"],
     )
 
 
 def _version_perfil(perfil: Perfil) -> VersionPerfil:
-    selectores = {
-        "resultado": perfil.sel_resultado,
-        "titulo": perfil.sel_titulo,
-        "enlace": perfil.sel_enlace,
-    }
+    # La web enseña estos pares a quien revisa el perfil: en uno `api_*` lo que hay que revisar
+    # es el tipo (y la URL de la API), no unos selectores vacíos.
+    selectores: dict[str, str] = {}
+    if perfil.tipo != TIPO_HTML:
+        selectores["tipo"] = perfil.tipo
+    for nombre, selector in (
+        ("resultado", perfil.sel_resultado),
+        ("titulo", perfil.sel_titulo),
+        ("enlace", perfil.sel_enlace),
+    ):
+        if selector or not perfil.es_api:
+            selectores[nombre] = selector
     if perfil.sel_precio_listado is not None:
         selectores["precio_listado"] = perfil.sel_precio_listado
     selectores.update(perfil.sel_campos)
