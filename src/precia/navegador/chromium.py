@@ -16,15 +16,33 @@ un SSRF:
 - Los service workers se bloquean (sus peticiones no pasarían por `route`) y los WebSocket se
   cierran sin conectar.
 - Un contexto nuevo por descarga: sin cookies ni almacenamiento entre páginas.
+
+Con un `Proxy` (`navegador.proxy`), Chromium arranca contra un relé local sin credenciales
+(`navegador.rele`), que reenvía cada túnel al proxy añadiendo `Proxy-Authorization`: a Playwright
+nunca se le dan el usuario ni la contraseña, porque los usaría para contestar a cualquier `401
+Basic` de un destino. Todo lo que pide la página, también `route.fetch`, sale por el relé. El
+User-Agent sigue siendo el honesto y no hay ningún añadido para disimular que es un navegador
+automático.
+
+Si la tienda corta la conexión de la navegación principal sin responder (un `ECONNRESET`, como
+algunos WAF con las IP de centros de datos), se lanza `ConexionCortada`: con proxy, cuenta como
+bloqueo (`navegador.con_proxy`).
 """
 
 import asyncio
 import contextlib
+import re
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, Protocol
 from urllib.parse import urljoin
 
-from playwright.async_api import Browser, Playwright, WebSocketRoute, async_playwright
+from playwright.async_api import (
+    Browser,
+    Playwright,
+    WebSocketRoute,
+    async_playwright,
+)
 from playwright.async_api import Error as ErrorPlaywright
 from playwright.async_api import TimeoutError as TiempoPlaywright
 
@@ -34,11 +52,19 @@ from precia.navegador.http import (
     REDIRECCIONES,
     TIPOS_ADMITIDOS,
 )
-from precia.navegador.tipos import ErrorDescarga, Pagina, URLNoPermitida
+from precia.navegador.proxy import Proxy
+from precia.navegador.rele import ReleProxy
+from precia.navegador.tipos import ConexionCortada, ErrorDescarga, Pagina, URLNoPermitida
 from precia.navegador.url import Validador, validar_url
 
 RECURSOS_BLOQUEADOS = frozenset({"image", "font", "media"})
 ESPERA_RED_S = 2.0
+_CORTE = re.compile(
+    r"ECONNRESET|ECONNABORTED|socket hang up|ERR_CONNECTION_(?:RESET|CLOSED|ABORTED)"
+    r"|ERR_EMPTY_RESPONSE"
+)
+"""Cómo cuenta Playwright que la tienda cortó la conexión: el error de Node en `route.fetch`
+(«read ECONNRESET», «socket hang up») o el de red de Chromium («net::ERR_CONNECTION_RESET»)."""
 
 
 class _Marco(Protocol):
@@ -91,6 +117,8 @@ class FiltroPeticiones:
         """Por qué se abortó la navegación principal (para dar el error correcto)."""
         self.redireccion: str | None = None
         """Destino ya validado de una redirección de la navegación principal."""
+        self.fallo_principal: str | None = None
+        """Error de red de la navegación principal (para reconocer un corte de la conexión)."""
 
     async def __call__(self, ruta: _Ruta) -> None:
         peticion = ruta.request
@@ -102,7 +130,7 @@ class FiltroPeticiones:
             await ruta.abort("blockedbyclient")
             return
         actual = peticion.url
-        respuesta = await _pedir_sin_redirecciones(ruta, None)
+        respuesta = await self._pedir(ruta, None, principal)
         for salto in range(MAXIMO_REDIRECCIONES + 1):
             if respuesta is None:
                 break
@@ -121,8 +149,16 @@ class FiltroPeticiones:
                 await ruta.abort("aborted")
                 return
             actual = siguiente
-            respuesta = await _pedir_sin_redirecciones(ruta, actual)
+            respuesta = await self._pedir(ruta, actual, principal)
         await ruta.abort("failed")  # error de red o demasiadas redirecciones
+
+    async def _pedir(self, ruta: _Ruta, url: str | None, principal: bool) -> _Respuesta | None:
+        try:
+            return await ruta.fetch(url=url, max_redirects=0)
+        except ErrorPlaywright as error:
+            if principal:
+                self.fallo_principal = error.message
+            return None
 
     async def _validar(self, url: str, principal: bool) -> str | None:
         try:
@@ -133,11 +169,8 @@ class FiltroPeticiones:
             return None
 
 
-async def _pedir_sin_redirecciones(ruta: _Ruta, url: str | None) -> _Respuesta | None:
-    try:
-        return await ruta.fetch(url=url, max_redirects=0)
-    except ErrorPlaywright:
-        return None
+def _es_corte(mensaje: str | None) -> bool:
+    return mensaje is not None and _CORTE.search(mensaje) is not None
 
 
 def _es_navegacion_principal(peticion: _Peticion) -> bool:
@@ -158,8 +191,14 @@ class DescargadorChromium:
         max_bytes: int = MAXIMO_BYTES,
         validador: Validador = validar_url,
         espera_red_s: float = ESPERA_RED_S,
+        proxy: Proxy | None = None,
+        crear_rele: Callable[[Proxy], ReleProxy] = ReleProxy,
     ) -> None:
+        """`crear_rele` solo se cambia en los tests (el proxy falso está en 127.0.0.1)."""
         self._user_agent = user_agent
+        self._proxy = proxy
+        self._crear_rele = crear_rele
+        self._rele: ReleProxy | None = None
         self._timeout_ms = timeout * 1000
         self._max_bytes = max_bytes
         self._validador = validador
@@ -167,6 +206,10 @@ class DescargadorChromium:
         self._playwright: Playwright | None = None
         self._navegador: Browser | None = None
         self._candado = asyncio.Lock()
+
+    @property
+    def proxy(self) -> Proxy | None:
+        return self._proxy
 
     async def descargar(self, url: str) -> Pagina:
         url = await self._validador(url)
@@ -193,6 +236,8 @@ class DescargadorChromium:
                     if filtro.bloqueo_principal is not None:
                         raise filtro.bloqueo_principal from error
                     if filtro.redireccion is None:
+                        if _es_corte(filtro.fallo_principal) or _es_corte(error.message):
+                            raise ConexionCortada("La tienda cortó la conexión.") from error
                         raise ErrorDescarga("Chromium no pudo cargar la página.") from error
                     actual = filtro.redireccion
             else:
@@ -237,16 +282,33 @@ class DescargadorChromium:
             if self._playwright is not None:
                 await self._playwright.stop()
                 self._playwright = None
+            await self._cerrar_rele()
+
+    async def _cerrar_rele(self) -> None:
+        rele, self._rele = self._rele, None
+        if rele is not None:
+            await rele.cerrar()
 
     async def _abrir(self) -> Browser:
         async with self._candado:
             if self._navegador is None:
                 self._playwright = await async_playwright().start()
                 try:
-                    self._navegador = await self._playwright.chromium.launch(headless=True)
-                except ErrorPlaywright as error:
+                    if self._proxy is None:
+                        self._navegador = await self._playwright.chromium.launch(headless=True)
+                    else:
+                        self._rele = self._crear_rele(self._proxy)
+                        servidor = await self._rele.abrir()
+                        # Solo la dirección del relé: ni usuario ni contraseña (ver arriba).
+                        self._navegador = await self._playwright.chromium.launch(
+                            headless=True, proxy={"server": servidor}
+                        )
+                except (ErrorPlaywright, OSError) as error:
                     await self._playwright.stop()
                     self._playwright = None
+                    await self._cerrar_rele()
+                    if isinstance(error, OSError):
+                        raise ErrorDescarga("No se pudo abrir el relé local del proxy.") from error
                     primera_linea = error.message.splitlines()[0] if error.message else ""
                     raise ErrorDescarga(f"No se pudo arrancar Chromium: {primera_linea}") from error
             return self._navegador

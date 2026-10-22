@@ -16,6 +16,8 @@ class Pagina:
     tipo_contenido: str
     obtenida: datetime
     desde_cache: bool = False
+    via_proxy: bool = False
+    """Llegó por el proxy de salida (`navegador.con_proxy`): para enseñarlo en el progreso."""
 
 
 class ErrorNavegador(Exception):
@@ -31,7 +33,11 @@ class ProhibidoPorRobots(ErrorNavegador):
 
 
 class Bloqueado(ErrorNavegador):
-    """La web responde con un CAPTCHA o un bloqueo anti-bot. Nunca se intenta evadir."""
+    """La web responde con un CAPTCHA o un bloqueo anti-bot. Nunca se intenta resolver.
+
+    Con un proxy configurado, antes de llegar aquí ya se ha repetido una vez desde otra IP
+    (`navegador.con_proxy`): si también se bloquea, la tienda se para.
+    """
 
     def __init__(self, url: str, motivo: str) -> None:
         super().__init__(f"Bloqueo en {url}: {motivo}")
@@ -41,6 +47,11 @@ class Bloqueado(ErrorNavegador):
 
 class ErrorDescarga(ErrorNavegador):
     """Red, tiempo de espera, tamaño excesivo o contenido que no es HTML."""
+
+
+class ConexionCortada(ErrorDescarga):
+    """La tienda cortó la conexión sin responder (`ECONNRESET`), como hacen algunos WAF con las IP
+    de centros de datos. Con un proxy, cuenta como bloqueo (`navegador.con_proxy`)."""
 
 
 class Descargador(Protocol):

@@ -649,6 +649,9 @@ class _EnTienda:
             detalle += " de la API pública de la tienda"
         elif perfil.necesita_js:
             detalle += " con Chromium"
+        if pagina.via_proxy:
+            # La tienda bloqueó la conexión directa (o el modo es «siempre»): se enseña.
+            detalle += " por el proxy"
         if pagina.desde_cache:
             detalle += " (caché)"
         self.paso("búsqueda", EstadoPaso.OK, detalle)

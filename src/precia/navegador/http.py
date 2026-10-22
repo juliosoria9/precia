@@ -13,6 +13,10 @@ Defensas, porque todo lo que manda la web es no confiable:
 - El cuerpo se lee por trozos con un tope de bytes y de tiempo total, y solo se acepta HTML o texto
   y, para las APIs públicas de plataforma y el descriptor OpenSearch (nota 15), JSON o XML, con el
   mismo límite de bytes. Esos datos llegan tal cual en `Pagina.html`: no se interpretan aquí.
+- Con un `Proxy` configurado (`navegador.proxy`), toda petición, http o https, va por un túnel
+  `CONNECT` al proxy. TLS se negocia dentro del túnel con la tienda y se verifica contra el nombre
+  de la tienda (SNI y certificado), no contra el del proxy. Si el proxy está en la red local, el
+  túnel va a la IP de la tienda ya validada, no a su nombre (contra el *DNS rebinding*, `_Salida`).
 """
 
 import asyncio
@@ -35,6 +39,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 from urllib.parse import urljoin, urlsplit
 
+from precia.navegador.proxy import Proxy
 from precia.navegador.tipos import ErrorDescarga, Pagina, URLNoPermitida
 from precia.navegador.url import IP, Validador, ip_publica, validar_url
 
@@ -79,6 +84,8 @@ REDIRECCIONES = frozenset({301, 302, 303, 307, 308})
 # para colar XSS): con ellos se decodifica como UTF-8.
 _CODECS_VETADOS = frozenset({"utf-7", "unicode-escape", "raw-unicode-escape", "idna", "punycode"})
 _META_CHARSET = re.compile(rb"""<meta[^>]*?charset\s*=\s*["']?\s*([a-zA-Z0-9_.:-]+)""", re.I)
+# Lo que lanza `http.client` cuando el proxy no contesta 200 al `CONNECT`.
+_TUNEL_FALLIDO = re.compile(r"Tunnel connection failed: (\d{3})")
 # Declaración XML (`<?xml version="1.0" encoding="..."?>`): solo vale al principio del documento,
 # así que se busca con `match` y acotada; los cuantificadores son acotados o posesivos.
 _DECLARACION_XML = re.compile(
@@ -130,6 +137,10 @@ class DescargadorHTTP:
             "Accept-Language": "es-ES,es;q=0.9,en;q=0.5",
             "Accept-Encoding": "identity",
         }
+
+    @property
+    def transporte(self) -> Transporte:
+        return self._transporte
 
     async def descargar(self, url: str) -> Pagina:
         return await self._descargar(url, self._max_bytes, self._timeout)
@@ -321,9 +332,31 @@ def _descomprimir_capa(datos: bytes, max_bytes: int) -> bytes:
         posicion -= len(descompresor.unused_data)
 
 
+Resolver = Callable[..., Sequence[tuple[Any, ...]]]
+"""`socket.getaddrinfo` (o un doble en los tests)."""
+
+
+def ips_permitidas(
+    host: str, puerto: int, *, resolver: Resolver, ip_permitida: Callable[[IP], bool]
+) -> list[IP]:
+    """Las IP de `host`, si **todas** están permitidas. Si no, `URLNoPermitida`."""
+    ips: list[IP] = []
+    for info in resolver(host, puerto, type=socket.SOCK_STREAM):
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError as error:
+            raise URLNoPermitida("El DNS devolvió una dirección no válida.") from error
+        if not ip_permitida(ip):
+            raise URLNoPermitida("El servidor resuelve a una dirección IP no pública.")
+        ips.append(ip)
+    if not ips:
+        raise URLNoPermitida("No se puede resolver el nombre del servidor.")
+    return ips
+
+
 def conexion_validada(
     *,
-    resolver: Callable[..., Sequence[tuple[Any, ...]]] = socket.getaddrinfo,
+    resolver: Resolver = socket.getaddrinfo,
     conectar: CrearSocket = socket.create_connection,
     ip_permitida: Callable[[IP], bool] = ip_publica,
 ) -> CrearSocket:
@@ -333,17 +366,7 @@ def conexion_validada(
         direccion: tuple[str, int], timeout: object = None, origen: object = None
     ) -> socket.socket:
         host, puerto = direccion
-        ips: list[IP] = []
-        for info in resolver(host, puerto, type=socket.SOCK_STREAM):
-            try:
-                ip = ipaddress.ip_address(info[4][0])
-            except ValueError as error:
-                raise URLNoPermitida("El DNS devolvió una dirección no válida.") from error
-            if not ip_permitida(ip):
-                raise URLNoPermitida("El servidor resuelve a una dirección IP no pública.")
-            ips.append(ip)
-        if not ips:
-            raise URLNoPermitida("No se puede resolver el nombre del servidor.")
+        ips = ips_permitidas(host, puerto, resolver=resolver, ip_permitida=ip_permitida)
         error_final: OSError | None = None
         for ip in ips:
             try:
@@ -356,12 +379,101 @@ def conexion_validada(
     return crear
 
 
+class _FalloProxy(OSError):
+    """No se pudo abrir la conexión TCP con el proxy (para dar el mensaje correcto)."""
+
+
+class _ProxyNoHTTP(OSError):
+    """El proxy contestó al `CONNECT` algo que no es HTTP (otro servicio, el puerto SOCKS5...).
+
+    Es un `OSError` para que `urllib` lo envuelva en `URLError` como al resto de fallos del túnel.
+    """
+
+
+def _conectar_al_proxy(
+    direccion: tuple[str, int], timeout: object = None, origen: object = None
+) -> socket.socket:
+    """Conexión al proxy, sin la comprobación de IP pública que se hace con las tiendas.
+
+    El proxy lo configura el usuario en `.env` (no viene de la web), así que puede estar en la
+    red local o en este equipo. Lo que se protege es el **destino** del túnel (`_Salida`).
+    """
+    try:
+        return socket.create_connection(direccion, timeout, origen)  # type: ignore[arg-type]
+    except OSError as error:
+        raise _FalloProxy("No se pudo conectar con el proxy.") from error
+
+
+def _cabeceras_tunel(proxy: Proxy) -> dict[str, str]:
+    # Solo van en el CONNECT, que lee el proxy: la tienda nunca ve la autorización.
+    autorizacion = proxy.cabecera_autorizacion
+    return {"Proxy-Authorization": autorizacion} if autorizacion else {}
+
+
+@dataclass(frozen=True, slots=True)
+class _Salida:
+    """Cómo se pide el túnel por el proxy, contra el SSRF por *DNS rebinding*.
+
+    La URL de la tienda ya pasó `validar_url`, que resolvió el nombre **antes** de la petición.
+    Si el `CONNECT` lleva el nombre, el proxy lo vuelve a resolver y esa IP no la comprueba nadie:
+
+    - con un proxy remoto (IP pública, como Evomi), lo resuelve un equipo que no ve la red local
+      de este; el `CONNECT` lleva el nombre, como espera el proveedor;
+    - con un proxy de la red local o de este equipo (un Squid propio), una tienda con *rebinding*
+      (TTL 0: primero una IP pública y luego 192.168.1.1) llegaría a la red interna a través de
+      él. Por eso el nombre se resuelve aquí, se valida como en la conexión directa y el
+      `CONNECT` va a esa IP. `Host`, SNI y certificado siguen siendo los del nombre.
+    """
+
+    proxy: Proxy
+    resolver: Resolver
+    ip_permitida: Callable[[IP], bool]
+    proxy_remoto: Callable[[IP], bool]
+
+    def preparar(self, conexion: http.client.HTTPConnection) -> None:
+        """Justo antes del `CONNECT`, con la conexión al proxy ya abierta."""
+        sock = conexion.sock
+        assert sock is not None
+        ip_proxy = ipaddress.ip_address(sock.getpeername()[0])
+        if self.proxy_remoto(ip_proxy):
+            return
+        host: str = conexion._tunnel_host  # type: ignore[attr-defined]
+        puerto: int = conexion._tunnel_port  # type: ignore[attr-defined]
+        ip = ips_permitidas(host, puerto, resolver=self.resolver, ip_permitida=self.ip_permitida)[0]
+        direccion = f"[{ip}]" if ip.version == 6 else str(ip)
+        conexion._tunnel_host = str(ip)  # type: ignore[attr-defined]
+        conexion._tunnel_headers["Host"] = f"{direccion}:{puerto}"  # type: ignore[attr-defined]
+
+
+def _abrir_tunel(
+    conexion: http.client.HTTPConnection, salida: _Salida | None, abrir: Callable[[], None]
+) -> None:
+    if salida is not None:
+        salida.preparar(conexion)
+    try:
+        abrir()
+    except http.client.HTTPException as error:
+        # `BadStatusLine`, demasiadas cabeceras...: lo que contestó no es un proxy HTTP.
+        raise _ProxyNoHTTP("El proxy no respondió como un proxy HTTP.") from error
+
+
 class _ConexionHTTP(http.client.HTTPConnection):
-    def __init__(self, host: str, *, corte: "_Corte", **opciones: Any) -> None:
-        super().__init__(host, **opciones)
+    def __init__(
+        self, host: str, *, corte: "_Corte", salida: _Salida | None = None, **opciones: Any
+    ) -> None:
+        if salida is None:
+            super().__init__(host, **opciones)
+        else:
+            # Se conecta al proxy y se le pide un túnel hasta `host` (con su puerto, si lo lleva).
+            super().__init__(salida.proxy.host, salida.proxy.puerto, **opciones)
+            self.set_tunnel(host, headers=_cabeceras_tunel(salida.proxy))
+        self._salida = salida
         self._create_connection = corte.crear_socket
         self._corte = corte
         corte.registrar(self)
+
+    def _tunnel(self) -> None:
+        _abrir_tunel(self, self._salida, super()._tunnel)  # type: ignore[misc]
 
     def close(self) -> None:
         # Antes de soltar el descriptor: así el corte no puede caer sobre un socket ya reutilizado.
@@ -370,11 +482,40 @@ class _ConexionHTTP(http.client.HTTPConnection):
 
 
 class _ConexionHTTPS(http.client.HTTPSConnection):
-    def __init__(self, host: str, *, corte: "_Corte", **opciones: Any) -> None:
-        super().__init__(host, **opciones)
+    def __init__(
+        self,
+        host: str,
+        *,
+        corte: "_Corte",
+        salida: _Salida | None = None,
+        context: ssl.SSLContext | None = None,
+        **opciones: Any,
+    ) -> None:
+        self._contexto = context or ssl.create_default_context()
+        if salida is None:
+            super().__init__(host, context=self._contexto, **opciones)
+            self._nombre_tls = self.host
+        else:
+            super().__init__(
+                salida.proxy.host, salida.proxy.puerto, context=self._contexto, **opciones
+            )
+            self.set_tunnel(host, headers=_cabeceras_tunel(salida.proxy))
+            # Antes de que `_Salida` cambie el destino del túnel por la IP: TLS va con el nombre.
+            self._nombre_tls = self._tunnel_host  # type: ignore[attr-defined]
+        self._salida = salida
         self._create_connection = corte.crear_socket
         self._corte = corte
         corte.registrar(self)
+
+    def connect(self) -> None:
+        # Como `HTTPSConnection.connect`, pero el certificado y el SNI son siempre los del nombre
+        # de la tienda, aunque el túnel vaya a su IP (y nunca los del proxy).
+        http.client.HTTPConnection.connect(self)
+        assert self.sock is not None
+        self.sock = self._contexto.wrap_socket(self.sock, server_hostname=self._nombre_tls)
+
+    def _tunnel(self) -> None:
+        _abrir_tunel(self, self._salida, super()._tunnel)  # type: ignore[misc]
 
     def close(self) -> None:
         self._corte.terminar()
@@ -382,46 +523,68 @@ class _ConexionHTTPS(http.client.HTTPSConnection):
 
 
 class _ManejadorHTTP(urllib.request.HTTPHandler):
-    def __init__(self, corte: "_Corte") -> None:
+    def __init__(self, corte: "_Corte", salida: _Salida | None = None) -> None:
         super().__init__()
-        self._conexion = functools.partial(_ConexionHTTP, corte=corte)
+        self._conexion = functools.partial(_ConexionHTTP, corte=corte, salida=salida)
 
     def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
         return self.do_open(self._conexion, req)
 
 
 class _ManejadorHTTPS(urllib.request.HTTPSHandler):
-    def __init__(self, corte: "_Corte", contexto: ssl.SSLContext) -> None:
+    def __init__(
+        self, corte: "_Corte", contexto: ssl.SSLContext, salida: _Salida | None = None
+    ) -> None:
         self._contexto = contexto
         super().__init__(context=self._contexto)
-        self._conexion = functools.partial(_ConexionHTTPS, corte=corte)
+        self._conexion = functools.partial(_ConexionHTTPS, corte=corte, salida=salida)
 
     def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
         return self.do_open(self._conexion, req, context=self._contexto)
 
 
 class TransporteURLLib:
-    """Transporte real. Solo maneja http y https: ni redirecciones, ni proxies, ni `file:`."""
+    """Transporte real. Solo maneja http y https: ni redirecciones, ni proxies del entorno, ni
+    `file:`. El único proxy es el que se le pasa (`proxy`), y entonces todo va por él."""
 
     def __init__(
         self,
         *,
         ip_permitida: Callable[[IP], bool] = ip_publica,
-        resolver: Callable[..., Sequence[tuple[Any, ...]]] = socket.getaddrinfo,
+        resolver: Resolver = socket.getaddrinfo,
         contexto_tls: ssl.SSLContext | None = None,
+        proxy: Proxy | None = None,
+        proxy_remoto: Callable[[IP], bool] = ip_publica,
     ) -> None:
-        """`contexto_tls` solo se cambia en los tests (para confiar en un certificado propio)."""
+        """`contexto_tls` solo se cambia en los tests (para confiar en un certificado propio).
+
+        Con `proxy`, la conexión es con el proxy. Si su IP es pública (`proxy_remoto`), el nombre
+        de la tienda lo resuelve él; si no, se resuelve aquí con `resolver` y se valida con
+        `ip_permitida`, como sin proxy (ver `_Salida`).
+        """
         self._crear = conexion_validada(resolver=resolver, ip_permitida=ip_permitida)
         self._contexto_tls = contexto_tls or ssl.create_default_context()
+        self._proxy = proxy
+        self._salida = (
+            None
+            if proxy is None
+            else _Salida(
+                proxy, resolver=resolver, ip_permitida=ip_permitida, proxy_remoto=proxy_remoto
+            )
+        )
+
+    @property
+    def proxy(self) -> Proxy | None:
+        return self._proxy
 
     def __call__(self, url: str, cabeceras: Mapping[str, str], timeout: float) -> RespuestaCruda:
-        corte = _Corte(self._crear)
+        corte = _Corte(self._crear if self._salida is None else _conectar_al_proxy)
         # Un OpenerDirector vacío en lugar de build_opener: así no se cuelan los manejadores por
         # defecto (redirecciones automáticas, proxies del entorno, file://, ftp://, data:).
         abridor = urllib.request.OpenerDirector()
         for manejador in (
-            _ManejadorHTTP(corte),
-            _ManejadorHTTPS(corte, self._contexto_tls),
+            _ManejadorHTTP(corte, self._salida),
+            _ManejadorHTTPS(corte, self._contexto_tls, self._salida),
             urllib.request.UnknownHandler(),
         ):
             abridor.add_handler(manejador)
@@ -432,14 +595,27 @@ class TransporteURLLib:
         temporizador = threading.Timer(timeout, corte.cortar)
         temporizador.daemon = True
         temporizador.start()
+        fallo: OSError | http.client.HTTPException | None = None
         try:
             respuesta = abridor.open(peticion, timeout=timeout)
-        except urllib.error.URLError as error:
-            corte.terminar()
-            raise ErrorDescarga("No se pudo conectar con la tienda.") from error
+        except (OSError, http.client.HTTPException) as error:
+            # `urllib` solo envuelve en `URLError` lo que falla al enviar; lo que falla al leer
+            # la respuesta (`getresponse`) llega tal cual: `OSError` o `HTTPException`.
+            fallo = error
         finally:
             temporizador.cancel()
-        if not corte.terminar():
+        a_tiempo = corte.terminar()
+        if fallo is not None:
+            if not a_tiempo:
+                # El fallo lo ha provocado nuestro propio corte (`shutdown` del socket): se lanza
+                # fuera del `except` y sin encadenar, para que nadie lo lea como un reset de la
+                # tienda (`con_proxy` lo tomaría por un bloqueo y la pasaría al proxy de pago).
+                raise ErrorDescarga("Se agotó el tiempo de espera de la tienda.")
+            motivo = fallo.reason if isinstance(fallo, urllib.error.URLError) else fallo
+            if self._proxy is not None:
+                raise ErrorDescarga(_mensaje_proxy(motivo)) from fallo
+            raise ErrorDescarga("No se pudo conectar con la tienda.") from fallo
+        if not a_tiempo:
             respuesta.close()
             raise ErrorDescarga("Se agotó el tiempo de espera de la tienda.")
         return RespuestaCruda(
@@ -486,6 +662,26 @@ class _Corte:
         with self._candado:
             self._terminado = True
             return not self._cortado
+
+
+def _mensaje_proxy(motivo: object) -> str:
+    """Por qué falló una petición por el proxy. Nunca cita las credenciales."""
+    if isinstance(motivo, _FalloProxy):
+        return "No se pudo conectar con el proxy."
+    if isinstance(motivo, _ProxyNoHTTP):
+        return (
+            "El proxy no respondió como un proxy HTTP: revisa el servidor y el puerto "
+            "(PRECIA_PROXY)."
+        )
+    encontrado = _TUNEL_FALLIDO.match(str(motivo)) if isinstance(motivo, OSError) else None
+    if encontrado is None:
+        return "No se pudo conectar con la tienda a través del proxy."
+    if encontrado[1] == "407":
+        return (
+            "El proxy rechazó la conexión (407): revisa sus credenciales "
+            "(PRECIA_PROXY o EVOMI_API_KEY)."
+        )
+    return f"El proxy no pudo abrir la conexión con la tienda (HTTP {encontrado[1]})."
 
 
 def _tipo_contenido(valor: str | None) -> tuple[str, str | None]:

@@ -31,6 +31,7 @@ from precia.nucleo.modelos import (
     Descartado,
     EstadoPaso,
     EstadoPerfil,
+    EstadoProxy,
     GrupoProducto,
     LlamadaIA,
     Modo,
@@ -734,6 +735,10 @@ class FuenteDemo:
 
     def evaluacion(self) -> list[ResultadoEvaluacion]:
         return []
+
+    def estado_proxy(self) -> EstadoProxy:
+        """La demo no visita ninguna tienda: sin proxy."""
+        return EstadoProxy()
 
     async def cerrar(self) -> None:
         """No hay nada que cerrar: la demo no abre navegador ni base de datos."""

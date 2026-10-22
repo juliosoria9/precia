@@ -78,6 +78,10 @@ Alimenta la memoria §3 («método de validación del código generado»).
 | 2026-10-20 | Coste de CPU por URL del catálogo sin tope; `detectar_bloqueo` sobre 20 MiB en el bucle de eventos | Revisor adversarial de seguridad y coste | `MAX_RUTA_PALABRAS`; el bloqueo mira 5 MiB como mucho + tests deterministas |
 | 2026-10-20 | Topes de profundidad y de etiquetas del lector sin ningún test que los comprobara | Revisor adversarial (mutación) | `test_tope_de_profundidad` y `test_tope_de_etiquetas` |
 | 2026-10-20 | La ruta se recortaba por el principio y se perdía el slug del final | Yo, al revisar los pendientes de los revisores | Tramos enteros del final + test |
+| 2026-10-20 | Pasó las credenciales del proxy a Playwright, que las enviaba a cualquier servidor con 401 Basic | Revisor adversarial de seguridad | Relé local sin credenciales + test con Chromium real |
+| 2026-10-20 | Un corte por tiempo propio se tomaba por «la tienda cortó la conexión» y la tienda lenta pasaba al proxy de pago para siempre | Revisor adversarial (red) | Distinguir el corte del temporizador + test con tienda que gotea |
+| 2026-10-20 | Un 429 se repetía por el proxy, saltándose el límite de frecuencia de la tienda | Revisor adversarial (lógica) | El 429 normal no se repite + test |
+| 2026-10-20 | La contraseña de `PRECIA_PROXY` con caracteres que NFKC convierte en separadores acababa en el log y en Ajustes | Revisor adversarial de seguridad | `URLProxyNoValida` con mensajes propios + test |
 
 ---
 
@@ -308,3 +312,62 @@ Alimenta la memoria §3 («método de validación del código generado»).
 - **Qué pasó:** con 8 agentes ejecutando la batería a la vez, los tests con umbral de 1 s (`test_embebidos`, y a veces otros de descubrimiento y validador) fallaban por 0,1-0,2 s; con la máquina libre pasan todos (2947). Ya estaba apuntado como bug 6.
 - **Lección:** un test de rendimiento con cronómetro mide la máquina, no el código. Los revisores prefirieron tests deterministas («cuánto texto se analiza»), que no dependen de la carga.
 - **Para la memoria:** metodología (TDD y fiabilidad de los tests) · S01
+
+### 2026-10-20 19:36 · 📏 Medida · Primera tienda real sin buscador dada de alta en vivo (books.toscrape.com)
+- **Qué pasó:** con la URL del catálogo paginado pegada por el usuario, PrecIA creó el perfil `listado` en la primera búsqueda: 22 peticiones (sobre todo los intentos de buscador y sitemap que no existen), 3 llamadas a Claude y **0,0018 $**, 64 s con 2 s entre peticiones. Encontró y extrajo *Sapiens* con el precio anclado. La segunda búsqueda: 0,4 s, 0 peticiones, 0 IA. Antes de A + B, esta web se agotaba sin resultado.
+- **Matiz:** el producto se descartó por estar en libras. Es lo correcto, pero la web lo mostraba como «Sin resultados», que confunde.
+- **Para la memoria:** Eval (generalidad y coste en una web real), §5 · S01
+
+### 2026-10-20 19:56 · ❌ Fallo · Primera prueba de Julio con la web: «puerta delantera opel corsa» no da nada
+- **Qué pasó:** cada tienda falló por una razón distinta. Velázquez respondió bien (no tiene esa puerta; sí faros y pilotos del Corsa). DLI se cortó por el tope de peticiones de la demo, que había gastado casi entero una búsqueda anterior en la que Julio pegó la URL de una ficha de B-Parts en el buscador: PrecIA la trató como texto y la buscó en todas las tiendas. B-Parts, Ecooparts y Ovoko no estaban permitidas en la demo (y bloquean a los robots).
+- **Lección:** un usuario real hace cosas que los tests no prevén: pegar una URL donde va el producto es natural. Y «0 resultados» sin explicar por qué en cada tienda parece un fallo aunque el sistema haya hecho lo correcto.
+- **Para la memoria:** Eval (prueba con usuario), §5 (experiencia de uso) · S01
+
+### 2026-10-20 21:15 · 🧭 Decisión · La demo no limita nada que PrecIA no limite por sí misma
+- **Qué:** Julio pidió que no se limite la herramienta por código. Los límites que cortaron la búsqueda del Corsa (lista de webs aprobadas y tope de 25 peticiones por dominio) eran del guion de pruebas, no de PrecIA. Se quitan de la demo. PrecIA conserva su cortesía (2 s entre peticiones por dominio, configurable), la protección anti-SSRF y el presupuesto de la IA. Proxies: no, porque no habrían cambiado nada aquí y rotar IP contra un WAF es evasión anti-bot.
+- **Lección:** un arnés de pruebas demasiado estricto puede hacer parecer que falla la herramienta. Hay que separar en la memoria los límites del experimento de los del producto.
+- **Para la memoria:** Eval (metodología de prueba), §8 (legal y ética) · S01
+
+### 2026-10-20 21:22 · 📏 Medida · Un proxy residencial desbloquea 2 de las 3 tiendas que bloqueaban
+- **Qué:** 1 petición a la portada de cada tienda por el proxy residencial de Evomi (IP española), con el mismo UA honesto. B-Parts y Ecooparts pasan de 403 (prueba del 19) a 200. Ovoko sigue en 403 porque Cloudflare le sirve un desafío JavaScript, y eso no depende de la IP.
+- **Lección:** el bloqueo de B-Parts y Ecooparts era por la reputación de la IP (la de casa o un centro de datos); el de Ovoko es por el comportamiento del cliente.
+- **Para la memoria:** Eval (scraping real), §8 (legal y ética) · S01
+
+### 2026-10-20 22:16 · 🧭 Decisión · Proxies residenciales (Evomi) para las tiendas que bloquean por IP
+- **Qué:** Julio decide usar proxies y cambia la regla de «nunca evasión anti-bot» en lo que toca a la IP. Se mantienen el UA honesto, la cortesía de 2 s, el anti-SSRF y la regla de no resolver CAPTCHAs, desafíos JS ni logins. Modo por defecto «si bloquea»: primero directo y, solo si la tienda bloquea, 1 reintento por el proxy (se paga por GB).
+- **Para la memoria:** §8 (legal y ética), §4 (diseño del navegador) · S01
+
+### 2026-10-20 22:16 · ✅ Avance · PrecIA sale por proxy (HTTP con túnel CONNECT y Chromium con relé local)
+- **Qué:** proxy configurable (`EVOMI_API_KEY` o `PRECIA_PROXY`) con credenciales pedidas a la API de Evomi y guardadas solo en memoria. Descargador envoltorio con reintento por bloqueo y tiendas marcadas. Sección «Proxy» en Ajustes con peticiones y MB. 3122 tests (175 nuevos), ruff y mypy en verde.
+- **Para la memoria:** §4 (implementación), Eval · S01
+
+### 2026-10-20 22:16 · ❌ Fallo · La primera versión del proxy en Chromium entregaba las credenciales a terceros
+- **Qué pasó:** la IA pasó usuario y contraseña del proxy a `launch(proxy=...)` de Playwright. Playwright los guarda como credenciales HTTP sin origen: cualquier servidor que contestara 401 Basic (por ejemplo, un script de terceros en la página de una tienda) recibía las credenciales de Evomi. Los tests estaban en verde.
+- **Cómo se detectó:** revisor adversarial de seguridad, leyendo el bundle de Playwright 1.64 instalado.
+- **Solución:** relé `CONNECT` local en 127.0.0.1 que añade la autenticación hacia Evomi; Chromium no conoce las credenciales. Test con Chromium real: la tienda contesta 401 y nunca recibe `Authorization`.
+- **Lección:** una opción de una librería que «parece» segura puede tener efectos laterales documentados solo en su código. Con secretos, hay que revisar el camino completo que siguen.
+- **Para la memoria:** §3 (validación del código generado), §8 · S01
+
+### 2026-10-20 22:31 · 📏 Medida · El proxy residencial no desbloquea ninguna de las 3 tiendas
+- **Qué:** con el proxy ya integrado, la búsqueda del Corsa pasó a B-Parts, Ecooparts y Ovoko por el proxy y las tres siguieron bloqueadas. Diagnóstico (14 peticiones): B-Parts deja ver la portada pero bloquea toda ficha con el WAF de AWS; Ecooparts sirve el desafío de Cloudflare a 5 de 5 IP residenciales (el 200 de la primera sonda fue suerte); Ovoko, igual. DLI, que antes se cortaba por el tope de la demo, se configura y responde en 69 s.
+- **Lección:** los anti-bot modernos deciden por comportamiento (JavaScript, huella del navegador), no solo por IP. Cambiar de IP no basta; lo siguiente sería resolver el desafío, que es justo lo que la ley (art. 197 bis CP) y la regla 5 dejan fuera. Además, una sola medida (la sonda de 1 petición) no es representativa: hay que repetir.
+- **Para la memoria:** Eval (scraping real), §8 (legal y ética) · S01
+
+### 2026-10-20 22:31 · ❌ Fallo · DLI da como ofertas piezas que no tienen nada que ver con la búsqueda
+- **Qué pasó:** para «puerta delantera opel corsa», el buscador de DLI devolvió un mando limpia de Toyota, mandos de luces de Ford y una guantera de Mitsubishi, y PrecIA los enseñó como 5 productos con precio. Nadie comprueba que el resultado de la tienda se parezca a la consulta.
+- **Para la memoria:** Eval (calidad de resultados), §5 · S01
+
+### 2026-10-21 19:17 · 💡 Aprendizaje · El bloqueo de Cloudflare no venía de un User-Agent de Chrome
+- **Qué pasó:** la tarea partía de que PrecIA se presentaba como Chrome desde `urllib`. El análisis (6 subagentes) lo descartó: el UA es el honesto `PrecIA/0.1 …` y las cabeceras ya son coherentes con `urllib`. Los defectos reales son otros: sin cookies ni sesión, `Pagina` sin cabeceras de respuesta (no se puede distinguir un desafío gestionado de un 1020/1010 o de un 403 del origen), un desafío en `robots.txt` que bloquea el dominio entero aunque robots se ignore, y un Chromium cuya red sale por Node (`route.fetch`), con una huella que no es la del navegador.
+- **Lección:** comprobar la hipótesis en el código antes de corregir. Cloudflare decide por la coherencia de muchas señales (TLS, HTTP/2, JavaScript, cookies); cambiar solo el UA no arregla nada.
+- **Para la memoria:** §4 (diseño del navegador), §8 (legal y ética), Eval · S02
+
+### 2026-10-21 19:17 · ❌ Fallo · Un desafío en robots.txt bloquea toda la tienda 10 minutos aunque robots se ignore
+- **Qué pasó:** `robots.txt` se pide siempre por `urllib`; si trae un desafío de Cloudflare, `ServicioRobots` lo guarda 600 s y `Navegador` lanza `Bloqueado` antes de elegir descargador, también para Chromium. Choca con ADR-017 y explica tiendas como Oscaro, que ponen el desafío en el propio `robots.txt`. Además esa petición va fuera del limitador de cortesía.
+- **Qué se hizo:** sin resolver todavía (pendiente de la decisión de Julio).
+- **Para la memoria:** §4, Eval · S02
+
+### 2026-10-21 19:33 · 🧭 Decisión · Alcance de las correcciones de Cloudflare
+- **Qué:** Julio aprueba cookies en memoria por tienda, que Chromium use su propia red (hoy la saca por Node con `route.fetch`) y un intento con Chromium tras un bloqueo por HTTP. Se mantiene el diagnóstico (clasificación de bloqueos y cabeceras de respuesta en `Pagina`).
+- **Lección:** la mayor parte del problema era incoherencia creada por el propio PrecIA (red de Node bajo un Chromium, visitas en frío sin cookies).
+- **Para la memoria:** §4, Eval · S02

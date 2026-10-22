@@ -69,4 +69,32 @@
     <button class="boton boton-primario" type="submit">Guardar ajustes</button>
   </div>
 </form>
+
+{% set modos_proxy = {
+  "bloqueo": "Directo; solo si la tienda bloquea la conexión se repite por el proxy y la tienda pasa a ir siempre por él",
+  "siempre": "Todas las peticiones salen por el proxy",
+  "nunca": "Nunca: todo directo aunque haya proxy configurado",
+} %}
+<section class="tarjeta">
+  <h2>Proxy</h2>
+  {% if not proxy.configurado %}
+    <p><span class="insignia insignia-tenue">Sin proxy</span> Todas las peticiones salen directas desde este equipo.</p>
+  {% else %}
+    <p>
+      {% if proxy.activo %}<span class="insignia insignia-ok">Activo</span>
+      {% elif proxy.pendiente %}<span class="insignia insignia-tenue">Sin comprobar</span>
+      {% else %}<span class="insignia insignia-aviso">No se usa</span>{% endif %}
+      <strong>{{ proxy.nombre }}</strong>
+    </p>
+    {% if proxy.error %}<p class="mensaje mensaje-aviso" role="status">{{ proxy.error }} Se sigue con la conexión directa.</p>{% endif %}
+    {% if proxy.pendiente %}<p class="tenue">Las credenciales se piden y se comprueban en la primera búsqueda.</p>{% endif %}
+    <dl class="datos">
+      {% if proxy.pais %}<div><dt>País de salida</dt><dd>{{ proxy.pais }}</dd></div>{% endif %}
+      <div><dt>Modo</dt><dd>{{ proxy.modo }}: {{ modos_proxy.get(proxy.modo, "") }}</dd></div>
+      <div><dt>Uso en esta ejecución</dt><dd>{{ proxy.peticiones | miles }} peticiones · {{ proxy.mb | decimal(2) }} MB (estimación por lo bajo: solo el HTML recibido)</dd></div>
+      <div><dt>Tiendas por el proxy</dt><dd>{% if proxy.dominios %}{{ proxy.dominios | join(", ") }}{% else %}Ninguna todavía{% endif %}</dd></div>
+    </dl>
+  {% endif %}
+  <p class="tenue">Se configura en el fichero <code>.env</code> (nunca aquí): <code>PRECIA_PROXY=http://usuario:contraseña@servidor:puerto</code> para un proxy propio o <code>EVOMI_API_KEY</code> para el residencial de Evomi (si están las dos, manda <code>PRECIA_PROXY</code>), y <code>PRECIA_PROXY_MODO</code> (<code>bloqueo</code>, <code>siempre</code> o <code>nunca</code>). El User-Agent sigue siendo el honesto, se respeta la espera entre peticiones y nunca se resuelve un CAPTCHA.</p>
+</section>
 {% endblock %}

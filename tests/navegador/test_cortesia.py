@@ -1,10 +1,11 @@
 """Cortesía: intervalo mínimo entre peticiones al mismo dominio y tope global de concurrencia."""
 
 import asyncio
+import contextlib
 
 import pytest
 
-from precia.navegador.cortesia import LimitadorDominio
+from precia.navegador.cortesia import LimitadorDominio, pausa_de_cortesia
 from tests.navegador.falsos import Reloj
 
 
@@ -131,3 +132,52 @@ def test_parametros_no_validos() -> None:
         LimitadorDominio(-1)
     with pytest.raises(ValueError):
         LimitadorDominio(1, concurrencia=0)
+
+
+def test_pausa_de_cortesia_fuera_de_turno_o_de_otro_dominio_no_espera() -> None:
+    reloj = Reloj()
+    limitador = LimitadorDominio(2.0, reloj=reloj, dormir=reloj.dormir)
+
+    async def probar() -> tuple[bool, bool, bool]:
+        fuera = await pausa_de_cortesia("tienda.example")
+        async with limitador.turno("Tienda.Example", retardo_minimo=5.0):
+            otro = await pausa_de_cortesia("otra.example")
+            propio = await pausa_de_cortesia("tienda.example")
+        return fuera, otro, propio
+
+    assert asyncio.run(probar()) == (False, False, True)
+    assert reloj.esperas == [5.0]
+
+
+def test_pausa_de_cortesia_cancelada_no_devuelve_una_plaza_de_mas() -> None:
+    async def dormir_eterno(_: float) -> None:
+        await asyncio.Event().wait()
+
+    limitador = LimitadorDominio(1.0, concurrencia=1, dormir=dormir_eterno)
+
+    async def probar() -> bool:
+        async def con_pausa() -> None:
+            async with limitador.turno("tienda.example"):
+                await pausa_de_cortesia("tienda.example")
+
+        tarea = asyncio.create_task(con_pausa())
+        await asyncio.sleep(0.01)
+        tarea.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await tarea
+        # Una sola plaza: si la cancelación la hubiera devuelto dos veces, entrarían dos a la vez.
+        dentro = 0
+        maximo = 0
+
+        async def ocupar(dominio: str) -> None:
+            nonlocal dentro, maximo
+            async with limitador.turno(dominio):
+                dentro += 1
+                maximo = max(maximo, dentro)
+                await asyncio.sleep(0.01)
+                dentro -= 1
+
+        await asyncio.gather(ocupar("a.example"), ocupar("b.example"))
+        return maximo == 1
+
+    assert asyncio.run(probar())

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -135,3 +136,32 @@ def test_version_con_javascript_aparte(tmp_path: Path) -> None:
     sin_js = c.obtener(URL)
     assert con_js is not None and con_js.html == "con js"
     assert sin_js is not None and sin_js.html == "sin js"
+
+
+def test_recuerda_si_la_pagina_llego_por_el_proxy(tmp_path: Path) -> None:
+    c, _ = cache(tmp_path)
+    c.guardar(replace(pagina(URL), via_proxy=True))
+    recuperada = c.obtener(URL)
+    assert recuperada is not None and recuperada.via_proxy and recuperada.desde_cache
+
+
+def test_fichero_sin_via_proxy_cuenta_como_directa(tmp_path: Path) -> None:
+    # Las páginas guardadas antes de que existiera el proxy no traen el campo.
+    c, _ = cache(tmp_path)
+    c.guardar(pagina(URL))
+    fichero = next(tmp_path.iterdir())
+    datos = json.loads(fichero.read_text(encoding="utf-8"))
+    datos.pop("via_proxy", None)
+    fichero.write_text(json.dumps(datos), encoding="utf-8")
+    recuperada = c.obtener(URL)
+    assert recuperada is not None and not recuperada.via_proxy
+
+
+def test_via_proxy_que_no_es_booleano_es_un_fallo_de_cache(tmp_path: Path) -> None:
+    c, _ = cache(tmp_path)
+    c.guardar(pagina(URL))
+    fichero = next(tmp_path.iterdir())
+    datos = json.loads(fichero.read_text(encoding="utf-8"))
+    datos["via_proxy"] = "sí"
+    fichero.write_text(json.dumps(datos), encoding="utf-8")
+    assert c.obtener(URL) is None

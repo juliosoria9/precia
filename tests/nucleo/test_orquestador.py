@@ -466,6 +466,27 @@ def test_robots_ignorado_se_avisa_en_el_progreso() -> None:
     assert tienda is not None and not tienda.robots_permite
 
 
+class NavegadorPorProxy(NavegadorFalso):
+    """Como el sitio falso, pero todo llega por el proxy (`Pagina.via_proxy`)."""
+
+    async def obtener(self, url: str, *, js: bool = False, grande: bool = False) -> Pagina:
+        return replace(await super().obtener(url, js=js, grande=grande), via_proxy=True)
+
+
+def test_busqueda_por_el_proxy_se_dice_en_el_progreso() -> None:
+    m = montar(nuevo_almacen(perfil()), NavegadorPorProxy(paginas_sitio()))
+    r = m.buscar(modo=Modo.CLASICO)
+    busqueda = paso(r, "búsqueda")
+    assert busqueda.estado is EstadoPaso.OK
+    assert busqueda.detalle == "Resultados descargados por el proxy"
+    assert ofertas(r)
+
+
+def test_busqueda_directa_no_menciona_el_proxy() -> None:
+    m = montar(nuevo_almacen(perfil()), NavegadorFalso(paginas_sitio()))
+    assert "proxy" not in paso(m.buscar(modo=Modo.CLASICO), "búsqueda").detalle
+
+
 class NavegadorProhibido:
     """Todo lo prohíbe el robots.txt: el configurador no llega a ninguna página."""
 

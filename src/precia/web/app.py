@@ -320,7 +320,11 @@ def crear_app(
     @app.get("/ajustes", response_class=HTMLResponse)
     async def ajustes(request: Request) -> HTMLResponse:
         guardado = request.query_params.get("guardado") == "1"
-        return pagina(request, "ajustes.html", {"ajustes": datos.ajustes(), "guardado": guardado})
+        return pagina(
+            request,
+            "ajustes.html",
+            {"ajustes": datos.ajustes(), "guardado": guardado, "proxy": datos.estado_proxy()},
+        )
 
     @app.post("/ajustes", response_class=HTMLResponse)
     async def guardar_ajustes(request: Request) -> Response:
@@ -332,7 +336,12 @@ def crear_app(
             return pagina(
                 request,
                 "ajustes.html",
-                {"ajustes": datos.ajustes(), "guardado": False, "error": str(error)},
+                {
+                    "ajustes": datos.ajustes(),
+                    "guardado": False,
+                    "error": str(error),
+                    "proxy": datos.estado_proxy(),
+                },
                 422,
             )
         datos.guardar_ajustes(nuevos)

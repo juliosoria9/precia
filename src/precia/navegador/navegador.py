@@ -124,7 +124,8 @@ class Navegador:
         vista = replace(pagina, html=pagina.html[:MAXIMO_BYTES]) if grande else pagina
         motivo = detectar_bloqueo(vista)
         if motivo is not None:
-            # Se para y se registra; nunca se reintenta ni se intenta resolver el desafío.
+            # Se para y se registra; nunca se intenta resolver el desafío. El único reintento (por
+            # el proxy, desde otra IP) ya lo ha hecho `DescargadorConProxy`, si lo hay.
             registro.warning("Bloqueo en %s: %s", dominio, motivo)
             raise Bloqueado(url, motivo)
         if pagina.url_final != url:

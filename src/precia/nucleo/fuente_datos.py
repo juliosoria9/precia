@@ -14,6 +14,7 @@ from precia.nucleo.modelos import (
     Ajustes,
     Alerta,
     ConsultaBusqueda,
+    EstadoProxy,
     GrupoProducto,
     ResultadoBusqueda,
     ResultadoEvaluacion,
@@ -105,6 +106,10 @@ class FuenteDatos(Protocol):
     def guardar_ajustes(self, ajustes: Ajustes) -> None: ...
 
     def evaluacion(self) -> list[ResultadoEvaluacion]: ...
+
+    def estado_proxy(self) -> EstadoProxy:
+        """Proxy de salida y su uso en esta ejecución, para «Ajustes» (sin credenciales)."""
+        ...
 
     async def cerrar(self) -> None:
         """Libera navegador, base de datos... Se llama al apagar la aplicación."""

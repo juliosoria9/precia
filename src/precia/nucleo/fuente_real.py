@@ -7,10 +7,16 @@ presupuesto y tope), así que un cambio en «Ajustes» vale desde la búsqueda s
 
 Sin clave de la API (y con el proveedor `api`) no hay IA: los modos Auto e IA funcionan como el
 clásico y la búsqueda lo dice. La clave nunca se muestra: ni en los avisos ni en los errores.
+
+Con un proxy configurado (`PRECIA_PROXY` o `EVOMI_API_KEY`, ver `nucleo.config`), los
+descargadores de HTTP y de Chromium van envueltos en `DescargadorConProxy`. Las credenciales de
+Evomi se piden una sola vez, al crear el primer navegador, con el User-Agent de los ajustes. Si
+no se consiguen, se avisa (sin secretos), se sigue sin proxy y «Ajustes» enseña el motivo.
 """
 
 import asyncio
-from collections.abc import Callable
+import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
@@ -22,9 +28,19 @@ from precia.ia.servicio import ServicioIA
 from precia.ia.tipos import ErrorIA, IANoDisponible, ProveedorIA
 from precia.navegador.cache import CachePaginas
 from precia.navegador.chromium import DescargadorChromium
+from precia.navegador.con_proxy import DescargadorConProxy, UsoProxy
 from precia.navegador.cortesia import LimitadorDominio
-from precia.navegador.http import DescargadorHTTP
+from precia.navegador.evomi import credenciales_evomi
+from precia.navegador.http import DescargadorHTTP, TransporteURLLib
 from precia.navegador.navegador import Navegador
+from precia.navegador.proxy import (
+    NOMBRE_PROPIO,
+    ErrorProxy,
+    ModoProxy,
+    Proxy,
+    URLProxyNoValida,
+    proxy_desde_url,
+)
 from precia.navegador.robots import ServicioRobots
 from precia.navegador.tipos import Descargador
 from precia.navegador.url import Validador, validar_url
@@ -42,6 +58,7 @@ from precia.nucleo.modelos import (
     Ajustes,
     Alerta,
     ConsultaBusqueda,
+    EstadoProxy,
     GrupoProducto,
     ResultadoBusqueda,
     ResultadoEvaluacion,
@@ -50,6 +67,8 @@ from precia.nucleo.modelos import (
     Tienda,
 )
 from precia.nucleo.orquestador import MAX_FICHAS, Orquestador, estado_de
+
+registro = logging.getLogger(__name__)
 
 TTL_CACHE_S = 6 * 3600.0
 MAX_LLAMADAS_RESUMEN = 500
@@ -74,6 +93,8 @@ CrearDescargadores = Callable[[Ajustes], tuple[Descargador, Descargador | None]]
 """Descargador HTTP y, si lo hay, Chromium, con el User-Agent de los ajustes."""
 CrearProveedor = Callable[[Ajustes], tuple[ProveedorIA | None, str]]
 """Proveedor de IA según los ajustes, o `None` y el motivo por el que no hay IA."""
+CredencialesEvomi = Callable[..., Awaitable[Proxy]]
+"""`credenciales_evomi(clave, *, user_agent, producto, pais)`: la API de Evomi (o un doble)."""
 
 
 def _ahora() -> datetime:
@@ -112,20 +133,32 @@ class FuenteReal:
         validador: Validador = validar_url,
         reloj: Callable[[], datetime] = _ahora,
         max_fichas: int = MAX_FICHAS,
+        credenciales_evomi: CredencialesEvomi = credenciales_evomi,
     ) -> None:
-        """`validador` es el anti-SSRF de todo el flujo; solo se cambia en los tests."""
+        """`validador` es el anti-SSRF de todo el flujo; solo se cambia en los tests.
+
+        El proxy solo se usa con los descargadores reales: con `crear_descargadores` inyectado
+        (tests, demo) no se interpreta ni se piden credenciales.
+        """
         self._config = config
         self._validador = validador
         self._reloj = reloj
         self._max_fichas = max_fichas
         self._crear_descargadores = crear_descargadores or self._descargadores_reales
+        self._descargadores_propios = crear_descargadores is None
+        self._credenciales_evomi = credenciales_evomi
+        self._proxy: Proxy | None = None
+        self._proxy_resuelto = False
+        self._error_proxy = ""
+        self._uso_proxy = UsoProxy()
+        """Compartido por todos los navegadores: el gasto y las tiendas marcadas de la ejecución."""
         self._crear_proveedor: CrearProveedor = crear_proveedor or (
             lambda ajustes: proveedor_desde_ajustes(config, ajustes)
         )
         config.ruta_bd.parent.mkdir(parents=True, exist_ok=True)
         self._almacen = Almacen(config.ruta_bd, reloj=reloj)
         self._navegador: Navegador | None = None
-        self._clave_navegador: tuple[str, float, bool] | None = None
+        self._clave_navegador: tuple[str, float, bool, Proxy | None] | None = None
         self._usos: dict[Navegador, int] = {}
         """Búsquedas en vuelo por navegador (el actual y los sustituidos que aún se usan)."""
         self._candado = asyncio.Lock()
@@ -175,8 +208,15 @@ class FuenteReal:
         búsqueda en vuelo: cerrarlo le cortaría Chromium a media descarga y, peor, su
         descargador volvería a arrancar otro Chromium que ya no cerraría nadie.
         """
-        clave = (ajustes.user_agent, ajustes.retardo_dominio_s, ajustes.respetar_robots)
         async with self._candado:
+            if self._descargadores_propios and not self._proxy_resuelto:
+                await self._resolver_proxy(ajustes)
+            clave = (
+                ajustes.user_agent,
+                ajustes.retardo_dominio_s,
+                ajustes.respetar_robots,
+                self._proxy,
+            )
             if self._navegador is not None and self._clave_navegador != clave:
                 viejo, self._navegador = self._navegador, None
                 if not self._usos.get(viejo):
@@ -208,11 +248,102 @@ class FuenteReal:
                 # Lo habían sustituido unos ajustes nuevos: era la última búsqueda que lo usaba.
                 await navegador.cerrar()
 
+    async def _resolver_proxy(self, ajustes: Ajustes) -> None:
+        """Interpreta `PRECIA_PROXY` o pide las credenciales a Evomi. Solo se intenta una vez.
+
+        Se da por resuelto al acabar el intento, falle o no. Si se cancela a medias (la primera
+        búsqueda se cancela), queda pendiente y se intenta en la siguiente. Un fallo nunca rompe
+        la búsqueda: se avisa y se sigue con la conexión directa.
+        """
+        config = self._config
+        if config.hay_proxy and config.proxy_modo is not ModoProxy.NUNCA:
+            try:
+                self._proxy = await self._obtener_proxy(config, ajustes)
+            except ErrorProxy as error:
+                # Mensajes propios, sin secretos: se pueden registrar y enseñar.
+                self._error_proxy = str(error)
+                registro.warning("No se usa el proxy: %s Se sigue con la conexión directa.", error)
+            except Exception as error:
+                # Un error ajeno (`UnicodeEncodeError` de una cabecera...) puede citar la clave:
+                # solo se apunta su tipo.
+                self._error_proxy = "No se pudo obtener el proxy (error inesperado)."
+                registro.warning(
+                    "No se usa el proxy: error inesperado (%s). Se sigue con la conexión directa.",
+                    type(error).__name__,
+                )
+        self._proxy_resuelto = True
+
+    async def _obtener_proxy(self, config: Config, ajustes: Ajustes) -> Proxy | None:
+        if config.proxy_url:
+            try:
+                return proxy_desde_url(config.proxy_url)
+            except URLProxyNoValida as error:
+                # Sus mensajes son propios y nunca citan la URL.
+                raise ErrorProxy(f"PRECIA_PROXY no es válida: {error}") from None
+            except ValueError:
+                raise ErrorProxy("PRECIA_PROXY no es válida.") from None
+        if config.clave_evomi:
+            return await self._credenciales_evomi(
+                config.clave_evomi,
+                user_agent=ajustes.user_agent,
+                producto=config.evomi_producto,
+                pais=config.proxy_pais,
+            )
+        return None
+
     def _descargadores_reales(self, ajustes: Ajustes) -> tuple[Descargador, Descargador | None]:
-        # Chromium no arranca hasta que una tienda lo necesita (`necesita_js`).
-        http = DescargadorHTTP(ajustes.user_agent, validador=self._validador)
-        chromium = DescargadorChromium(ajustes.user_agent, validador=self._validador)
-        return http, chromium
+        # Chromium no arranca hasta que una tienda lo necesita (`necesita_js`); el del proxy,
+        # hasta que una tienda con JavaScript tiene que ir por él.
+        ua = ajustes.user_agent
+        http = DescargadorHTTP(ua, validador=self._validador)
+        chromium = DescargadorChromium(ua, validador=self._validador)
+        if self._proxy is None:
+            return http, chromium
+
+        def envolver(directo: Descargador, por_proxy: Descargador) -> DescargadorConProxy:
+            return DescargadorConProxy(
+                directo,
+                por_proxy,
+                modo=self._config.proxy_modo,
+                uso=self._uso_proxy,
+                # El reintento por el proxy espera lo mismo que dos peticiones seguidas a la tienda.
+                espera_reintento_s=ajustes.retardo_dominio_s,
+            )
+
+        transporte = TransporteURLLib(proxy=self._proxy)
+        return (
+            envolver(http, DescargadorHTTP(ua, validador=self._validador, transporte=transporte)),
+            envolver(
+                chromium, DescargadorChromium(ua, validador=self._validador, proxy=self._proxy)
+            ),
+        )
+
+    def estado_proxy(self) -> EstadoProxy:
+        config = self._config
+        if not config.hay_proxy:
+            return EstadoProxy(modo=config.proxy_modo.value)
+        evomi = not config.proxy_url
+        if self._proxy is not None:
+            nombre = self._proxy.nombre
+        else:
+            nombre = "Evomi" if evomi else NOMBRE_PROPIO
+        uso = self._uso_proxy
+        return EstadoProxy(
+            configurado=True,
+            activo=self._proxy is not None,
+            nombre=nombre,
+            pais=config.proxy_pais if evomi else "",
+            modo=config.proxy_modo.value,
+            peticiones=uso.peticiones,
+            bytes=uso.bytes,
+            dominios=tuple(sorted(uso.dominios)),
+            error=self._error_proxy,
+            pendiente=(
+                self._descargadores_propios
+                and not self._proxy_resuelto
+                and config.proxy_modo is not ModoProxy.NUNCA
+            ),
+        )
 
     async def cerrar(self) -> None:
         async with self._candado:

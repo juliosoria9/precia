@@ -254,3 +254,30 @@ class ResumenIA:
     gasto_mes_usd: Decimal
     presupuesto_mes_usd: Decimal
     por_componente: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class EstadoProxy:
+    """El proxy de salida tal como lo enseña «Ajustes». Nunca lleva credenciales."""
+
+    configurado: bool = False
+    """Hay `PRECIA_PROXY` o `EVOMI_API_KEY` (aunque luego no se haya podido usar)."""
+    activo: bool = False
+    nombre: str = ""
+    """Proveedor y producto, sin credenciales («Evomi core residential (ES)», «proxy propio»)."""
+    pais: str = ""
+    modo: str = "bloqueo"
+    peticiones: int = 0
+    """Peticiones que han salido por el proxy en esta ejecución."""
+    bytes: int = 0
+    """Estimación por lo bajo: el HTML o los datos recibidos por el proxy."""
+    dominios: tuple[str, ...] = ()
+    """Tiendas que van por el proxy porque bloquearon la conexión directa."""
+    error: str = ""
+    """Por qué no se usa el proxy configurado (sin secretos)."""
+    pendiente: bool = False
+    """Configurado, pero aún sin comprobar: las credenciales se piden en la primera búsqueda."""
+
+    @property
+    def mb(self) -> float:
+        return self.bytes / (1024 * 1024)

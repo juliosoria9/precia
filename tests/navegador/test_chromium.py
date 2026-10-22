@@ -7,7 +7,10 @@ trata `/secreto` como si fuera un servicio interno.
 """
 
 import asyncio
+import contextlib
 import http.server
+import socket
+import struct
 import threading
 import time
 from collections.abc import Iterator
@@ -18,8 +21,11 @@ import pytest
 from playwright.async_api import Error as ErrorPlaywright
 
 from precia.navegador.chromium import DescargadorChromium, FiltroPeticiones
-from precia.navegador.tipos import ErrorDescarga, Pagina, URLNoPermitida
+from precia.navegador.proxy import Proxy
+from precia.navegador.rele import ReleProxy
+from precia.navegador.tipos import ConexionCortada, ErrorDescarga, Pagina, URLNoPermitida
 from precia.navegador.url import Validador
+from tests.navegador.servidores_proxy import proxy_falso, tienda
 
 UA = "PrecIA/0.1 (+https://github.com/juliosoria9/precia)"
 
@@ -366,3 +372,199 @@ def test_pagina_que_cuelga_el_navegador_respeta_el_timeout(
     with pytest.raises(ErrorDescarga):
         con_chromium(base, f"{base}/bucle", timeout=3)
     assert time.monotonic() - inicio < 10
+
+
+# --- Arranque con proxy (Playwright falso) ------------------------------------------------------
+
+
+class _NavegadorArrancado:
+    def __init__(self) -> None:
+        self.cerrado = False
+
+    async def new_context(self, **opciones: object) -> object:
+        raise RuntimeError("el test para aquí")
+
+    async def close(self) -> None:
+        self.cerrado = True
+
+
+class _PlaywrightFalso:
+    def __init__(self) -> None:
+        self.lanzamientos: list[dict[str, object]] = []
+        self.chromium = self
+
+    async def start(self) -> "_PlaywrightFalso":
+        return self
+
+    async def launch(self, **opciones: object) -> _NavegadorArrancado:
+        self.lanzamientos.append(opciones)
+        return _NavegadorArrancado()
+
+    async def stop(self) -> None:
+        pass
+
+
+def _lanzar(monkeypatch: pytest.MonkeyPatch, proxy: Proxy | None) -> dict[str, object]:
+    falso = _PlaywrightFalso()
+    monkeypatch.setattr("precia.navegador.chromium.async_playwright", lambda: falso)
+
+    async def permisivo(url: str) -> str:
+        return url
+
+    descargador = DescargadorChromium(UA, validador=permisivo, proxy=proxy)
+
+    async def probar() -> None:
+        with pytest.raises(RuntimeError, match="el test para aquí"):
+            await descargador.descargar("https://tienda.example/")
+        await descargador.cerrar()
+
+    asyncio.run(probar())
+    assert len(falso.lanzamientos) == 1
+    return falso.lanzamientos[0]
+
+
+def test_sin_proxy_arranca_sin_la_opcion(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _lanzar(monkeypatch, None) == {"headless": True}
+
+
+def test_con_proxy_arranca_chromium_contra_el_rele_sin_credenciales(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Playwright usaría el usuario y la contraseña del proxy para contestar a cualquier 401 Basic
+    # de un destino: Chromium va al relé local, que es quien las añade en el CONNECT.
+    proxy = Proxy("core-residential.evomi.com", 1000, "usu", "secreta_country-ES")
+    opciones = _lanzar(monkeypatch, proxy)
+    assert set(opciones) == {"headless", "proxy"} and opciones["headless"] is True
+    ajustes = opciones["proxy"]
+    assert isinstance(ajustes, dict) and set(ajustes) == {"server"}
+    assert ajustes["server"].startswith("http://127.0.0.1:")
+    assert "secreta" not in repr(opciones) and "usu" not in repr(opciones)
+
+
+def test_fallo_de_red_de_la_navegacion_principal_se_recuerda() -> None:
+    ruta = RutaFalsa(PeticionFalsa("https://tienda.example/", navegacion=True))
+    ruta.fallo_de_red = True
+    filtro = filtrar(ruta)
+    assert ruta.acciones[-1] == "abort:failed"
+    assert filtro.fallo_principal is not None and "ERR_CONNECTION_RESET" in filtro.fallo_principal
+
+
+def test_fallo_de_red_de_un_subrecurso_no_es_el_de_la_pagina() -> None:
+    ruta = RutaFalsa(PeticionFalsa("https://tienda.example/api", resource_type="xhr"))
+    ruta.fallo_de_red = True
+    assert filtrar(ruta).fallo_principal is None
+
+
+# --- Chromium real por el proxy (relé local) ----------------------------------------------------
+
+USUARIO_PROXY = "usuario-proxy-chromium"
+SECRETO_PROXY = "contrasena-proxy-chromium_country-ES"
+
+
+def _pide_basic(manejador: http.server.BaseHTTPRequestHandler) -> bool:
+    """Como haría un script de terceros hostil: un 401 Basic para que le manden credenciales."""
+    if manejador.headers.get("Authorization"):
+        cuerpo = b"<html><body>Credenciales robadas</body></html>"
+        estado = 200
+    elif manejador.path in ("/", "/privado"):
+        manejador.send_response(401)
+        manejador.send_header("WWW-Authenticate", 'Basic realm="atacante"')
+        manejador.send_header("Content-Type", "text/html")
+        manejador.send_header("Content-Length", "0")
+        manejador.end_headers()
+        return True
+    else:
+        return False
+    manejador.send_response(estado)
+    manejador.send_header("Content-Type", "text/html")
+    manejador.send_header("Content-Length", str(len(cuerpo)))
+    manejador.end_headers()
+    manejador.wfile.write(cuerpo)
+    return True
+
+
+def _siempre_remoto(_: object) -> bool:
+    return True
+
+
+@pytest.mark.chromium
+def test_por_el_proxy_un_401_basic_no_se_lleva_las_credenciales() -> None:
+    with tienda(manejar=_pide_basic) as servidor:
+        base = f"http://tienda.example:{servidor.server_address[1]}"
+        proxy_esperado = Proxy("127.0.0.1", 1, USUARIO_PROXY, SECRETO_PROXY)
+        with proxy_falso(
+            servidor.server_address[1], esperada=proxy_esperado.cabecera_autorizacion
+        ) as (puerto, estado):
+            proxy = Proxy("127.0.0.1", puerto, USUARIO_PROXY, SECRETO_PROXY)
+
+            async def validar(url: str) -> str:
+                if not url.startswith(base + "/"):
+                    raise URLNoPermitida("Fuera de la tienda del test.")
+                return url
+
+            async def ejecutar() -> Pagina:
+                descargador = DescargadorChromium(
+                    UA,
+                    timeout=15,
+                    validador=validar,
+                    espera_red_s=0.5,
+                    proxy=proxy,
+                    crear_rele=lambda p: ReleProxy(p, proxy_remoto=_siempre_remoto),
+                )
+                try:
+                    return await asyncio.wait_for(descargador.descargar(f"{base}/"), 60)
+                finally:
+                    await descargador.cerrar()
+
+            try:
+                pagina = asyncio.run(ejecutar())
+            except Exception as error:
+                if "Executable doesn't exist" in str(error):
+                    pytest.skip("Chromium de Playwright no instalado")
+                raise
+    # Ha ido por el proxy (el nombre `tienda.example` solo lo «resuelve» el proxy falso)...
+    assert estado.connects and all("tienda.example" in c for c in estado.connects)
+    assert set(estado.autorizaciones) == {proxy_esperado.cabecera_autorizacion}
+    # ...y el 401 se queda en 401: nadie repitió la petición con `Authorization`.
+    assert pagina.estado == 401
+    assert servidor.peticiones
+    assert all("authorization" not in cabeceras for _, cabeceras in servidor.peticiones)
+    assert "robadas" not in pagina.html
+
+
+# --- La tienda corta la conexión -----------------------------------------------------------------
+
+
+@pytest.fixture
+def servidor_que_corta() -> Iterator[str]:
+    """Acepta y cierra con RST (`SO_LINGER` 0), como un WAF que rechaza la IP."""
+    escucha = socket.create_server(("127.0.0.1", 0))
+    escucha.settimeout(0.2)
+    parar = threading.Event()
+
+    def aceptar() -> None:
+        while not parar.is_set():
+            try:
+                conexion, _ = escucha.accept()
+            except OSError:
+                continue
+            with contextlib.suppress(OSError):
+                conexion.recv(65536)
+                conexion.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            conexion.close()
+
+    hilo = threading.Thread(target=aceptar, daemon=True)
+    hilo.start()
+    try:
+        yield f"http://127.0.0.1:{escucha.getsockname()[1]}"
+    finally:
+        parar.set()
+        hilo.join(5)
+        escucha.close()
+
+
+@pytest.mark.chromium
+def test_conexion_cortada_por_la_tienda(servidor_que_corta: str) -> None:
+    base = servidor_que_corta
+    with pytest.raises(ConexionCortada):
+        con_chromium(base, f"{base}/")

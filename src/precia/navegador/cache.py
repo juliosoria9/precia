@@ -68,6 +68,7 @@ class CachePaginas:
             "html": pagina.html,
             "tipo_contenido": pagina.tipo_contenido,
             "obtenida": pagina.obtenida.isoformat(),
+            "via_proxy": pagina.via_proxy,
         }
         # Escritura atómica: un lector a la vez nunca ve un JSON a medias.
         descriptor, temporal = tempfile.mkstemp(dir=self._directorio, suffix=".tmp")
@@ -93,6 +94,10 @@ def _desde_json(datos: Any) -> Pagina | None:
     estado = datos.get("estado")
     if not isinstance(estado, int) or isinstance(estado, bool):
         return None
+    # Opcional: los ficheros guardados antes de que existiera el proxy no lo traen.
+    via_proxy = datos.get("via_proxy", False)
+    if not isinstance(via_proxy, bool):
+        return None
     try:
         obtenida = datetime.fromisoformat(datos["obtenida"])
     except ValueError:
@@ -107,4 +112,5 @@ def _desde_json(datos: Any) -> Pagina | None:
         tipo_contenido=datos["tipo_contenido"],
         obtenida=obtenida,
         desde_cache=True,
+        via_proxy=via_proxy,
     )

@@ -1,7 +1,8 @@
 """Detección de CAPTCHA y bloqueos anti-bot.
 
-Solo se detecta para **parar** (el navegador lanza `Bloqueado` y no reintenta): nunca se intenta
-resolver ni evadir un desafío (nota 07, scraping ético).
+Solo se detecta para **parar** (el navegador lanza `Bloqueado` y no reintenta) o, con un proxy
+configurado, para repetir la petición **una vez** desde otra IP (`navegador.con_proxy`). Nunca se
+intenta resolver un desafío ni un CAPTCHA (nota 07, scraping ético).
 
 Un widget de CAPTCHA por sí solo no es un bloqueo: muchas tiendas cargan reCAPTCHA v3 en todas las
 páginas o lo ponen en el formulario de contacto de la ficha. Cuenta como bloqueo si llega con un
@@ -39,7 +40,7 @@ _MOTIVO_AKAMAI = "Bloqueo del WAF de Akamai («Access Denied»)."
 _MOTIVO_CLOUDFRONT = "Bloqueo del WAF de AWS (CloudFront «Request blocked»)."
 _MOTIVO_F5 = "Bloqueo del WAF de F5 (BIG-IP ASM)."
 _MOTIVO_KASADA = "Desafío anti-bot de Kasada."
-_MOTIVO_LIMITE = "La tienda limita las peticiones (HTTP 429)."
+MOTIVO_LIMITE = "La tienda limita las peticiones (HTTP 429)."
 
 # Marcas que solo están en la página de desafío o de bloqueo de cada proveedor, no en su sensor.
 _PROVEEDORES = (
@@ -133,7 +134,7 @@ def detectar_bloqueo(pagina: Pagina) -> str | None:
         # `*.captcha-delivery.com`, una reseña que cita un «Incapsula incident ID», unas
         # instrucciones «press & hold» o el reCAPTCHA del formulario de contacto junto a una
         # descripción que dice «control de seguridad». Solo el 429 se respeta siempre.
-        return _MOTIVO_LIMITE if pagina.estado == 429 else None
+        return MOTIVO_LIMITE if pagina.estado == 429 else None
     titulo = _titulo(contenido)
 
     # Primero el proveedor: un 429 de Kasada dice más con su nombre que con el código.
@@ -141,7 +142,7 @@ def detectar_bloqueo(pagina: Pagina) -> str | None:
     if motivo is not None:
         return motivo
     if pagina.estado == 429:
-        return _MOTIVO_LIMITE
+        return MOTIVO_LIMITE
 
     habla_de_desafio = any(f in contenido for f in _FRASES_DESAFIO)
     sospechosa = pagina.estado in _ESTADOS_DESAFIO or habla_de_desafio
@@ -200,7 +201,7 @@ def _proveedor(contenido: str, titulo: str, estado: int) -> str | None:
 def _bloqueo_en_datos(pagina: Pagina) -> str | None:
     """JSON o XML: solo el límite de peticiones y el bloqueo de DataDome a una llamada de API."""
     if pagina.estado == 429:
-        return _MOTIVO_LIMITE
+        return MOTIVO_LIMITE
     if pagina.estado >= 400 and "captcha-delivery.com" in pagina.html[:_LIMITE_DATOS].lower():
         return _MOTIVO_DATADOME
     return None
