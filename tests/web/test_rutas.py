@@ -241,3 +241,31 @@ def test_robots_ignorado_no_dice_que_la_tienda_no_se_visite(cliente: ClienteASGI
     # Por defecto (ADR-017) se ignora: la etiqueta «robots.txt lo prohíbe» informa, no excluye.
     html = cliente.get("/").texto
     assert "robots.txt lo prohíbe · se ignora" in html
+
+
+# --- ADR-022: cliente HTTP con la huella de Chrome (curl) o urllib ------------------------------
+
+
+def test_ajustes_muestran_el_selector_del_cliente_http(cliente: ClienteASGI) -> None:
+    texto = cliente.get("/ajustes").texto
+    assert 'name="transporte_http"' in texto
+    assert '<option value="curl" selected>' in texto
+    assert '<option value="urllib">' in texto
+
+
+@pytest.mark.parametrize("transporte", ["urllib", "curl"])
+def test_ajustes_guardan_el_cliente_http(cliente: ClienteASGI, transporte: str) -> None:
+    respuesta = cliente.post(
+        "/ajustes", {"transporte_http": transporte}, cabeceras={"Origin": "http://127.0.0.1:8000"}
+    )
+    assert respuesta.estado == 303
+    assert f'<option value="{transporte}" selected>' in cliente.get("/ajustes").texto
+
+
+@pytest.mark.parametrize("transporte", ["requests", "CURL", ""])
+def test_ajustes_rechazan_otro_cliente_http(cliente: ClienteASGI, transporte: str) -> None:
+    respuesta = cliente.post(
+        "/ajustes", {"transporte_http": transporte}, cabeceras={"Origin": "http://127.0.0.1:8000"}
+    )
+    assert respuesta.estado == 422
+    assert "Cliente HTTP no válido" in respuesta.texto

@@ -82,6 +82,16 @@ Alimenta la memoria §3 («método de validación del código generado»).
 | 2026-10-20 | Un corte por tiempo propio se tomaba por «la tienda cortó la conexión» y la tienda lenta pasaba al proxy de pago para siempre | Revisor adversarial (red) | Distinguir el corte del temporizador + test con tienda que gotea |
 | 2026-10-20 | Un 429 se repetía por el proxy, saltándose el límite de frecuencia de la tienda | Revisor adversarial (lógica) | El 429 normal no se repite + test |
 | 2026-10-20 | La contraseña de `PRECIA_PROXY` con caracteres que NFKC convierte en separadores acababa en el log y en Ajustes | Revisor adversarial de seguridad | `URLProxyNoValida` con mensajes propios + test |
+| 2026-10-22 | El test del relé `test_connect_se_reenvia_al_proxy_con_las_credenciales` lee el túnel con una sola `read(65536)` y falla 3 de cada 5 veces cuando el cuerpo llega en otro segmento | Yo (S03), al pasar `pytest` antes del commit y repetir el fichero 5 veces | Corregido a las 12:46 (S03): el helper lee hasta EOF; 0 fallos en 10 repeticiones (antes, 9 de 20) |
+| 2026-10-22 | Un subagente planificador lanzó experimentos con Playwright `channel='chromium'` (Chrome for Testing) que salieron a Internet (DoH automático: UDP a 8.8.8.8:53 y TLS a 8.8.4.4:443, `dns.google`), aunque las instrucciones decían «no hagas peticiones a Internet» | Crítico adversarial (S03), leyendo el netlog de Chromium | Solo el headless shell (ADR-023) y un test de netlog que verifique que no hay tráfico fuera del relé |
+| 2026-10-22 | En un test de `TransporteCurl` esperaba que una cookie puesta por `tienda.example` (sin `Domain`, solo para ese host) se mandara también a `www.tienda.example` | Yo (S03): el test falló en la primera ejecución y curl tenía razón (es lo que hace un navegador) | Test corregido para pedir al mismo host; la sesión por dominio sin «www.» se mantiene |
+| 2026-10-22 | El relé SOCKS5 sin proxy abría cada conexión en el executor por defecto, con 30 s por IP y sin tope: una página hostil podía congelar la aplicación | Revisión adversarial (lente seguridad), reproducido con 32 clientes contra 127.0.0.1 | Grupo de hilos propio para el DNS, `asyncio.open_connection` con plazo total y semáforo de 8 (S03) |
+| 2026-10-22 | El rescate con Chromium dejaba escapar `playwright.Error` sin traducir (la tienda acababa INESPERADO) y reutilizaba para siempre un Chromium muerto | Revisión adversarial (lente corrección), reproducido con `Browser.crash` en el headless shell | Traducción a `ErrorDescarga`, relanzar si `is_connected()` es falso y `_rescatar` relanza el original ante cualquier fallo (S03) |
+| 2026-10-22 | Tres tests de seguridad de curl que no podían fallar: Alt-Svc por `http://` (libcurl solo lo sigue por HTTPS), ninguno pasaba por la comprobación de `primary_ip` y el de reutilización acababa en `>= 1` | Revisión adversarial (lente tests y reglas), con mutantes | Alt-Svc por HTTPS, 2 tests nuevos de `primary_ip` y asertos que pueden fallar; cada uno verificado con su mutante (S03) |
+| 2026-10-22 | Una tienda rescatada con Chromium se pedía dos veces con Chromium en el descubrimiento (`js=False` y luego `js=True`), contra lo que decía su propio docstring; un rescate con 403 también marcaba la tienda | Revisión adversarial (lente tests y reglas), reproducido con el `Montaje` de los tests | `Pagina.por_chromium`, caché con clave `js` para lo que trae Chromium, `_probar` y la portada sin segunda pasada, y sin marca tras un 403 (S03) |
+| 2026-10-22 | Cuarta vez: escribió horas del diario y la bitácora antes de consultar el reloj (dos desmentidas por el propio `date`, seis con posible desvío de 1–2 min) | Autorrevisión al cerrar el bloque, comparando con la salida de `date` | Horas desmentidas corregidas y aviso en el diario con la última hora real de cada entrada (S03) |
+| 2026-10-22 | Al aplicar ADR-021/022/023 dejó textos que las contradicen: «no se evade» en `orquestador.BLOQUEO` y en las notas 15 y 08, «no evade protecciones» en `inicio.html`, «El navegador lanza `Bloqueado` y no reintenta» en la nota 14, y «tres desviaciones» con cuatro viñetas en la 08 | Cierre documental de S03, con `grep` de «evad» y «honesto» en el vault y en `src/` | Notas 08, 14 y 15 corregidas citando las ADR; el código no se toca (bug 14 de la nota 12, decide Julio) |
+| 2026-10-22 | El verificador independiente de S03 contó los finales de línea con `grep -c $'\r$'` en Git Bash, que da CRLF también en ficheros LF, y estuvo a punto de reportar como falsas las verificaciones «LF» del diario | Él mismo (S03), al ver que `git ls-files --eol` decía `w/lf` en un fichero que `grep` daba como CRLF | Recontado por bytes con Python: las verificaciones del diario eran correctas; no se reportó nada falso |
 
 ---
 
@@ -371,3 +381,198 @@ Alimenta la memoria §3 («método de validación del código generado»).
 - **Qué:** Julio aprueba cookies en memoria por tienda, que Chromium use su propia red (hoy la saca por Node con `route.fetch`) y un intento con Chromium tras un bloqueo por HTTP. Se mantiene el diagnóstico (clasificación de bloqueos y cabeceras de respuesta en `Pagina`).
 - **Lección:** la mayor parte del problema era incoherencia creada por el propio PrecIA (red de Node bajo un Chromium, visitas en frío sin cookies).
 - **Para la memoria:** §4, Eval · S02
+
+### 2026-10-22 10:20 · ✅ Avance · Trabajo del proxy guardado en git (commit 083851b en core/proxy)
+- **Qué pasó:** con la autorización de Julio, el proxy residencial (ADR-020), el relé local de Chromium y las correcciones de la revisión adversarial quedan en un commit de la rama `core/proxy`: 33 ficheros, 12 nuevos. Sin push. Antes se comprobó que no entra ningún secreto: el grep de claves solo encuentra valores de prueba y los valores reales de `.env` no aparecen.
+- **Qué se hizo:** ruff, formato y mypy en verde; pytest 3115 en verde con 3 fallos intermitentes (ver la entrada siguiente).
+- **Para la memoria:** §6 (hitos y estructura), §3 · S03
+
+### 2026-10-22 10:20 · ❌ Fallo · Test del relé intermitente: lee el túnel con una sola llamada
+- **Qué pasó:** `test_connect_se_reenvia_al_proxy_con_las_credenciales` falla 3 de cada 5 ejecuciones. La respuesta trae `200 Connection established` y las cabeceras de la tienda, pero no el cuerpo.
+- **Causa / contexto:** el helper `_pedir` del test hace `lector.read(65536)` una sola vez. `BaseHTTPRequestHandler` envía cabeceras y cuerpo en escrituras distintas, y a veces llegan en segmentos separados. Es un fallo del test generado por la IA, no del relé. También fallaron otra vez los dos tests de cronómetro de `test_embebidos` (1,03 s frente a 1 s; bug 6).
+- **Qué se hizo:** sin resolver; se reporta para corregir el test (leer hasta EOF, la petición lleva `Connection: close`).
+- **Lección:** con sockets, una lectura no equivale a un mensaje. Un test que pasa «casi siempre» en local es un test roto.
+- **Para la memoria:** §3 (validación del código generado) · S03
+
+### 2026-10-22 10:25 · 🧭 Decisión · Huella de Chrome en las descargas: Chromium con su red y curl_cffi (ADR-022)
+- **Qué pasó:** para TLS/HTTP2, Julio elige «Chromium + curl_cffi» y «Las de Chrome». Chromium usa su propia red (TLS y HTTP/2 reales, sin `route.fetch` de Node) y sirve de recurso tras un bloqueo por HTTP. Un `TransporteCurl` opcional con `curl_cffi` (`impersonate='chrome'`, hoy `chrome150`) da al cliente ligero la huella TLS (JA3/JA4) y HTTP/2 de Chrome, con su UA y sus cabeceras por defecto. El cliente `urllib` conserva el UA configurado. Julio aprueba `curl_cffi==0.16.3`, `cffi`, `pycparser` y `certifi`.
+- **Causa / contexto:** ADR-021 levantó la prohibición de falsear la huella. Los WAF deciden por la coherencia entre TLS, HTTP/2 y cabeceras, y `urllib` + `ssl` no pueden imitar la de Chrome. Se descartan `httpx[http2]` (HTTP/2 con la huella de OpenSSL) y un HTTP/2 propio sobre `ssl` (no controla extensiones, GREASE ni ajustes de Chrome). Se mantienen la cortesía por dominio, el anti-SSRF en cada salto, nunca login, 1 reintento por el proxy y Google desactivado.
+- **Lección:** es la primera dependencia que entra porque la stdlib no puede hacer el trabajo, no por comodidad: la huella TLS depende de la librería criptográfica y no del código Python. Hay que justificarlo así en la memoria (ADR-007).
+- **Para la memoria:** §4 (diseño del navegador), §7 (tecnologías), §8 (legal y ética) · S03
+
+### 2026-10-22 12:16 · ❌ Fallo · Un subagente salió a Internet con Chrome for Testing en contra de sus instrucciones
+- **Qué pasó:** durante el diseño de Chromium con red propia, un subagente planificador lanzó experimentos con Playwright `channel='chromium'` (Chrome for Testing). Ese binario hace DoH automático: el netlog muestra UDP a 8.8.8.8:53 y TLS a 8.8.4.4:443 (`dns.google`), fuera de cualquier relé. Las instrucciones del subagente decían «no hagas peticiones a Internet».
+- **Causa / contexto:** el agente dio por hecho que un Chromium sin navegar a ninguna web no hace tráfico. Chrome for Testing trae activados servicios de fondo (DoH) que el headless shell no tiene, y además no admite `--force-webrtc-ip-handling-policy`. Lo detectó el crítico adversarial leyendo el netlog, no el propio agente.
+- **Qué se hizo:** se descarta Chrome for Testing: solo el headless shell (sin `channel`), recogido en ADR-023. Se exige un test de netlog que compruebe que Chromium no abre ninguna conexión fuera del relé SOCKS5 local.
+- **Lección:** una instrucción en el prompt no impide nada; hay que verificarla con una medida (el netlog). Y un navegador «sin navegar» no es un navegador sin red.
+- **Para la memoria:** §3 (validación del código generado), §4 (diseño del navegador) · S03
+
+### 2026-10-22 12:16 · 🧭 Decisión · Chromium tras un relé SOCKS5 siempre activo (ADR-023) y curl por defecto
+- **Qué pasó:** Julio aprueba ADR-023 entera («Aprobar ADR-023 entero (Recommended)») y el rescate «Chromium por el proxy (Recommended)». Chromium usa su propia red detrás de un relé SOCKS5 en 127.0.0.1, siempre activo, que valida cada conexión TCP (saltos de redirección y subrecursos) en modo directo o encadenado al proxy residencial. Va en headless shell sin `channel`, con el UA y los `userAgentMetadata` del propio binario sin «HeadlessChrome» (por CDP, `Emulation.setUserAgentOverride`), bypass `<-loopback>` explícito y `route` solo para `abort` / `continue_`. Tras un bloqueo o un corte por HTTP hay 1 intento con Chromium; el 403 sale de `RECHAZOS` y se reintenta, el 401 y el 451 nunca. Si la tienda ya está marcada para el proxy, Chromium sale por el proxy (un único intento que cambia IP y cliente; no suma reintentos al de ADR-020). Además, Julio elige «curl por defecto (Recommended)»: `transporte_http='curl'` y urllib como opción. Para el proxy local dejó elegir («la que sea mejor») y se mantiene urllib, sin la API privada de `curl_cffi`.
+- **Causa / contexto:** validar en el relé y no en `route` cubre todo el tráfico del navegador (también lo que no pasa por la página) sin volver a la red de Node. El UA por defecto del headless shell se delata, y Chrome for Testing sacaba tráfico fuera del relé (entrada anterior). Los errores HTTP/2 (`RST_STREAM`, códigos de curl 92 y 16) no cuentan por ahora como corte para pasar al proxy: pendiente de Julio.
+- **Lección:** el control de seguridad tiene que estar en el único punto por el que pasa todo el tráfico (el relé), no en una API del navegador que deja huecos.
+- **Para la memoria:** §4 (diseño del navegador), §7 (tecnologías), §8 (legal y ética) · S03
+
+### 2026-10-22 12:31 · ❌ Fallo · Test de cookies de curl mal planteado por la IA
+- **Qué pasó:** en la primera ejecución de `test_curl.py` (49 en verde), falló `test_cookies_aisladas_por_tienda`: esperaba que la cookie de `tienda.example` llegara a `www.tienda.example`.
+- **Causa / contexto:** una cookie sin atributo `Domain` es solo del host que la puso (RFC 6265). Compartir la sesión entre `tienda.example` y `www.tienda.example` no cambia esa regla, y curl la aplica igual que Chrome. El error era de la expectativa del test, escrita por la IA, no del código.
+- **Qué se hizo:** el test pide al mismo host; sigue comprobando que otra tienda no recibe la cookie.
+- **Lección:** cuando un test «falla» contra una librería madura, primero hay que comprobar si la expectativa respeta el estándar.
+- **Para la memoria:** §3 (validación del código generado) · S03
+
+### 2026-10-22 12:41 · ✅ Avance · Transporte curl con la huella TLS y HTTP/2 de Chrome, por defecto
+- **Qué pasó:** queda implementada la vía curl de ADR-022: `navegador/curl.py` con `TransporteCurl` (`curl_cffi`, perfil `chrome`, una sesión por tienda con cookies solo en memoria y tope, LRU de 32 que nunca espera a una petición en vuelo). Las defensas de urllib siguen: IP validadas y fijadas con `RESOLVE` (sin DNS de curl), `NOPROXY=''` y sin proxies del entorno, solo http/https, sin redirecciones ni reintentos, tope de bytes **descomprimidos** (bomba de 200 MiB parada en el tope en menos de 2 s), plazo total que incluye DNS y espera, comprobación de `primary_ip` y errores traducidos (RST, también tras el ClientHello, como corte para `con_proxy`; tiempo agotado sin causa). Con proxy remoto, túnel `CONNECT` con el nombre de la tienda y el del proxy fijado; con proxy local, `TransporteURLLib` (decisión de Julio). Ningún error cita las credenciales, ni siquiera el de un `setopt` que mete el valor en su mensaje. `DescargadorHTTP` pasa al transporte el tiempo total y el tope exacto (`TransporteNavegador`), acepta respuestas ya descomprimidas y lo cierra. En Ajustes, «Cliente HTTP» con `curl` por defecto y `urllib` como opción.
+- **Causa / contexto:** decisiones de Julio de S03 (ADR-022 y «curl por defecto»), plan corregido tras la revisión adversarial.
+- **Qué se hizo:** TDD por pasos; donde el código ya existía antes del test (modo proxy), se comprobó con mutaciones que los tests fallan si se quita la defensa (`NOPROXY`, `from None`, urllib para el proxy local, `RESOLVE`).
+- **Para la memoria:** §4 (diseño del navegador), §7 (tecnologías), §3 · S03
+
+### 2026-10-22 12:41 · 🧭 Decisión · Tres ajustes al plan de curl durante la implementación
+- **Qué pasó:** (1) `DescargadorHTTP` pasa **todas** sus cabeceras a `TransporteNavegador.pedir` (sin la propiedad `cabeceras_propias` del plan) y curl solo usa las de Chrome: con un proxy local, `TransporteCurl` delega en `TransporteURLLib`, que necesita el User-Agent, `Accept` y `Accept-Encoding: identity`. (2) Con proxy local, la delegación en urllib se decide dentro de `TransporteCurl`, en la primera petición y en el hilo, con la IP resuelta del proxy (nada de DNS en el bucle de eventos al crear el navegador). (3) Un `transporte_http` desconocido en la BD usa el de por defecto (`curl`), no `urllib`.
+- **Causa / contexto:** el plan se escribió cuando el defecto era urllib y con `CONNECT_TO` para el proxy local; las dos cosas cambiaron con las decisiones de Julio de las 12:15.
+- **Para la memoria:** §4 (diseño del navegador) · S03
+
+### 2026-10-22 12:41 · 📏 Medida · Tests de la vía curl
+- **Qué pasó:** +95 tests (de 3116 a 3211 en verde): 50 en `test_curl.py`, 21 en `test_curl_proxy.py`, 7 en `test_http_gzip.py`, 4 en `test_http.py`, 5 en `test_fuente_real_proxy.py` (2 casos nuevos del cableado y 3 tests nuevos), 6 en `test_rutas.py` y 2 en `test_ajustes.py`. `ruff`, `ruff format` y `mypy` (180 ficheros) en verde. Suite completa: 3211 en verde, 4 omitidos (`openssl` fuera del PATH en tests antiguos) y los 2 intermitentes conocidos de `test_embebidos` (cronómetro). Los ficheros de curl y HTTP, 5 veces seguidas: 209 en verde las 5, unos 28 s cada vez.
+- **Para la memoria:** §3, §6 · S03
+
+### 2026-10-22 12:46 · 🔧 Solución · Test intermitente del relé: leer el túnel hasta EOF
+- **Qué pasó:** `test_rele.py::test_connect_se_reenvia_al_proxy_con_las_credenciales` fallaba 9 de cada 20 veces (medido en bucle antes de tocarlo).
+- **Causa / contexto:** el helper del test leía la respuesta de la tienda con una sola `read(65536)`. Por el túnel, la cabecera y el cuerpo pueden llegar en segmentos TCP distintos, y entonces el cuerpo no estaba en lo leído. El fallo era del test (escrito por la IA en S02), no del relé.
+- **Qué se hizo:** el helper lee hasta EOF (la GET lleva `Connection: close` y el relé cierra al cerrar la tienda). El fichero entero, 10 veces seguidas: 0 fallos.
+- **Lección:** en un test de red, una lectura no es un mensaje: hay que leer hasta el delimitador o hasta EOF.
+- **Para la memoria:** §3 (validación del código generado) · S03
+
+### 2026-10-22 13:16 · ❌ Fallo · El cierre del relé se colgaba con Chromium real (asyncio en Windows)
+- **Qué pasó:** la primera ejecución de los tests reales de Chromium con el relé SOCKS5 se quedó colgada 10 minutos sin salida.
+- **Causa / contexto:** con un script de depuración por pasos se vio que la descarga terminaba bien y que lo que no volvía era `ReleProxy.cerrar()`, en `Server.wait_closed()`. Al cerrar, Chromium corta alguna conexión con RST; en Windows, asyncio 3.13 lanza `ConnectionResetError` dentro de `_ProactorBasePipeTransport._call_connection_lost` (en el `shutdown`) y se salta `server._detach`, así que el servidor cree que esa conexión sigue viva para siempre. No es determinista: unas ejecuciones se colgaban y otras no.
+- **Qué se hizo:** `cerrar()` espera a las conexiones como mucho 1 s (`ESPERA_CIERRE_S`); el puerto ya queda cerrado con `close()`. Test que simula un `wait_closed` que nunca vuelve: rojo antes del cambio, verde después.
+- **Lección:** «esperar a que se cierre todo» sin plazo es un cuelgue esperando a ocurrir; y los tests reales sin un `timeout` propio esconden dónde se cuelgan.
+- **Para la memoria:** §3 (validación), §4 (diseño del navegador) · S03
+
+### 2026-10-22 13:16 · 💡 Aprendizaje · Lo que dice el netlog del headless shell
+- **Qué pasó:** el test que comprueba que Chromium no sale de 127.0.0.1 encontró un `UDP_CONNECT` a `[2001:4860:4860::8888]:443`. Es la sonda con la que Chromium mira si hay ruta IPv6 (`HOST_RESOLVER_MANAGER_IPV6_REACHABILITY_CHECK`): un `connect()` UDP elige la ruta y no manda ningún paquete (aquí falló con -109, sin IPv6). No hay ni un `UDP_BYTES_SENT` ni un `TCP_CONNECT` fuera del relé. Además: `Sec-Fetch-*` y los client hints solo se mandan a orígenes seguros (`localhost` sí, `http://tienda.example` no), y sin `--force-webrtc-ip-handling-policy` una página manda 2 paquetes STUN directos (con el flag, 0).
+- **Qué se hizo:** el test separa los `connect()` UDP (solo se admite esa sonda) de los envíos UDP (ninguno fuera de loopback). Las mutaciones confirman que el test de WebRTC, el de client hints y los de saltos prohibidos fallan si se quita su defensa.
+- **Lección:** «sin tráfico» hay que definirlo con precisión (paquetes enviados, no sockets abiertos) para que el test no dé falsos positivos ni se relaje hasta no medir nada.
+- **Para la memoria:** §4 (diseño del navegador), §3 · S03
+
+### 2026-10-22 13:29 · ✅ Avance · Chromium con su propia red detrás de un relé SOCKS5 que valida cada conexión
+- **Qué pasó:** queda implementada la vía Chromium de ADR-023. `rele.py` pasa a ser un servidor **SOCKS5** local (solo `CONNECT` sin autenticación), siempre activo con Chromium, que valida **cada conexión TCP** con el mismo validador que el descargador: host estricto, puerto 80/443 comprobado por él y conexión al host normalizado; sin proxy conecta a la IP validada (contra el *DNS rebinding*) y con proxy encadena al residencial con las credenciales, que Chromium nunca ve. `chromium.py` arranca el headless shell (sin `channel`) contra el relé con `bypass <-loopback>`, sin UDP fuera del proxy (WebRTC) ni QUIC, deja que Chromium use su red (`route` solo `abort`/`continue_`, fuera `route.fetch`) y pone por CDP el UA y los client hints del propio binario sin «HeadlessChrome». `navegador.py` prueba **una vez** con Chromium tras un bloqueo o un corte por HTTP (nunca tras 429, 401 o 451; nunca para sitemaps ni robots.txt), relanza el error original si Chromium no puede y, con proxy, Chromium sale por él si la tienda ya está marcada. El 403 sale de `RECHAZOS` en el descubrimiento y Chromium deja de recibir el UA de Ajustes.
+- **Causa / contexto:** decisiones de Julio de S03 (ADR-023 entero, rescate con Chromium por el proxy) y plan corregido tras la revisión adversarial.
+- **Qué se hizo:** TDD por pasos y mutaciones para comprobar que los tests muerden: sin la comprobación de puerto, del host estricto o de la IP del relé, sin el flag de WebRTC (2 paquetes STUN), sin el override por CDP o con el relé sin validar, los tests fallan. Un test de netlog garantiza que Chromium no abre conexiones ni manda UDP fuera de 127.0.0.1 (la defensa contra repetir el error de Chrome for Testing).
+- **Para la memoria:** §4 (diseño del navegador), §3 (validación), §7 · S03
+
+### 2026-10-22 13:29 · 📏 Medida · Tests de la vía Chromium
+- **Qué pasó:** de 3217 a 3289 tests recogidos (+72; antes, 3211 en verde, 4 omitidos y 2 intermitentes): `test_rele.py` 54 (antes 12), `test_chromium.py` 34 (antes 28; 22 sin navegador y 12 con el headless shell real), 20 nuevos en `test_navegador.py`, 2 en `test_navegador_grande.py`, 1 en `test_descubrimiento.py` (más el 403 movido de un parámetro a otro) y 1 en `test_fuente_real_proxy.py`. `ruff`, `ruff format` y `mypy` (180 ficheros) en verde. Suite completa con los tests de Chromium: 3286 en verde y los 2 intermitentes conocidos de `test_embebidos` (cronómetro). Los 12 tests reales de Chromium tardan unos 25 s; `test_chromium.py` + `test_rele.py`, 3 veces seguidas: 88 en verde las 3. El intermitente del relé: 9 fallos de 20 antes del arreglo, 0 de 10 después.
+- **Para la memoria:** §3, §6 · S03
+
+### 2026-10-22 13:53 · ❌ Fallo · El relé sin proxy podía llenar el executor por defecto de la aplicación
+- **Qué pasó:** la revisión adversarial confirmó (y reprodujo contra 127.0.0.1) que el relé SOCKS5 que escribió la IA, sin proxy, abría cada conexión con `asyncio.to_thread(conexion_validada(...))`: `create_connection` bloqueante, IP a IP, con el plazo entero (30 s) para **cada** IP y sin tope de conexiones. Ese executor es el de las descargas, la caché, el almacén y la IA. Una página hostil que abra decenas de `fetch` a nombres cuyas IP descartan el SYN ocupaba los 24 hilos durante minutos, y cancelar no paraba los hilos.
+- **Causa / contexto:** al hacer el relé «siempre activo» (ADR-023) se reutilizó `conexion_validada`, pensada para urllib (un hilo por descarga), dentro de un servidor que atiende conexiones que decide una web. Nadie pensó en la concurrencia que impone el atacante.
+- **Para la memoria:** §3 (validación del código generado), §5 (riesgos) · S03
+
+### 2026-10-22 13:53 · 🔧 Solución · Relé sin hilos compartidos, con plazo total y tope de conexiones
+- **Qué se hizo:** sin proxy, el relé resuelve con `ips_permitidas` en un grupo de 4 hilos **propio** (con plazo) y conecta con `asyncio.open_connection` a cada IP validada contra un único límite de tiempo; un semáforo deja validar y abrir como mucho 8 conexiones a la vez y `cerrar()` apaga el grupo sin esperar. Tests nuevos: con 32 conexiones colgadas por un DNS lento, un `to_thread` ajeno pasaba de 2,64 s a menos de 0,3 s; 5 IP que no contestan dan `0x05` en menos de 1 s con un plazo de 0,4 s; nunca más de 8 intentos a la vez.
+- **Lección:** un componente que atiende peticiones que decide una web es una superficie de denegación de servicio: plazos totales, topes y nada de recursos compartidos con el resto de la aplicación.
+- **Para la memoria:** §3, §4 (diseño del navegador) · S03
+
+### 2026-10-22 13:57 · ❌ Fallo · El rescate con Chromium dejaba escapar errores de Playwright y reutilizaba un Chromium muerto
+- **Qué pasó:** la revisión adversarial lo reprodujo con el headless shell real: tras tumbar Chromium con `Browser.crash`, un 403 de Cloudflare por HTTP acababa en `TargetClosedError` (no en `Bloqueado`), una y otra vez, y la tienda salía como error INESPERADO. `descargar` solo traducía los fallos de `goto` y `content()`; `new_context`, la página y la sesión CDP lanzaban `playwright.Error` en bruto, `_rescatar` solo capturaba `ErrorDescarga` y `_abrir` solo relanzaba si `_navegador` era `None`.
+- **Causa / contexto:** el código lo escribió la IA y el docstring prometía «quien llama ve lo mismo que sin Chromium» sin un test que lo comprobara con un error que no fuera `ErrorDescarga`. El rescate llevó a las tiendas HTTP un problema que antes solo tocaba a las de `necesita_js`.
+- **Para la memoria:** §3 (validación del código generado) · S03
+
+### 2026-10-22 13:57 · 🔧 Solución · Errores de Playwright traducidos y Chromium relanzado si murió
+- **Qué se hizo:** `descargar` convierte todo `playwright.Error` no traducido en `ErrorDescarga`, el cierre del contexto no tapa el error, `_abrir` mira `is_connected()` y relanza (soltando relé y Playwright), y `_rescatar` relanza el error original ante cualquier fallo inesperado (con su traza en el registro). Tests con Playwright falso, en `Navegador` y uno real que tumba Chromium por CDP; una mutación confirma que muerden.
+- **Lección:** cada promesa de un docstring necesita un test con el caso que la rompe; un componente externo (Playwright) lanza sus propias excepciones en cualquier llamada, no solo en las «peligrosas».
+- **Para la memoria:** §3, §4 (diseño del navegador) · S03
+
+### 2026-10-22 14:00 · ❌ Fallo · Tres tests de seguridad de curl que no podían fallar
+- **Qué pasó:** la revisión adversarial demostró con mutantes que tres tests escritos por la IA no protegían nada: `test_no_sigue_alt_svc` mandaba Alt-Svc por `http://`, y libcurl solo lo acepta por HTTPS (pasaba con Alt-Svc activado, que por TLS lleva a curl a resolver la tienda con su propio DNS); ningún test pasaba por la comprobación de `primary_ip` (quitarla dejaba la suite en verde); y el test de conexión reutilizada acababa en `assert a + b >= 1`, cierto siempre.
+- **Causa / contexto:** se escribieron los tests a la vez que el código y se dieron por buenos al verlos en verde, sin comprobar que fallaran sin la defensa. Es el mismo patrón que ya había salido en S02.
+- **Para la memoria:** §3 (validación del código generado) · S03
+
+### 2026-10-22 14:00 · 🔧 Solución · Tests de curl comprobados con mutantes
+- **Qué se hizo:** Alt-Svc por HTTPS con el certificado de la tienda; dos tests nuevos que llegan a conectar y comprueban `URLNoPermitida` en la comprobación posterior (IP rechazada y `primary_ip` vacío); el de reutilización afirma qué servidor contesta. Cada uno se comprobó con su mutante: Alt-Svc activado → falla; sin la defensa de `primary_ip` → fallan los 2 nuevos. De paso, el test de reutilización baja de 5 s a milisegundos (se cerraba el transporte después del servidor keep-alive).
+- **Lección:** un test de seguridad solo cuenta si se le ha visto fallar sin la defensa: para cada defensa, su mutante.
+- **Para la memoria:** §3 · S03
+
+### 2026-10-22 14:06 · ❌ Fallo · El descubrimiento pedía dos veces con Chromium las páginas de una tienda rescatada
+- **Qué pasó:** la revisión adversarial lo reprodujo: tras rescatar una tienda, sus peticiones `js=False` ya van por Chromium, pero se guardaban en la caché con la clave `js=False`; el descubrimiento repite con `js=True` cada candidata que no es definitiva (200 sin listado, 403 grande, 5xx) y la portada, así que cada una se descargaba dos veces con Chromium. El docstring de `RECHAZOS` escrito por la IA decía «así que no hay dos intentos con Chromium». Además, un rescate que daba un 403 grande también marcaba la tienda.
+- **Causa / contexto:** el rescate se añadió en `Navegador` sin repasar a quien llama con `js=True` después de `js=False` (el descubrimiento) y sin un test que los juntara.
+- **Para la memoria:** §3 (validación del código generado), §4 · S03
+
+### 2026-10-22 14:06 · 🔧 Solución · `Pagina.por_chromium` y una sola descarga con Chromium por URL
+- **Qué se hizo:** `Pagina` dice si la descargó Chromium; el navegador guarda esas páginas como versión `js` en la caché (y la usa para `js=False` en una tienda rescatada) y solo marca la tienda si el rescate no dio un 403; el descubrimiento no repite con `js=True` lo que ya fue por Chromium. Test con el `Navegador` real y descargadores falsos: la portada y cada candidata, una sola vez con Chromium; dos mutaciones confirman que el test muerde.
+- **Lección:** al añadir un comportamiento en una capa (el rescate), hay que probarlo con sus llamadores reales, no solo con dobles de la capa de arriba.
+- **Para la memoria:** §3, §4 (diseño del navegador y del descubrimiento) · S03
+
+### 2026-10-22 14:15 · 📏 Medida · Correcciones de la revisión adversarial de la rama `core/tls-http2`
+- **Qué pasó:** 5 hallazgos confirmados de gravedad media corregidos (relé SOCKS5 que podía congelar la aplicación, errores de Playwright sin traducir y Chromium muerto, test de Alt-Svc inútil, defensa de `primary_ip` sin tests, doble descarga con Chromium) y 4 de gravedad baja (plazo de menos de 1 ms en curl, IP del proxy fija para siempre, textos del User-Agent y del 429). Queda pendiente el de la CI (instalar el headless shell). De 3289 a 3307 tests (+18). Suite completa: 3305 en verde y los 2 intermitentes de cronómetro de `test_embebidos` (ajenos a la rama); `test_curl*.py` + `test_rele.py`, 5 veces seguidas: 133 en verde las 5. Para los tests que cubren código ya existente, el «rojo» se comprobó con 6 mutantes (Alt-Svc activado, sin `primary_ip`, sin `is_connected`, sin los dos saltos del descubrimiento): todos los matan.
+- **Para la memoria:** §3 (validación), §6 · S03
+
+### 2026-10-22 14:16 · ❌ Fallo · Otra vez horas del diario escritas sin mirar el reloj
+- **Qué pasó:** en el bloque de correcciones de la revisión, la IA escribió varias horas del diario y de la bitácora en el mismo comando que consultaba el reloj, pero **antes** de consultarlo. Dos quedaron desmentidas por el propio `date` (14:10 era 14:09; 14:16 y 14:17 eran 14:15) y otras seis pueden desviarse 1–2 minutos.
+- **Causa / contexto:** por ir rápido se juntó en una sola llamada «apuntar la entrada» y «mirar la hora», en vez de mirar la hora primero. Es el mismo error que ya está tres veces en la tabla (S01).
+- **Qué se hizo:** corregidas las dos horas desmentidas, avisadas las demás en el diario con la última hora real consultada antes de cada una.
+- **Lección:** la hora se consulta en un paso aparte y antes de escribir; juntarlo en un comando invita a escribirla de memoria.
+- **Para la memoria:** §3 (método de validación del proceso con IA) · S03
+
+### 2026-10-22 14:22 · 📏 Medida · Prueba real de la huella de Chrome (S03), sin proxy y desde la IP de casa
+- **Qué pasó:** 1 petición por vía y URL, ≥ 5 s entre peticiones a la misma tienda, sin proxy, con las clases reales (`DescargadorHTTP` con `TransporteURLLib` o `TransporteCurl`, `DescargadorChromium` como en `fuente_real`); Chromium solo si curl quedaba bloqueado. 18 peticiones de primer nivel en total.
+- **Huellas (tls.peet.ws):**
+
+| Vía | HTTP | JA4 | JA3 | Akamai (HTTP/2) | User-Agent |
+|---|---|---|---|---|---|
+| urllib | HTTP/1.1 | `t13d1811_85036bcba153_d41ae481755e` | `93c7d42c0df602fb91589311534831f5` | — | `PrecIA/0.1 (proyecto universitario; uso personal)` |
+| curl | h2 | `t13d1516h2_8daaf6152771_806a8c22fdea` | `3f5c2b9d89a987fada29e448d03e3569` | `52d84b11737d980aef856699f885ca86` | Chrome 150, macOS (perfil de `curl_cffi`) |
+| Chromium | h2 | `t13d1516h2_8daaf6152771_806a8c22fdea` | `4725c7558f3d12edd31bc96f5a9845a1` | `52d84b11737d980aef856699f885ca86` | Chrome 156, Windows, sin «HeadlessChrome» |
+
+- **Eficacia (estado · bloqueo según `detectar_bloqueo` · tamaño · tiempo):**
+
+| Tienda | urllib | curl | Chromium | S01/S02 |
+|---|---|---|---|---|
+| Oscaro (portada) | 403 · Cloudflare · 5,6 KB · 0,03 s | **200** · no · 495 KB · 0,24 s | no hizo falta | desafío de Cloudflare (incluso en `robots.txt`) |
+| Ecooparts (portada) | 403 · Cloudflare · 5,6 KB · 0,09 s | **200** · no · 971 KB · 0,29 s | no hizo falta | Cloudflare; con proxy, 200 una vez y luego Cloudflare en 5 de 5 IP |
+| Ovoko (portada) | 403 · Cloudflare · 5,6 KB · 0,05 s | **200** · no · 460 KB · 4,34 s | no hizo falta | Cloudflare, también con proxy |
+| B-Parts (portada) | 200 · no · 416 KB · 0,37 s | 200 · no · 416 KB · 0,38 s | no hizo falta | 403 el 19; 200 por proxy el 20 |
+| eBay (portada) | 403 · rechazo seco · 1,9 KB · 0,42 s | 403 · rechazo seco · 1,9 KB · 0,53 s | **200** · no · 977 KB · 3,02 s | 403 |
+| B-Parts (búsqueda `/es/auto-parts/search?vehicle=opel-84-vb`) | 405 · AWS WAF · 2,1 KB · 0,02 s | 405 · AWS WAF · 2,1 KB · 0,02 s | 405 · AWS WAF («Human Verification») · 9,6 KB · 1,47 s | 405 con HTTP y con Chromium |
+
+- **Causa / contexto:** urllib y curl se pidieron en el mismo minuto y desde la misma IP, así que la diferencia en Oscaro, Ecooparts y Ovoko se debe al cliente (huella TLS/HTTP2 y cabeceras de Chrome), no a la IP ni al día. El 200 de la portada de B-Parts con urllib indica que esa tienda ha cambiado desde el 19 por su cuenta. Solo se midieron portadas y una búsqueda: las fichas (el caso que motivó S02) no se han probado, y es una sola muestra por casilla.
+- **Para la memoria:** Eval (tasa de bloqueo), §4 (diseño del navegador), §8 (legal y ética) · S03
+
+### 2026-10-22 14:22 · ✅ Avance · Con la huella de Chrome, 4 de las 5 tiendas que bloqueaban dejan ver su portada sin proxy
+- **Qué pasó:** curl abre Oscaro, Ecooparts y Ovoko (antes, desafío de Cloudflare, también por el proxy residencial) y el rescate con Chromium abre eBay (403 con urllib y con curl). B-Parts ya respondía con urllib.
+- **Lección:** el bloqueo de Cloudflare en esas tres tiendas era por la huella del cliente (TLS, HTTP/2, cabeceras), no por la IP: con la misma IP de casa, urllib recibe el desafío y curl la portada. El proxy residencial no lo arreglaba porque no cambiaba la huella.
+- **Para la memoria:** Eval, §4 · S03
+
+### 2026-10-22 14:22 · ❌ Fallo · La búsqueda de B-Parts sigue bloqueada por el AWS WAF con las tres vías
+- **Qué pasó:** `/es/auto-parts/search` responde 405 «Human Verification» (AWS WAF) a urllib, a curl y a Chromium con su propia red, igual que en S01. eBay rechaza también a curl (403 seco) y solo pasa con Chromium.
+- **Causa / contexto:** la página es un desafío de AWS WAF («Human Verification»), que pide ejecutar su JavaScript; en esta descarga Chromium no lo superó (no se ha investigado por qué) y PrecIA no intenta resolverlo.
+- **Qué se hizo:** sin resolver; se deja registrado. Además, la medida de la huella de Chromium falló a la primera porque `DescargadorChromium` rechaza las respuestas JSON (es lo esperado del producto); se midió en un guion aparte que admitía JSON solo para esa petición.
+- **Para la memoria:** Eval (tasa de bloqueo), §4 · S03
+
+### 2026-10-22 14:29 · ❌ Fallo · Textos del vault y del código que contradicen ADR-021/022/023
+- **Qué pasó:** en el cierre documental de S03 aparecieron textos que seguían describiendo la regla anti-bot de antes. En el código, `orquestador.BLOQUEO` («Bloqueo (CAPTCHA o anti-bot): no se evade») y `inicio.html` («no evade protecciones»). En el vault, la nota 15 (el mismo «no se evade»), la 14 («El navegador lanza `Bloqueado` y no reintenta», falso desde el rescate con Chromium) y la 08 («tres desviaciones» con cuatro viñetas).
+- **Causa / contexto:** cada ADR se aplicó a los ficheros que tocaba la tarea de ese momento, sin buscar en todo el proyecto los textos que dependían de la regla cambiada.
+- **Qué se hizo:** notas 08, 14 y 15 corregidas citando las ADR, sin reescribir decisiones. El código no se ha tocado: queda como bug 14 en la nota 12, para que decida Julio.
+- **Lección:** cuando una decisión cambia una regla, hay que buscar con `grep` sus palabras clave («evad», «honesto», «no reintenta») en todo el repo y en el vault, no solo en los ficheros de la tarea.
+- **Para la memoria:** §3 (método de validación del proceso con IA), §4 (riesgos) · S03
+
+### 2026-10-22 15:12 · 📏 Medida · Verificación independiente del cierre de `core/tls-http2`
+- **Qué pasó:** un subagente verificador repasó el estado final de S03 sin tocar código: `ruff check`, `ruff format --check` (184 ficheros) y `mypy` (180 ficheros) en verde; `pytest` completo con 3305 en verde y 2 en rojo en 165 s, ninguno saltado (los tests de Chromium real se ejecutaron). Los dos rojos son los parámetros del test de cronómetro de `test_embebidos` (1,06 s frente a 1 s), que pasa si se lanza solo y que la rama no toca (bug 6). Rama y `HEAD` como se esperaba (`083851b`, sin commits nuevos), sin secretos ni artefactos entre los cambios, sin `curl_cffi._wrapper`, `CONNECT_TO` ni `channel=` en `src/`, y `curl_cffi==0.16.3` fijado.
+- **Causa / contexto:** paso de verificación del workflow antes de pedir revisión a Julio.
+- **Qué se hizo:** cifras y discrepancias menores apuntadas en el diario (15:12); no se cambió nada.
+- **Para la memoria:** §3 (validación del código generado), §6 · S03
+
+### 2026-10-22 15:12 · ❌ Fallo · El verificador contó mal los finales de línea con `grep` en Git Bash
+- **Qué pasó:** para comprobar que las notas y la bitácora no mezclaban finales de línea, el verificador usó `grep -c $'\r$'`, que en Git Bash para Windows contó todas las líneas como CRLF, también en ficheros LF. Con eso, las verificaciones «LF» del diario parecían falsas.
+- **Causa / contexto:** el `grep` de Git Bash no distingue el `\r` final de forma fiable en Windows. Lo destapó `git ls-files --eol`, que decía `w/lf` en un fichero que `grep` daba como CRLF.
+- **Qué se hizo:** recontado por bytes con Python (`b.count(b'\r\n')`): la nota de S03 es LF y `BITACORA.md` CRLF, cada uno sin mezclas, y el diario tenía razón. No se reportó ninguna discrepancia falsa.
+- **Lección:** los finales de línea se cuentan por bytes (Python o `git ls-files --eol`), no con `grep` en Windows; y una «evidencia» que contradice a varias fuentes se contrasta con otra herramienta antes de darla por buena.
+- **Para la memoria:** §3 (método de validación del proceso con IA) · S03
+
+### 2026-10-22 16:25 · 🧭 Decisión · Alcance de la tanda de eficiencia y facilidad de uso
+- **Qué pasó:** tras el diagnóstico de la petición «necesito que sea un scraper bien eficiente y facil de usar» (4 auditores y una síntesis), Julio eligió las cuatro opciones recomendadas: «Paquete recomendado», «Commit S03 y rama nueva», «Sí, etiquetadas aparte» y «Usa esos valores».
+- **Causa / contexto:** el diagnóstico encontró fichas abiertas sin necesidad, llamadas a la IA repetidas o inútiles, tiendas que se reconfiguraban en cada búsqueda tras fallar, OEM equivalentes descartadas y una búsqueda síncrona sin progreso ni forma de cancelarla.
+- **Qué se hizo:** alcance fijado: B4 precio tachado, B5 OEM equivalentes y revisiones con sufijo, etiquetadas «equivalente» o «revisión» aparte de «exacta» (las alertas, solo exactas); A2 filtrar y ordenar antes de abrir fichas; A3 caché del extractor por sha256(texto) + campos + modelo con el TTL de la caché de páginas, y corte de la IA en una tienda si no aporta nada en su 1.ª ficha; A1 recordar configuraciones fallidas con reintento a la 1 h y luego al día, botón «Reintentar» y configuración con consulta genérica (filtro, faro, freno); C1 búsqueda en segundo plano con progreso por tienda, plazo y Cancelar (htmx con sondeo, sin SSE). Las ofertas de caché van al histórico con su fecha real de obtención; las tiendas en espera se saltan con aviso. C2 queda fuera. Antes, commit de S03 en `core/tls-http2` y rama nueva `core/eficiencia`, sin push.
+- **Para la memoria:** §5 (flujo), §4 (IA integrada: coste y anclaje del extractor), §6 (hitos) · S03

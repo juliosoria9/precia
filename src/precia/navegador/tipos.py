@@ -18,6 +18,9 @@ class Pagina:
     desde_cache: bool = False
     via_proxy: bool = False
     """Llegó por el proxy de salida (`navegador.con_proxy`): para enseñarlo en el progreso."""
+    por_chromium: bool = False
+    """La descargó Chromium (con `js`, en un rescate o porque la tienda ya estaba rescatada):
+    pedirla otra vez con `js=True` no traería nada distinto."""
 
 
 class ErrorNavegador(Exception):
@@ -35,8 +38,10 @@ class ProhibidoPorRobots(ErrorNavegador):
 class Bloqueado(ErrorNavegador):
     """La web responde con un CAPTCHA o un bloqueo anti-bot. Nunca se intenta resolver.
 
-    Con un proxy configurado, antes de llegar aquí ya se ha repetido una vez desde otra IP
-    (`navegador.con_proxy`): si también se bloquea, la tienda se para.
+    Antes de llegar aquí ya se ha probado lo que hay: con un proxy configurado, una vez desde otra
+    IP (`navegador.con_proxy`), y, si hay Chromium, una vez con Chromium tras el bloqueo por HTTP
+    (`navegador.navegador`, ADR-023; nunca tras un 401, un 451 o un 429 normal, el de límite de
+    peticiones). Si también se bloquea, la tienda se para.
     """
 
     def __init__(self, url: str, motivo: str) -> None:

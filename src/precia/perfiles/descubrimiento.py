@@ -89,8 +89,13 @@ MAX_FORMULARIOS_RESUMEN = 10
 MAX_CAMPOS_RESUMEN = 10
 MAX_ENLACES_RESUMEN = 150
 MAX_TEXTO_ENLACE = 80
-RECHAZOS = frozenset({401, 403, 429, 451})
-"""La tienda dice que no: repetirlo con un navegador real sería insistir (regla 5, sin evasión)."""
+RECHAZOS = frozenset({401, 429, 451})
+"""La tienda dice que no y otro cliente no lo cambia: 401, pide credenciales (nunca se inicia
+sesión); 429, limita las peticiones; 451, motivo legal o geográfico. El 403 no está (ADR-023):
+suele ser el WAF rechazando la huella del cliente HTTP, y con Chromium puede pasar. Un 403 pequeño
+ya lo convierte el navegador en `Bloqueado` y lo rescata él con Chromium; lo que ya vino de
+Chromium (`Pagina.por_chromium`) no se vuelve a pedir con `js=True` (ver `_probar`). Incluye
+`navegador.bloqueo.ESTADOS_SIN_RESCATE`."""
 ESTADOS_DEFINITIVOS = frozenset({400, 404, 410, 414, 501}) | RECHAZOS
 """Estados por HTTP con los que una candidata no se repite con Chromium (ver `_probar`)."""
 MIN_PRODUCTOS = 2
@@ -206,7 +211,7 @@ async def descubrir(
     if portada is not None:
         descriptores: set[str] = set()
         de_portada = await _de_la_portada(portada, dominio, navegador, validador, descriptores)
-        if not de_portada:
+        if not de_portada and not portada.por_chromium:
             renderizada = await abrir(navegador, _url(portada), js=True, validador=validador)
             if renderizada is not None and _de_la_tienda_y_bien(renderizada, dominio):
                 de_portada = await _de_la_portada(
@@ -281,27 +286,37 @@ async def _probar(
     ninguna lo da, con Chromium.
 
     Con Chromium no se repiten las que por HTTP respondieron con un estado de
-    `ESTADOS_DEFINITIVOS`: Chromium pide el mismo documento, con el mismo User-Agent, y recibiría
-    el mismo estado; y `parece_listado` exige un 2xx del documento, así que aunque su JavaScript
-    pintara resultados encima de la página de error no se aceptaría. 404 y 410: la ruta no existe;
-    400 y 414: el servidor rechaza la propia URL; 501: no admite el GET. Sí se repiten un 2xx que
-    no era un listado (puede pintarlo el JavaScript) y los 5xx (pueden ser pasajeros). Los
-    bloqueos (`Bloqueado`, un 403 o un 429 de un anti-bot) ni llegan aquí: el navegador los lanza
-    y se para.
+    `ESTADOS_DEFINITIVOS`: el estado no depende del cliente, y `parece_listado` exige un 2xx del
+    documento, así que aunque su JavaScript pintara resultados encima de la página de error no se
+    aceptaría. 404 y 410: la ruta no existe; 400 y 414: el servidor rechaza la propia URL; 501: no
+    admite el GET; y los `RECHAZOS`. Sí se repiten un 2xx que no era un listado (puede pintarlo el
+    JavaScript), un 403 grande (puede ser el WAF rechazando la huella del cliente HTTP) y los 5xx
+    (pueden ser pasajeros). Los bloqueos (`Bloqueado`) ni llegan aquí: el navegador ya ha probado
+    una vez con Chromium y, si sigue bloqueado, los lanza.
+
+    Tampoco se repite lo que ya fue por Chromium: en una tienda rescatada (ADR-023), `js=False`
+    va por Chromium desde la página rescatada (`Pagina.por_chromium`, o la portada) en adelante,
+    también las que fallan, y repetirlas sería otra descarga igual contra la tienda.
     """
-    definitivas: set[str] = set()
+    sin_repetir: set[str] = set()
+    por_chromium = portada is not None and portada.por_chromium
     for js in (False, True):
         for plantilla, origen in candidatas:
             url = url_de_busqueda(plantilla, consulta)
-            if js and url in definitivas:
+            if js and url in sin_repetir:
                 continue
             pagina = await abrir(navegador, url, js=js, validador=validador)
+            if not js:
+                # La marca de la tienda no se quita: lo que viene detrás también va por Chromium.
+                por_chromium = por_chromium or (pagina is not None and pagina.por_chromium)
+                if por_chromium:
+                    sin_repetir.add(url)
             if pagina is None:
                 continue
             if parece_listado(pagina, dominio, consulta, portada=portada):
                 return Busqueda(plantilla, pagina, js, origen)
             if pagina.estado in ESTADOS_DEFINITIVOS:
-                definitivas.add(url)
+                sin_repetir.add(url)
     return None
 
 

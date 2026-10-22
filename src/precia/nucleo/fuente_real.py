@@ -1,7 +1,9 @@
 """Fuente de datos real: el almacén SQLite y el orquestador detrás de la interfaz `FuenteDatos`.
 
 La web no cambia respecto a la demo. Lo caro se crea tarde: el navegador (y con él Chromium) en
-la primera búsqueda, y se vuelve a crear si cambian el User-Agent o la espera entre peticiones.
+la primera búsqueda, y se vuelve a crear si cambian el User-Agent, la espera entre peticiones o
+el cliente HTTP (`curl` o `urllib`, ADR-022).
+
 El servicio de IA se monta en cada búsqueda con los ajustes de ese momento (proveedor, modelo,
 presupuesto y tope), así que un cambio en «Ajustes» vale desde la búsqueda siguiente.
 
@@ -30,8 +32,9 @@ from precia.navegador.cache import CachePaginas
 from precia.navegador.chromium import DescargadorChromium
 from precia.navegador.con_proxy import DescargadorConProxy, UsoProxy
 from precia.navegador.cortesia import LimitadorDominio
+from precia.navegador.curl import TransporteCurl
 from precia.navegador.evomi import credenciales_evomi
-from precia.navegador.http import DescargadorHTTP, TransporteURLLib
+from precia.navegador.http import DescargadorHTTP, Transporte, TransporteURLLib
 from precia.navegador.navegador import Navegador
 from precia.navegador.proxy import (
     NOMBRE_PROPIO,
@@ -55,6 +58,7 @@ from precia.nucleo.fuente_datos import (
     entrada_normalizada,
 )
 from precia.nucleo.modelos import (
+    TRANSPORTES_HTTP,
     Ajustes,
     Alerta,
     ConsultaBusqueda,
@@ -119,6 +123,18 @@ def proveedor_desde_ajustes(config: Config, ajustes: Ajustes) -> tuple[Proveedor
         return None, str(error)
 
 
+def _transporte(nombre: str, proxy: Proxy | None) -> Transporte:
+    """El cliente HTTP de los ajustes (ADR-022). Uno desconocido usa el de por defecto."""
+    if nombre not in TRANSPORTES_HTTP:
+        # El almacén no valida el valor: una BD editada a mano no debe romper cada búsqueda.
+        defecto = Ajustes().transporte_http
+        registro.warning("Cliente HTTP desconocido en los ajustes: se usa %s.", defecto)
+        nombre = defecto
+    if nombre == "curl":
+        return TransporteCurl(proxy=proxy)
+    return TransporteURLLib(proxy=proxy)
+
+
 class FuenteReal:
     """Implementa `FuenteDatos` con datos reales (memoria §6)."""
 
@@ -158,7 +174,7 @@ class FuenteReal:
         config.ruta_bd.parent.mkdir(parents=True, exist_ok=True)
         self._almacen = Almacen(config.ruta_bd, reloj=reloj)
         self._navegador: Navegador | None = None
-        self._clave_navegador: tuple[str, float, bool, Proxy | None] | None = None
+        self._clave_navegador: tuple[str, float, bool, Proxy | None, str] | None = None
         self._usos: dict[Navegador, int] = {}
         """Búsquedas en vuelo por navegador (el actual y los sustituidos que aún se usan)."""
         self._candado = asyncio.Lock()
@@ -216,6 +232,7 @@ class FuenteReal:
                 ajustes.retardo_dominio_s,
                 ajustes.respetar_robots,
                 self._proxy,
+                ajustes.transporte_http,
             )
             if self._navegador is not None and self._clave_navegador != clave:
                 viejo, self._navegador = self._navegador, None
@@ -292,11 +309,14 @@ class FuenteReal:
         return None
 
     def _descargadores_reales(self, ajustes: Ajustes) -> tuple[Descargador, Descargador | None]:
-        # Chromium no arranca hasta que una tienda lo necesita (`necesita_js`); el del proxy,
-        # hasta que una tienda con JavaScript tiene que ir por él.
+        # Chromium no arranca hasta que una tienda lo necesita (`necesita_js` o el rescate tras un
+        # bloqueo por HTTP, ADR-023); el del proxy, hasta que una tienda tiene que ir por él. No
+        # recibe el UA de Ajustes: usa el de Chrome sacado de su propio binario.
         ua = ajustes.user_agent
-        http = DescargadorHTTP(ua, validador=self._validador)
-        chromium = DescargadorChromium(ua, validador=self._validador)
+        http = DescargadorHTTP(
+            ua, validador=self._validador, transporte=_transporte(ajustes.transporte_http, None)
+        )
+        chromium = DescargadorChromium(validador=self._validador)
         if self._proxy is None:
             return http, chromium
 
@@ -310,12 +330,10 @@ class FuenteReal:
                 espera_reintento_s=ajustes.retardo_dominio_s,
             )
 
-        transporte = TransporteURLLib(proxy=self._proxy)
+        transporte = _transporte(ajustes.transporte_http, self._proxy)
         return (
             envolver(http, DescargadorHTTP(ua, validador=self._validador, transporte=transporte)),
-            envolver(
-                chromium, DescargadorChromium(ua, validador=self._validador, proxy=self._proxy)
-            ),
+            envolver(chromium, DescargadorChromium(validador=self._validador, proxy=self._proxy)),
         )
 
     def estado_proxy(self) -> EstadoProxy:

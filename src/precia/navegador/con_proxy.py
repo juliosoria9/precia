@@ -81,7 +81,7 @@ def dominio_de(url: str) -> str:
     return host.removeprefix("www.")
 
 
-def _conexion_cortada(error: BaseException) -> bool:
+def conexion_cortada(error: BaseException) -> bool:
     """Si en la cadena del error hay un corte de la conexión por parte de la tienda.
 
     Se sigue la cadena como la enseña un traceback: la causa (`from`) o, si no se ha suprimido
@@ -189,7 +189,7 @@ class DescargadorConProxy:
         try:
             pagina = await pedir(False)
         except ErrorDescarga as error:
-            if not _conexion_cortada(error):
+            if not conexion_cortada(error):
                 raise
             motivo = "cortó la conexión"
         else:

@@ -223,6 +223,11 @@ class LlamadaIA:
     duracion_ms: int
 
 
+TRANSPORTES_HTTP = ("curl", "urllib")
+"""Clientes HTTP de las descargas ligeras: `curl` (huella TLS y HTTP/2 de Chrome, por defecto
+por decisión de Julio, ADR-022) o `urllib` (cliente de Python con el User-Agent de los ajustes)."""
+
+
 @dataclass(slots=True)
 class Ajustes:
     proveedor: str = "api"
@@ -236,6 +241,10 @@ class Ajustes:
     respetar_robots: bool = False
     retardo_dominio_s: float = 2.0
     user_agent: str = "PrecIA/0.1 (proyecto universitario; uso personal)"
+    """Lo usan urllib, el robots.txt y Evomi. Con curl van las cabeceras de Chrome y Chromium lleva
+    el UA de su propio binario (ADR-022/023)."""
+    transporte_http: str = "curl"
+    """Uno de `TRANSPORTES_HTTP`."""
 
 
 @dataclass(frozen=True, slots=True)

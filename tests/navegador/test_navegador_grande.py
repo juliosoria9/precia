@@ -263,3 +263,21 @@ def test_sitemaps_con_robots_bloqueado() -> None:
     m = Montaje({}, robots=pagina(ROBOTS, desafio(), estado=403))
     with pytest.raises(Bloqueado):
         asyncio.run(m.navegador.sitemaps(TIENDA))
+
+
+def test_sitemap_bloqueado_nunca_va_por_chromium() -> None:
+    m = Montaje({SITEMAP: pagina(SITEMAP, desafio(), estado=403)})
+    with pytest.raises(Bloqueado):
+        m.grande(SITEMAP)
+    assert m.chromium.pedidas == []
+
+
+def test_sitemap_de_tienda_rescatada_va_por_http() -> None:
+    ficha = f"{TIENDA}/ficha.html"
+    m = Montaje({ficha: pagina(ficha, desafio(), estado=403), SITEMAP: xml(SITEMAP)})
+    m.chromium.respuestas[ficha] = pagina(ficha, "<h1>Ficha</h1><p>38,90 €</p>")
+    asyncio.run(m.navegador.obtener(ficha))
+    assert m.chromium.pedidas == [ficha]
+    m.grande(SITEMAP)
+    assert m.http.grandes == [(SITEMAP, MAX_BYTES_SITEMAP)]
+    assert m.chromium.pedidas == [ficha]

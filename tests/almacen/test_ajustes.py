@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from precia.almacen.sqlite import Almacen, DatoNoValido, ErrorAlmacen
-from precia.nucleo.modelos import Ajustes
+from precia.nucleo.modelos import TRANSPORTES_HTTP, Ajustes
 
 
 def test_por_defecto_si_no_hay_nada(almacen: Almacen) -> None:
@@ -126,3 +126,18 @@ def test_guardar_rechaza_tipos_que_luego_no_se_podrian_leer(
 def test_un_entero_vale_como_retardo(almacen: Almacen) -> None:
     almacen.guardar_ajustes(Ajustes(retardo_dominio_s=3))
     assert almacen.leer_ajustes().retardo_dominio_s == 3.0
+
+
+# --- Cliente HTTP (ADR-022: curl por defecto, urllib como opción) -------------------------------
+
+
+def test_transporte_http_por_defecto_es_curl(almacen: Almacen) -> None:
+    assert TRANSPORTES_HTTP == ("curl", "urllib")
+    assert Ajustes().transporte_http == "curl"
+    # Una base de datos de antes, sin la clave, toma el valor por defecto.
+    assert almacen.leer_ajustes().transporte_http == "curl"
+
+
+def test_transporte_http_ida_y_vuelta(almacen: Almacen) -> None:
+    almacen.guardar_ajustes(Ajustes(transporte_http="urllib"))
+    assert almacen.leer_ajustes().transporte_http == "urllib"

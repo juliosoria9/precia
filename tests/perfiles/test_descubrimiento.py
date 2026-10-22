@@ -11,6 +11,7 @@ import pytest
 
 from precia.ia.simulado import Guion
 from precia.ia.tipos import IANoDisponible, PresupuestoAgotado
+from precia.navegador.bloqueo import ESTADOS_SIN_RESCATE
 from precia.navegador.tipos import Bloqueado, Pagina
 from precia.perfiles.configurador import AUTOR, COMPONENTE, configurar
 from precia.perfiles.descubrimiento import (
@@ -22,6 +23,7 @@ from precia.perfiles.descubrimiento import (
     ORIGEN_OPENSEARCH,
     PARAMETROS_ENLACE,
     PATRONES,
+    RECHAZOS,
     enlace_opensearch,
     leer_plantillas_ia,
     parece_listado,
@@ -618,8 +620,8 @@ def test_estado_definitivo_por_http_no_se_repite_con_chromium(estado: int) -> No
 
 
 # Un rechazo que no llega como `Bloqueado` (página grande o con señales de producto) tampoco se
-# repite con Chromium: insistir con un navegador real ante un «no» se parece a evadirlo (regla 5).
-@pytest.mark.parametrize("estado", [401, 403, 429, 451])
+# repite con Chromium: credenciales (401), límite de peticiones (429) o motivo legal (451).
+@pytest.mark.parametrize("estado", [401, 429, 451])
 def test_rechazo_por_http_no_se_repite_con_chromium(estado: int) -> None:
     sitio = paginas_sitio(formulario=False, busqueda=None)
     sitio[PORTADA] = SIN_BUSCADOR
@@ -631,10 +633,11 @@ def test_rechazo_por_http_no_se_repite_con_chromium(estado: int) -> None:
     assert (primera, True) not in navegador.pedidas
 
 
-@pytest.mark.parametrize("estado", [200, 500, 502, 503, 504])
+@pytest.mark.parametrize("estado", [200, 403, 500, 502, 503, 504])
 def test_otros_estados_por_http_si_se_repiten_con_chromium(estado: int) -> None:
     # Un 200 que no es un listado puede ser una tienda que pinta los resultados con JavaScript;
-    # un 5xx puede ser pasajero. Los bloqueos (403, 429...) ni llegan aquí: el navegador para.
+    # un 5xx puede ser pasajero; un 403 suele ser el WAF rechazando la huella del cliente HTTP
+    # (ADR-023), y con Chromium puede pasar.
     sitio = paginas_sitio(formulario=False, busqueda=None)
     sitio[PORTADA] = SIN_BUSCADOR
     primera = url_de_busqueda(TIENDA + PATRONES[0], CONSULTA)
@@ -642,6 +645,12 @@ def test_otros_estados_por_http_si_se_repiten_con_chromium(estado: int) -> None:
     navegador = NavegadorConEstados(sitio, paginas_js={}, estados={primera: estado})
     fallo_con(navegador, [{"plantillas": []}], dominio=f"www.{DOMINIO}")
     assert (primera, True) in navegador.pedidas
+
+
+def test_estados_sin_rescate_son_rechazos() -> None:
+    # Lo que el navegador nunca rescata con Chromium tampoco lo repite el descubrimiento.
+    assert ESTADOS_SIN_RESCATE <= RECHAZOS
+    assert 403 not in RECHAZOS
 
 
 def test_un_404_con_resultados_pintados_no_es_un_listado() -> None:
@@ -677,3 +686,56 @@ def test_descriptor_opensearch_que_no_vale_no_se_pide_otra_vez(respuesta: str | 
     fallo_con(navegador, [{"plantillas": []}], dominio=f"www.{DOMINIO}")
     assert (PORTADA, True) in navegador.pedidas
     assert navegador.urls.count(DESCRIPTOR) == 1
+
+
+# --- Tienda rescatada con Chromium (ADR-023), con el Navegador real -------------------------------
+
+
+def test_tienda_rescatada_no_repite_candidatas_con_chromium() -> None:
+    # La portada por HTTP es un desafío de Cloudflare: el navegador la rescata con Chromium y
+    # marca la tienda. Desde ahí, js=False ya va por Chromium, así que ni la portada ni las
+    # candidatas (las que dan un 200 que no es listado, ni las que fallan) se repiten con js=True.
+    from precia.navegador.cortesia import LimitadorDominio
+    from precia.navegador.navegador import Navegador
+    from precia.navegador.robots import ServicioRobots
+    from precia.perfiles.descubrimiento import abrir_portada, descubrir
+    from tests.navegador.falsos import DescargadorFalso, Reloj
+    from tests.navegador.falsos import pagina as pagina_navegador
+
+    desafio = (
+        Path(__file__).parent.parent / "fixtures" / "navegador" / "cloudflare_just_a_moment.html"
+    ).read_text(encoding="utf-8")
+    robots = f"{TIENDA}/robots.txt"
+    candidatas = [url_de_busqueda(TIENDA + patron, CONSULTA) for patron in PATRONES]
+    reloj = Reloj()
+    robots_http = DescargadorFalso(
+        {robots: pagina_navegador(robots, "User-agent: *\n", tipo="text/plain")}
+    )
+    http = DescargadorFalso({PORTADA: pagina_navegador(PORTADA, desafio, estado=403)})
+    chromium = DescargadorFalso(
+        {
+            PORTADA: pagina_navegador(PORTADA, SIN_BUSCADOR),
+            candidatas[0]: pagina_navegador(candidatas[0], SIN_BUSCADOR),  # 200, no es listado
+            candidatas[1]: pagina_navegador(candidatas[1], SIN_BUSCADOR, estado=503),
+        }
+    )  # el resto de candidatas falla (`ErrorDescarga`)
+    navegador = Navegador(
+        http=http,
+        chromium=chromium,
+        robots=ServicioRobots(robots_http, "PrecIA-test", reloj=reloj),
+        limitador=LimitadorDominio(0.0, reloj=reloj, dormir=reloj.dormir),
+        validador=validar_con_dns_publico,
+    )
+
+    async def probar() -> None:
+        host = f"www.{DOMINIO}"
+        portada = await abrir_portada(host, DOMINIO, navegador, validador=validar_con_dns_publico)
+        assert portada is not None and portada.por_chromium
+        with pytest.raises(ConfiguracionFallida):
+            await descubrir(
+                portada, host, DOMINIO, navegador, CONSULTA, validador=validar_con_dns_publico
+            )
+
+    asyncio.run(probar())
+    assert http.pedidas == [PORTADA]
+    assert chromium.pedidas == [PORTADA, *candidatas]  # una sola vez cada una

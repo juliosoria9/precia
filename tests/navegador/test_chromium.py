@@ -1,33 +1,50 @@
-"""Descargador con Chromium: ninguna petición de la página sale sin pasar `validar_url`.
+"""Descargador con Chromium: red propia de Chrome detrás del relé SOCKS5, que valida cada conexión.
 
-Los primeros tests prueban el filtro de peticiones con rutas falsas. Los marcados `chromium` abren
-un Chromium real contra un servidor HTTP en 127.0.0.1 levantado por el propio test; en producción
-127.0.0.1 está prohibido, así que aquí se inyecta un validador que solo deja pasar ese servidor y
-trata `/secreto` como si fuera un servicio interno.
+Los primeros tests prueban el filtro de `route` con rutas falsas, las funciones de la huella y el
+arranque con un Playwright falso. Los marcados `chromium` abren el headless shell de Playwright
+contra un servidor HTTP en 127.0.0.1 levantado por el propio test. Chromium nunca resuelve nombres:
+todo sale por el relé, que en los tests «resuelve» cualquier nombre a 127.0.0.1 y valida con el
+mismo validador que el descargador (solo deja pasar `tienda.example`, `localhost` y 127.0.0.1 en el
+puerto del servidor). `interno.example` hace de servicio interno. Ningún test sale a Internet: lo
+comprueba `test_sin_trafico_fuera_del_rele` con el netlog de Chromium.
 """
 
 import asyncio
 import contextlib
 import http.server
+import json
+import re
 import socket
 import struct
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Coroutine, Iterator
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 import pytest
 from playwright.async_api import Error as ErrorPlaywright
 
-from precia.navegador.chromium import DescargadorChromium, FiltroPeticiones
+from precia.navegador import chromium as modulo_chromium
+from precia.navegador.chromium import (
+    ARGUMENTOS,
+    DescargadorChromium,
+    FiltroPeticiones,
+    metadatos_de_chrome,
+    ua_de_chrome,
+)
 from precia.navegador.proxy import Proxy
 from precia.navegador.rele import ReleProxy
 from precia.navegador.tipos import ConexionCortada, ErrorDescarga, Pagina, URLNoPermitida
 from precia.navegador.url import Validador
 from tests.navegador.servidores_proxy import proxy_falso, tienda
 
-UA = "PrecIA/0.1 (+https://github.com/juliosoria9/precia)"
+UA_HEADLESS = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "HeadlessChrome/156.0.8078.4 Safari/537.36"
+)
 
 
 # --- Filtro de peticiones con dobles ------------------------------------------------------------
@@ -54,38 +71,17 @@ class PeticionFalsa:
 
 
 @dataclass
-class RespuestaFalsa:
-    status: int = 200
-    headers: dict[str, str] = field(default_factory=dict)
-
-
-def salto(destino: str, estado: int = 302) -> RespuestaFalsa:
-    return RespuestaFalsa(estado, {"location": destino})
-
-
-@dataclass
 class RutaFalsa:
-    """`respuestas[None]` es la de la URL original; el resto, por URL pedida con `fetch(url=)`."""
+    """Solo `abort` y `continue_`: si el filtro llamara a `fetch` o `fulfill`, AttributeError."""
 
     request: PeticionFalsa
-    respuestas: dict[str | None, RespuestaFalsa] = field(default_factory=dict)
     acciones: list[str] = field(default_factory=list)
-    fallo_de_red: bool = False
 
     async def abort(self, error_code: str | None = None) -> None:
         self.acciones.append(f"abort:{error_code}")
 
-    async def fetch(
-        self, *, url: str | None = None, max_redirects: int | None = None
-    ) -> RespuestaFalsa:
-        assert max_redirects == 0, "el filtro nunca deja que Playwright siga redirecciones"
-        self.acciones.append(f"fetch:{url or self.request.url}")
-        if self.fallo_de_red:
-            raise ErrorPlaywright("net::ERR_CONNECTION_RESET")
-        return self.respuestas.get(url, RespuestaFalsa())
-
-    async def fulfill(self, *, response: RespuestaFalsa) -> None:
-        self.acciones.append(f"fulfill:{response.status}")
+    async def continue_(self) -> None:
+        self.acciones.append("continue")
 
 
 async def solo_tienda(url: str) -> str:
@@ -119,89 +115,17 @@ def test_aborta_urls_no_validas(url: str) -> None:
     assert filtro.bloqueo_principal is None
 
 
-def test_deja_pasar_lo_valido() -> None:
-    ruta = RutaFalsa(PeticionFalsa("https://tienda.example/app.js", resource_type="script"))
+@pytest.mark.parametrize("tipo", ["document", "script", "xhr", "fetch", "stylesheet"])
+def test_deja_pasar_lo_valido(tipo: str) -> None:
+    ruta = RutaFalsa(PeticionFalsa("https://tienda.example/app", resource_type=tipo))
     filtrar(ruta)
-    assert ruta.acciones == ["fetch:https://tienda.example/app.js", "fulfill:200"]
-
-
-def test_subrecurso_redirigido_a_destino_prohibido() -> None:
-    ruta = RutaFalsa(
-        PeticionFalsa("https://tienda.example/api", resource_type="fetch"),
-        {None: salto("http://169.254.169.254/")},
-    )
-    filtrar(ruta)
-    assert ruta.acciones == ["fetch:https://tienda.example/api", "abort:blockedbyclient"]
-
-
-def test_subrecurso_sigue_la_cadena_validando_cada_salto() -> None:
-    # Chromium sigue por su cuenta (sin pasar por `route`) un 302 entregado con `fulfill`: por eso
-    # el filtro sigue la cadena él mismo y solo entrega la respuesta final.
-    ruta = RutaFalsa(
-        PeticionFalsa("https://tienda.example/a.js", resource_type="script"),
-        {
-            None: salto("/b.js", 301),
-            "https://tienda.example/b.js": salto("http://127.0.0.1/c.js"),
-        },
-    )
-    filtrar(ruta)
-    assert ruta.acciones == [
-        "fetch:https://tienda.example/a.js",
-        "fetch:https://tienda.example/b.js",
-        "abort:blockedbyclient",
-    ]
-
-
-def test_subrecurso_redirigido_correctamente() -> None:
-    ruta = RutaFalsa(
-        PeticionFalsa("https://tienda.example/a.js", resource_type="script"),
-        {None: salto("/b.js")},
-    )
-    filtrar(ruta)
-    assert ruta.acciones[-1] == "fulfill:200"
-
-
-def test_subrecurso_con_demasiadas_redirecciones() -> None:
-    respuestas: dict[str | None, RespuestaFalsa] = {None: salto("/0")}
-    for i in range(10):
-        respuestas[f"https://tienda.example/{i}"] = salto(f"/{i + 1}")
-    ruta = RutaFalsa(PeticionFalsa("https://tienda.example/x", resource_type="fetch"), respuestas)
-    filtrar(ruta)
-    assert ruta.acciones[-1] == "abort:failed"
-    assert len(ruta.acciones) == 1 + 6
-
-
-def test_fallo_de_red_aborta() -> None:
-    ruta = RutaFalsa(PeticionFalsa("https://tienda.example/api", resource_type="xhr"))
-    ruta.fallo_de_red = True
-    filtrar(ruta)
-    assert ruta.acciones == ["fetch:https://tienda.example/api", "abort:failed"]
-
-
-def test_navegacion_principal_redirigida_se_delega_validada() -> None:
-    ruta = RutaFalsa(
-        PeticionFalsa("https://tienda.example/vieja", navegacion=True),
-        {None: salto("/nueva", 301)},
-    )
-    filtro = filtrar(ruta)
-    assert ruta.acciones == ["fetch:https://tienda.example/vieja", "abort:aborted"]
-    assert filtro.redireccion == "https://tienda.example/nueva"
-
-
-def test_navegacion_principal_redirigida_a_destino_prohibido() -> None:
-    ruta = RutaFalsa(
-        PeticionFalsa("https://tienda.example/vieja", navegacion=True),
-        {None: salto("http://169.254.169.254/")},
-    )
-    filtro = filtrar(ruta)
-    assert ruta.acciones[-1] == "abort:blockedbyclient"
-    assert isinstance(filtro.bloqueo_principal, URLNoPermitida)
-    assert filtro.redireccion is None
+    assert ruta.acciones == ["continue"]
 
 
 def test_recuerda_el_bloqueo_de_la_navegacion_principal() -> None:
     ruta = RutaFalsa(PeticionFalsa("http://127.0.0.1/", navegacion=True))
     filtro = filtrar(ruta)
+    assert ruta.acciones == ["abort:blockedbyclient"]
     assert isinstance(filtro.bloqueo_principal, URLNoPermitida)
 
 
@@ -210,6 +134,336 @@ def test_navegacion_de_un_iframe_no_es_la_principal() -> None:
     filtro = filtrar(ruta)
     assert ruta.acciones == ["abort:blockedbyclient"]
     assert filtro.bloqueo_principal is None
+
+
+# --- Huella de Chrome sin «HeadlessChrome» ------------------------------------------------------
+
+
+def test_ua_de_chrome() -> None:
+    assert ua_de_chrome(UA_HEADLESS) == (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/156.0.0.0 Safari/537.36"
+    )
+    chrome = UA_HEADLESS.replace("HeadlessChrome/156.0.8078.4", "Chrome/156.0.0.0")
+    assert ua_de_chrome(chrome) == chrome
+
+
+VALORES_HEADLESS: dict[str, Any] = {
+    "architecture": "x86",
+    "bitness": "64",
+    "brands": [
+        {"brand": "Not:A-Brand", "version": "8"},
+        {"brand": "Chromium", "version": "156"},
+        {"brand": "HeadlessChrome", "version": "156"},
+    ],
+    "fullVersionList": [
+        {"brand": "Not:A-Brand", "version": "8.0.0.0"},
+        {"brand": "Chromium", "version": "156.0.8078.4"},
+        {"brand": "HeadlessChrome", "version": "156.0.8078.4"},
+    ],
+    "mobile": False,
+    "model": "",
+    "platform": "Windows",
+    "platformVersion": "19.0.0",
+    "uaFullVersion": "156.0.8078.4",
+    "wow64": False,
+}
+
+
+def test_metadatos_sin_headless() -> None:
+    metadatos = metadatos_de_chrome(VALORES_HEADLESS)
+    assert metadatos["brands"] == [
+        {"brand": "Not:A-Brand", "version": "8"},
+        {"brand": "Chromium", "version": "156"},
+    ]
+    assert metadatos["fullVersionList"] == [
+        {"brand": "Not:A-Brand", "version": "8.0.0.0"},
+        {"brand": "Chromium", "version": "156.0.8078.4"},
+    ]
+    assert "HeadlessChrome" not in json.dumps(metadatos)
+    assert metadatos["platform"] == "Windows"
+    assert metadatos["platformVersion"] == "19.0.0"
+    assert metadatos["architecture"] == "x86"
+    assert metadatos["bitness"] == "64"
+    assert metadatos["model"] == ""
+    assert metadatos["mobile"] is False
+    assert metadatos["wow64"] is False
+    assert metadatos["fullVersion"] == "156.0.8078.4"
+
+
+# --- Arranque (Playwright falso) ----------------------------------------------------------------
+
+
+class _SesionCDP:
+    async def send(self, metodo: str, parametros: object = None) -> dict[str, object]:
+        assert metodo == "Browser.getVersion"
+        return {"userAgent": UA_HEADLESS}
+
+    async def detach(self) -> None:
+        pass
+
+
+class _NavegadorArrancado:
+    def __init__(self) -> None:
+        self.cerrado = False
+        self.contextos: list[dict[str, object]] = []
+
+    async def new_browser_cdp_session(self) -> _SesionCDP:
+        return _SesionCDP()
+
+    async def new_context(self, **opciones: object) -> object:
+        self.contextos.append(opciones)
+        raise RuntimeError("el test para aquí")
+
+    async def close(self) -> None:
+        self.cerrado = True
+
+
+class _PlaywrightFalso:
+    def __init__(self, fallo: Exception | None = None) -> None:
+        self.lanzamientos: list[dict[str, object]] = []
+        self.navegadores: list[_NavegadorArrancado] = []
+        self.chromium = self
+        self.fallo = fallo
+        self.parado = False
+
+    async def start(self) -> "_PlaywrightFalso":
+        return self
+
+    async def launch(self, **opciones: object) -> _NavegadorArrancado:
+        self.lanzamientos.append(opciones)
+        if self.fallo is not None:
+            raise self.fallo
+        self.navegadores.append(_NavegadorArrancado())
+        return self.navegadores[-1]
+
+    async def stop(self) -> None:
+        self.parado = True
+
+
+async def permisivo(url: str) -> str:
+    return url
+
+
+def _lanzar(
+    monkeypatch: pytest.MonkeyPatch,
+    proxy: Proxy | None,
+    *,
+    falso: _PlaywrightFalso | None = None,
+    crear_rele: Callable[[Proxy | None], ReleProxy] | None = None,
+    error: type[Exception] = RuntimeError,
+) -> _PlaywrightFalso:
+    falso = falso or _PlaywrightFalso()
+    monkeypatch.setattr("precia.navegador.chromium.async_playwright", lambda: falso)
+    descargador = DescargadorChromium(validador=permisivo, proxy=proxy, crear_rele=crear_rele)
+
+    async def probar() -> None:
+        with pytest.raises(error):
+            await descargador.descargar("https://tienda.example/")
+        await descargador.cerrar()
+
+    asyncio.run(probar())
+    assert len(falso.lanzamientos) == 1
+    return falso
+
+
+def test_arranca_siempre_contra_el_rele_socks(monkeypatch: pytest.MonkeyPatch) -> None:
+    opciones = _lanzar(monkeypatch, None).lanzamientos[0]
+    assert opciones.keys() == {"headless", "proxy", "args"}  # sin `channel`: headless shell
+    assert opciones["headless"] is True
+    ajustes = opciones["proxy"]
+    assert isinstance(ajustes, dict) and ajustes.keys() == {"server", "bypass"}
+    assert re.fullmatch(r"socks5://127\.0\.0\.1:\d+", ajustes["server"])
+    # Sin esto, PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK sacaría el loopback directo.
+    assert ajustes["bypass"] == "<-loopback>"
+    assert opciones["args"] == [
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+        "--disable-quic",
+    ]
+    assert list(ARGUMENTOS) == opciones["args"]
+
+
+def test_con_proxy_arranca_contra_el_rele_sin_credenciales(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Playwright usaría el usuario y la contraseña del proxy para contestar a cualquier 401 Basic
+    # de un destino: Chromium va al relé local, que es quien las añade en el CONNECT.
+    proxy = Proxy("core-residential.evomi.com", 1000, "usu", "secreta_country-ES")
+    opciones = _lanzar(monkeypatch, proxy).lanzamientos[0]
+    assert opciones.keys() == {"headless", "proxy", "args"}
+    ajustes = opciones["proxy"]
+    assert isinstance(ajustes, dict) and ajustes.keys() == {"server", "bypass"}
+    assert ajustes["server"].startswith("socks5://127.0.0.1:")
+    assert "secreta" not in repr(opciones) and "usu" not in repr(opciones)
+
+
+@pytest.mark.parametrize("con_proxy", [False, True])
+def test_el_rele_recibe_el_proxy_y_el_mismo_validador(
+    monkeypatch: pytest.MonkeyPatch, con_proxy: bool
+) -> None:
+    proxy = Proxy("core-residential.evomi.com", 1000, "usu", "secreta") if con_proxy else None
+    descargador = DescargadorChromium(validador=permisivo, proxy=proxy)
+    rele = descargador._crear_rele(proxy)
+    assert rele._validador is permisivo
+    assert rele._proxy is proxy
+    pedidos: list[Proxy | None] = []
+
+    def crear(p: Proxy | None) -> ReleProxy:
+        pedidos.append(p)
+        return ReleProxy(p, validador=permisivo)
+
+    _lanzar(monkeypatch, proxy, crear_rele=crear)
+    assert pedidos == [proxy]
+
+
+def test_new_context_sin_user_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    # `new_context(user_agent=...)` deja «HeadlessChrome» en las marcas y cambia platformVersion:
+    # la huella se pone por CDP en cada página.
+    falso = _lanzar(monkeypatch, None)
+    contextos = falso.navegadores[0].contextos
+    assert contextos and all("user_agent" not in opciones for opciones in contextos)
+
+
+def test_si_chromium_no_arranca_se_cierra_el_rele(monkeypatch: pytest.MonkeyPatch) -> None:
+    reles: list[ReleProxy] = []
+
+    def crear(p: Proxy | None) -> ReleProxy:
+        reles.append(ReleProxy(p, validador=permisivo))
+        return reles[-1]
+
+    falso = _PlaywrightFalso(fallo=ErrorPlaywright("Executable doesn't exist at C:\\x\nmás"))
+    _lanzar(monkeypatch, None, falso=falso, crear_rele=crear, error=ErrorDescarga)
+    assert falso.parado
+    assert reles and reles[0]._servidor is None
+
+
+def test_si_falla_la_lectura_de_la_huella_se_cierra_todo(monkeypatch: pytest.MonkeyPatch) -> None:
+    reles: list[ReleProxy] = []
+
+    def crear(p: Proxy | None) -> ReleProxy:
+        reles.append(ReleProxy(p, validador=permisivo))
+        return reles[-1]
+
+    falso = _lanzar(monkeypatch, None, crear_rele=crear)
+    assert falso.navegadores[0].cerrado and falso.parado
+    assert reles[0]._servidor is None
+
+
+class _ContextoQueFalla:
+    """Contexto de Playwright cuya sesión CDP falla (Chromium murió a mitad)."""
+
+    def __init__(self) -> None:
+        self.cerrado = False
+
+    def set_default_timeout(self, _: float) -> None:
+        pass
+
+    async def route(self, *_: object) -> None:
+        pass
+
+    async def route_web_socket(self, *_: object) -> None:
+        pass
+
+    async def new_page(self) -> object:
+        return object()
+
+    async def new_cdp_session(self, _: object) -> "_ContextoQueFalla":
+        return self
+
+    async def send(self, *_: object) -> None:
+        raise ErrorPlaywright("Target page, context or browser has been closed")
+
+    async def close(self) -> None:
+        self.cerrado = True
+        raise ErrorPlaywright("Target page, context or browser has been closed")
+
+
+class _NavegadorMuerto(_NavegadorArrancado):
+    """Navegador cuyo proceso murió: `new_context` falla con el error en bruto de Playwright."""
+
+    def __init__(self, *, conectado: bool = False, contexto: object | None = None) -> None:
+        super().__init__()
+        self.conectado = conectado
+        self.contexto = contexto
+
+    def is_connected(self) -> bool:
+        return self.conectado
+
+    async def new_context(self, **opciones: object) -> object:
+        self.contextos.append(opciones)
+        if self.contexto is not None:
+            return self.contexto
+        raise ErrorPlaywright(
+            "Browser.new_context: Target page, context or browser has been closed."
+        )
+
+
+class _PlaywrightConMuertos(_PlaywrightFalso):
+    def __init__(self, crear: Callable[[], _NavegadorArrancado]) -> None:
+        super().__init__()
+        self.crear = crear
+        self.paradas = 0
+
+    async def launch(self, **opciones: object) -> _NavegadorArrancado:
+        self.lanzamientos.append(opciones)
+        self.navegadores.append(self.crear())
+        return self.navegadores[-1]
+
+    async def stop(self) -> None:
+        self.paradas += 1
+
+
+async def _sin_huella(_: object, __: object) -> dict[str, Any]:
+    return {}
+
+
+def _descargar_dos_veces(
+    monkeypatch: pytest.MonkeyPatch, falso: _PlaywrightConMuertos
+) -> tuple[list[BaseException], list[ReleProxy]]:
+    monkeypatch.setattr("precia.navegador.chromium.async_playwright", lambda: falso)
+    monkeypatch.setattr(DescargadorChromium, "_leer_huella", _sin_huella)
+    reles: list[ReleProxy] = []
+
+    def crear(p: Proxy | None) -> ReleProxy:
+        reles.append(ReleProxy(p, validador=permisivo))
+        return reles[-1]
+
+    descargador = DescargadorChromium(validador=permisivo, crear_rele=crear)
+    errores: list[BaseException] = []
+
+    async def probar() -> None:
+        for _ in range(2):
+            try:
+                await descargador.descargar("https://tienda.example/")
+            except Exception as error:
+                errores.append(error)
+        await descargador.cerrar()
+
+    asyncio.run(probar())
+    return errores, reles
+
+
+def test_errores_de_playwright_al_preparar_la_pagina_son_error_descarga(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Antes, `new_context` (fuera de todo try) y la sesión CDP lanzaban `playwright.Error` en
+    # bruto: el rescate no lo capturaba y la tienda acababa como error INESPERADO.
+    contexto = _ContextoQueFalla()
+    falso = _PlaywrightConMuertos(lambda: _NavegadorMuerto(conectado=True, contexto=contexto))
+    errores, _ = _descargar_dos_veces(monkeypatch, falso)
+    assert [type(error) for error in errores] == [ErrorDescarga, ErrorDescarga]
+    assert contexto.cerrado
+    assert len(falso.lanzamientos) == 1  # sigue conectado: no se relanza
+
+
+def test_navegador_muerto_se_relanza(monkeypatch: pytest.MonkeyPatch) -> None:
+    falso = _PlaywrightConMuertos(lambda: _NavegadorMuerto(conectado=False))
+    errores, reles = _descargar_dos_veces(monkeypatch, falso)
+    assert [type(error) for error in errores] == [ErrorDescarga, ErrorDescarga]
+    # El segundo intento no reutiliza el navegador muerto: arranca otro (y suelta el anterior).
+    assert len(falso.lanzamientos) == 2
+    assert len(reles) == 2 and reles[0]._servidor is None
+    assert falso.paradas >= 1
 
 
 # --- Chromium real contra un servidor local ------------------------------------------------------
@@ -224,9 +478,8 @@ PORTADA = """<!doctype html>
 <video src="/video.mp4"></video>
 <div id="precio"></div>
 <script>
-  fetch("/secreto").catch(() => {});
-  fetch("/redirige").catch(() => {});
-  fetch("/cadena").catch(() => {});
+  fetch("http://interno.example:PUERTO/secreto").catch(() => {});
+  fetch("/redirige-fuera").catch(() => {});
   new Image().src = "/pixel.gif";
   document.getElementById("precio").textContent = "Precio renderizado: 38,90 €";
 </script>
@@ -242,16 +495,61 @@ BUCLE = """<!doctype html>
 </script>
 </body></html>"""
 
+HINTS = """<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><title>Huella</title></head><body>
+<pre id="ua"></pre><pre id="marcas"></pre>
+<iframe src="http://127.0.0.1:PUERTO/marco"></iframe>
+<script>
+  document.getElementById("ua").textContent = navigator.userAgent;
+  document.getElementById("marcas").textContent = JSON.stringify(navigator.userAgentData.brands);
+  fetch("/xhr").catch(() => {});
+</script>
+</body></html>"""
+
+WEBRTC = """<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><title>WebRTC</title></head><body>
+<p id="estado">empezando</p>
+<script>
+  const pc = new RTCPeerConnection({iceServers: [{urls: "stun:127.0.0.1:STUN"}]});
+  pc.createDataChannel("x");
+  pc.onicegatheringstatechange = () => {
+    document.getElementById("estado").textContent = "ice:" + pc.iceGatheringState;
+  };
+  pc.createOffer().then((oferta) => pc.setLocalDescription(oferta))
+    .then(() => { document.getElementById("estado").textContent = "oferta-lista"; });
+</script>
+</body></html>"""
+
+
+@dataclass
+class Visita:
+    host: str
+    ruta: str
+    nombres: list[str]
+    """Nombres de las cabeceras tal cual llegaron (orden y mayúsculas)."""
+    cabeceras: dict[str, str]
+
 
 class _Manejador(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-        rutas: list[str] = self.server.rutas  # type: ignore[attr-defined]
-        rutas.append(self.path)
+        servidor: _Servidor = self.server  # type: ignore[assignment]
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
+        servidor.visitas.append(
+            Visita(
+                host,
+                self.path,
+                list(self.headers.keys()),
+                {k.lower(): v for k, v in self.headers.items()},
+            )
+        )
+        puerto = str(servidor.server_port)
+        externo = f"http://interno.example:{puerto}/secreto"
         saltos = {
-            "/redirige": "/secreto",
-            "/cadena": "/cadena2",
-            "/cadena2": "/secreto",
+            "/redirige": externo,
+            "/redirige-fuera": externo,
             "/vieja": "/",
+            **{f"/r{i}": f"/r{i + 1}" for i in range(7)},
+            "/r7": "/",
         }
         if self.path in saltos:
             self.send_response(302)
@@ -259,13 +557,19 @@ class _Manejador(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        tipos = {"/": "text/html; charset=utf-8", "/estilo.css": "text/css"}
-        paginas = {"/": PORTADA, "/bucle": BUCLE}
-        if self.path == "/bucle":
-            tipos["/bucle"] = "text/html; charset=utf-8"
-        cuerpo = paginas[self.path].encode() if self.path in paginas else b"/* nada */"
+        paginas = {
+            "/": PORTADA.replace("PUERTO", puerto),
+            "/bucle": BUCLE,
+            "/hints": HINTS.replace("PUERTO", puerto),
+            "/marco": "<p>marco</p>",
+            "/webrtc": WEBRTC.replace("STUN", str(servidor.puerto_stun)),
+        }
+        if self.path in paginas:
+            cuerpo, tipo = paginas[self.path].encode(), "text/html; charset=utf-8"
+        else:
+            cuerpo, tipo = b"/* nada */", "text/css"
         self.send_response(200)
-        self.send_header("Content-Type", tipos.get(self.path, "application/octet-stream"))
+        self.send_header("Content-Type", tipo)
         self.send_header("Content-Length", str(len(cuerpo)))
         self.end_headers()
         self.wfile.write(cuerpo)
@@ -274,44 +578,93 @@ class _Manejador(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class _Servidor(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    visitas: list[Visita]
+    puerto_stun: int
+
+
 @pytest.fixture
-def servidor() -> Iterator[tuple[str, list[str]]]:
-    servidor = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Manejador)
-    rutas: list[str] = []
-    servidor.rutas = rutas  # type: ignore[attr-defined]
+def servidor() -> Iterator[_Servidor]:
+    servidor = _Servidor(("127.0.0.1", 0), _Manejador)
+    servidor.visitas = []
+    servidor.puerto_stun = 9
     hilo = threading.Thread(
         target=servidor.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
     )
     hilo.start()
     try:
-        yield f"http://127.0.0.1:{servidor.server_port}", rutas
+        yield servidor
     finally:
         servidor.shutdown()
         servidor.server_close()
 
 
-def validador_local(base: str) -> Validador:
+HOSTS_DEL_TEST = ("tienda.example", "localhost", "127.0.0.1")
+
+
+def validador_local(puerto: int) -> Validador:
+    """Solo `tienda.example`, `localhost` y 127.0.0.1, por http y en el puerto del servidor."""
+
     async def validar(url: str) -> str:
-        if not url.startswith(base + "/") or urlsplit(url).path.startswith("/secreto"):
+        partes = urlsplit(url)
+        if (
+            partes.scheme != "http"
+            or partes.hostname not in HOSTS_DEL_TEST
+            or partes.port != puerto
+        ):
             raise URLNoPermitida("Fuera del servidor del test.")
         return url
 
     return validar
 
 
-def con_chromium(base: str, url: str, *, timeout: float = 15) -> Pagina:
+def _resolver_local(host: str, puerto: int, **_: object) -> list[tuple[Any, ...]]:
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", puerto))]
+
+
+def _loopback(ip: Any) -> bool:
+    return bool(ip.is_loopback)
+
+
+def descargador_local(
+    puerto: int, *, timeout: float = 15, espera_red_s: float = 0.5, proxy: Proxy | None = None
+) -> DescargadorChromium:
+    """El relé y el descargador comparten EL MISMO validador (como en producción)."""
+    validador = validador_local(puerto)
+    return DescargadorChromium(
+        timeout=timeout,
+        validador=validador,
+        espera_red_s=espera_red_s,
+        proxy=proxy,
+        crear_rele=lambda p: ReleProxy(
+            p,
+            validador=validador,
+            resolver=_resolver_local,
+            ip_permitida=_loopback,
+            proxy_remoto=lambda _: True,
+            puertos=frozenset({puerto}),
+        ),
+    )
+
+
+def con_chromium(
+    puerto: int, url: str, *, timeout: float = 15, espera_red_s: float = 0.5
+) -> Pagina:
     async def ejecutar() -> Pagina:
-        descargador = DescargadorChromium(
-            UA, timeout=timeout, validador=validador_local(base), espera_red_s=0.5
-        )
+        descargador = descargador_local(puerto, timeout=timeout, espera_red_s=espera_red_s)
         try:
             # Margen holgado: si `descargar` no respeta su propio timeout, el test falla aquí.
             return await asyncio.wait_for(descargador.descargar(url), timeout * 4)
         finally:
             await descargador.cerrar()
 
+    return _ejecutar(ejecutar)
+
+
+def _ejecutar(funcion: Callable[[], Coroutine[Any, Any, Pagina]]) -> Pagina:
     try:
-        return asyncio.run(ejecutar())
+        return asyncio.run(funcion())
     except URLNoPermitida:
         raise
     except Exception as error:
@@ -320,142 +673,187 @@ def con_chromium(base: str, url: str, *, timeout: float = 15) -> Pagina:
         raise
 
 
+def _hosts(servidor: _Servidor) -> set[str]:
+    return {visita.host for visita in servidor.visitas}
+
+
+def _rutas(servidor: _Servidor) -> list[str]:
+    return [visita.ruta for visita in servidor.visitas]
+
+
 @pytest.mark.chromium
-def test_renderiza_y_bloquea_lo_no_permitido(servidor: tuple[str, list[str]]) -> None:
-    base, rutas = servidor
-    pagina = con_chromium(base, f"{base}/")
+def test_renderiza_y_bloquea_lo_no_permitido(servidor: _Servidor) -> None:
+    puerto = servidor.server_port
+    base = f"http://tienda.example:{puerto}"
+    pagina = con_chromium(puerto, f"{base}/")
     assert "Precio renderizado: 38,90 €" in pagina.html
     assert pagina.estado == 200
     assert pagina.tipo_contenido == "text/html"
     assert pagina.url_final == f"{base}/"
-    assert "/secreto" not in rutas
-    assert not {"/foto.jpg", "/fuente.woff2", "/video.mp4", "/pixel.gif"} & set(rutas)
-    assert rutas[0] == "/"
+    assert _rutas(servidor)[0] == "/"
+    assert not {"/foto.jpg", "/fuente.woff2", "/video.mp4", "/pixel.gif"} & set(_rutas(servidor))
+    # Ni el fetch directo (lo corta `route`) ni el subrecurso redirigido (lo corta el relé).
+    assert "interno.example" not in _hosts(servidor)
+    assert "/redirige-fuera" in _rutas(servidor) and "/secreto" not in _rutas(servidor)
 
 
 @pytest.mark.chromium
-@pytest.mark.parametrize("inicio", ["/redirige", "/cadena"])
-def test_redirecciones_de_la_navegacion_se_validan(
-    servidor: tuple[str, list[str]], inicio: str
-) -> None:
-    base, rutas = servidor
+def test_redireccion_a_un_host_no_permitido_se_corta_en_el_rele(servidor: _Servidor) -> None:
+    puerto = servidor.server_port
     with pytest.raises(URLNoPermitida):
-        con_chromium(base, f"{base}{inicio}")
-    assert "/secreto" not in rutas
+        con_chromium(puerto, f"http://tienda.example:{puerto}/redirige")
+    assert _rutas(servidor) == ["/redirige"]
+    assert "interno.example" not in _hosts(servidor)
 
 
 @pytest.mark.chromium
-def test_url_inicial_no_valida(servidor: tuple[str, list[str]]) -> None:
-    base, rutas = servidor
+def test_url_inicial_no_valida(servidor: _Servidor) -> None:
     with pytest.raises(URLNoPermitida):
-        con_chromium(base, "http://169.254.169.254/")
-    assert rutas == []
+        con_chromium(servidor.server_port, "http://169.254.169.254/")
+    assert servidor.visitas == []
 
 
 @pytest.mark.chromium
-def test_redireccion_valida_de_la_navegacion(servidor: tuple[str, list[str]]) -> None:
-    base, rutas = servidor
-    pagina = con_chromium(base, f"{base}/vieja")
+def test_redireccion_valida_de_la_navegacion(servidor: _Servidor) -> None:
+    puerto = servidor.server_port
+    base = f"http://tienda.example:{puerto}"
+    pagina = con_chromium(puerto, f"{base}/vieja")
     assert pagina.url == f"{base}/vieja"
     assert pagina.url_final == f"{base}/"
     assert "Precio renderizado" in pagina.html
-    assert rutas[:2] == ["/vieja", "/"]
-    assert "/secreto" not in rutas
+    assert _rutas(servidor)[:2] == ["/vieja", "/"]
 
 
 @pytest.mark.chromium
-def test_pagina_que_cuelga_el_navegador_respeta_el_timeout(
-    servidor: tuple[str, list[str]],
+def test_demasiadas_redirecciones(servidor: _Servidor) -> None:
+    puerto = servidor.server_port
+    with pytest.raises(ErrorDescarga, match="redirecciones"):
+        con_chromium(puerto, f"http://tienda.example:{puerto}/r0")
+
+
+@pytest.mark.chromium
+def test_navega_con_la_red_de_chromium(servidor: _Servidor) -> None:
+    # Con `route.fetch` la petición la hacía Node: cabeceras en minúsculas y sin Sec-Fetch-*.
+    puerto = servidor.server_port
+    # En `localhost` (contexto seguro): Chromium solo manda Sec-Fetch-* a orígenes seguros.
+    con_chromium(puerto, f"http://localhost:{puerto}/")
+    portada = servidor.visitas[0]
+    assert portada.ruta == "/"
+    assert portada.nombres[0] == "Host"
+    assert "User-Agent" in portada.nombres and "Upgrade-Insecure-Requests" in portada.nombres
+    assert portada.cabeceras["sec-fetch-mode"] == "navigate"
+    assert portada.cabeceras["accept-language"].startswith("es-ES")
+
+
+@pytest.mark.chromium
+def test_client_hints_de_chrome(servidor: _Servidor) -> None:
+    # `localhost` es un contexto seguro: ahí existen `navigator.userAgentData` y `sec-ch-ua`.
+    puerto = servidor.server_port
+    pagina = con_chromium(puerto, f"http://localhost:{puerto}/hints", espera_red_s=1.5)
+    visitas = {(v.host, v.ruta): v for v in servidor.visitas}
+    for clave in (("localhost", "/hints"), ("localhost", "/xhr"), ("127.0.0.1", "/marco")):
+        cabeceras = visitas[clave].cabeceras
+        assert re.search(r"Chrome/\d+\.0\.0\.0 ", cabeceras["user-agent"]), clave
+        assert "Headless" not in cabeceras["user-agent"], clave
+        assert '"Chromium"' in cabeceras["sec-ch-ua"], clave
+        assert "Headless" not in cabeceras["sec-ch-ua"], clave
+    assert "Headless" not in pagina.html
+    assert '"brand":"Chromium"' in pagina.html
+
+
+@pytest.mark.chromium
+def test_webrtc_no_manda_udp(servidor: _Servidor) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as stun:
+        stun.bind(("127.0.0.1", 0))
+        stun.settimeout(0.5)
+        servidor.puerto_stun = stun.getsockname()[1]
+        puerto = servidor.server_port
+        pagina = con_chromium(puerto, f"http://tienda.example:{puerto}/webrtc", espera_red_s=2)
+        assert "oferta-lista" in pagina.html or "ice:" in pagina.html
+        paquetes = 0
+        with contextlib.suppress(TimeoutError):
+            while stun.recv(2048):
+                paquetes += 1
+    assert paquetes == 0
+
+
+SONDA_IPV6 = "[2001:4860:4860::8888]:443"
+"""`connect()` UDP con el que Chromium mira si hay ruta IPv6
+(`HOST_RESOLVER_MANAGER_IPV6_REACHABILITY_CHECK`). Un `connect()` UDP no manda ningún paquete."""
+
+
+@dataclass
+class Netlog:
+    tcp: list[str] = field(default_factory=list)
+    """Destinos de los `TCP_CONNECT*`."""
+    udp_conectados: list[str] = field(default_factory=list)
+    """Destinos de los `UDP_CONNECT` (sin tráfico por sí mismos)."""
+    udp_enviados: list[str] = field(default_factory=list)
+    """Destinos de los `UDP_BYTES_SENT` (por su parámetro o por el `connect` de su socket)."""
+
+
+def _leer_netlog(ruta: Path) -> Netlog:
+    texto = ruta.read_text(encoding="utf-8").rstrip().rstrip(",")
+    try:
+        datos = json.loads(texto)
+    except json.JSONDecodeError:
+        datos = json.loads(texto + "]}")  # Chromium cerrado sin terminar el fichero
+    tipos = {valor: nombre for nombre, valor in datos["constants"]["logEventTypes"].items()}
+    netlog = Netlog()
+    destino_udp: dict[int, str] = {}
+    for evento in datos["events"]:
+        nombre = tipos.get(evento.get("type"), "")
+        parametros = evento.get("params") or {}
+        fuente = evento.get("source", {}).get("id", -1)
+        direcciones = list(parametros.get("address_list", []))
+        if "address" in parametros:
+            direcciones.append(parametros["address"])
+        if nombre.startswith("TCP_CONNECT"):
+            netlog.tcp += direcciones
+        elif nombre == "UDP_CONNECT" and direcciones:
+            netlog.udp_conectados += direcciones
+            destino_udp[fuente] = direcciones[0]
+        elif nombre == "UDP_BYTES_SENT":
+            netlog.udp_enviados += direcciones or [destino_udp.get(fuente, "desconocido")]
+    return netlog
+
+
+def _es_loopback(direccion: str) -> bool:
+    host = direccion.rsplit(":", 1)[0].strip("[]")
+    return host.startswith("127.") or host == "::1"
+
+
+@pytest.mark.chromium
+def test_sin_trafico_fuera_del_rele(
+    servidor: _Servidor, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    base, _ = servidor
+    # Defensa contra una vuelta a Chrome for Testing (DoH directo a dns.google) o a cualquier
+    # canal con tráfico de fondo: todo lo que abre Chromium tiene que ir al relé, en 127.0.0.1.
+    netlog = tmp_path / "netlog.json"
+    monkeypatch.setattr(
+        modulo_chromium,
+        "ARGUMENTOS",
+        (*ARGUMENTOS, f"--log-net-log={netlog}", "--net-log-capture-mode=Everything"),
+    )
+    puerto = servidor.server_port
+    con_chromium(puerto, f"http://tienda.example:{puerto}/", espera_red_s=1.5)
+    registro = _leer_netlog(netlog)
+    assert registro.tcp, "el netlog no apuntó ninguna conexión: la prueba no mediría nada"
+    assert [d for d in registro.tcp if not _es_loopback(d)] == []
+    assert [d for d in registro.udp_enviados if not _es_loopback(d)] == []
+    assert {d for d in registro.udp_conectados if not _es_loopback(d)} <= {SONDA_IPV6}
+
+
+@pytest.mark.chromium
+def test_pagina_que_cuelga_el_navegador_respeta_el_timeout(servidor: _Servidor) -> None:
+    puerto = servidor.server_port
     inicio = time.monotonic()
     with pytest.raises(ErrorDescarga):
-        con_chromium(base, f"{base}/bucle", timeout=3)
+        con_chromium(puerto, f"http://tienda.example:{puerto}/bucle", timeout=3)
     assert time.monotonic() - inicio < 10
 
 
-# --- Arranque con proxy (Playwright falso) ------------------------------------------------------
-
-
-class _NavegadorArrancado:
-    def __init__(self) -> None:
-        self.cerrado = False
-
-    async def new_context(self, **opciones: object) -> object:
-        raise RuntimeError("el test para aquí")
-
-    async def close(self) -> None:
-        self.cerrado = True
-
-
-class _PlaywrightFalso:
-    def __init__(self) -> None:
-        self.lanzamientos: list[dict[str, object]] = []
-        self.chromium = self
-
-    async def start(self) -> "_PlaywrightFalso":
-        return self
-
-    async def launch(self, **opciones: object) -> _NavegadorArrancado:
-        self.lanzamientos.append(opciones)
-        return _NavegadorArrancado()
-
-    async def stop(self) -> None:
-        pass
-
-
-def _lanzar(monkeypatch: pytest.MonkeyPatch, proxy: Proxy | None) -> dict[str, object]:
-    falso = _PlaywrightFalso()
-    monkeypatch.setattr("precia.navegador.chromium.async_playwright", lambda: falso)
-
-    async def permisivo(url: str) -> str:
-        return url
-
-    descargador = DescargadorChromium(UA, validador=permisivo, proxy=proxy)
-
-    async def probar() -> None:
-        with pytest.raises(RuntimeError, match="el test para aquí"):
-            await descargador.descargar("https://tienda.example/")
-        await descargador.cerrar()
-
-    asyncio.run(probar())
-    assert len(falso.lanzamientos) == 1
-    return falso.lanzamientos[0]
-
-
-def test_sin_proxy_arranca_sin_la_opcion(monkeypatch: pytest.MonkeyPatch) -> None:
-    assert _lanzar(monkeypatch, None) == {"headless": True}
-
-
-def test_con_proxy_arranca_chromium_contra_el_rele_sin_credenciales(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Playwright usaría el usuario y la contraseña del proxy para contestar a cualquier 401 Basic
-    # de un destino: Chromium va al relé local, que es quien las añade en el CONNECT.
-    proxy = Proxy("core-residential.evomi.com", 1000, "usu", "secreta_country-ES")
-    opciones = _lanzar(monkeypatch, proxy)
-    assert set(opciones) == {"headless", "proxy"} and opciones["headless"] is True
-    ajustes = opciones["proxy"]
-    assert isinstance(ajustes, dict) and set(ajustes) == {"server"}
-    assert ajustes["server"].startswith("http://127.0.0.1:")
-    assert "secreta" not in repr(opciones) and "usu" not in repr(opciones)
-
-
-def test_fallo_de_red_de_la_navegacion_principal_se_recuerda() -> None:
-    ruta = RutaFalsa(PeticionFalsa("https://tienda.example/", navegacion=True))
-    ruta.fallo_de_red = True
-    filtro = filtrar(ruta)
-    assert ruta.acciones[-1] == "abort:failed"
-    assert filtro.fallo_principal is not None and "ERR_CONNECTION_RESET" in filtro.fallo_principal
-
-
-def test_fallo_de_red_de_un_subrecurso_no_es_el_de_la_pagina() -> None:
-    ruta = RutaFalsa(PeticionFalsa("https://tienda.example/api", resource_type="xhr"))
-    ruta.fallo_de_red = True
-    assert filtrar(ruta).fallo_principal is None
-
-
-# --- Chromium real por el proxy (relé local) ----------------------------------------------------
+# --- Chromium real por el proxy (relé encadenado) -----------------------------------------------
 
 USUARIO_PROXY = "usuario-proxy-chromium"
 SECRETO_PROXY = "contrasena-proxy-chromium_country-ES"
@@ -483,45 +881,26 @@ def _pide_basic(manejador: http.server.BaseHTTPRequestHandler) -> bool:
     return True
 
 
-def _siempre_remoto(_: object) -> bool:
-    return True
-
-
 @pytest.mark.chromium
 def test_por_el_proxy_un_401_basic_no_se_lleva_las_credenciales() -> None:
     with tienda(manejar=_pide_basic) as servidor:
-        base = f"http://tienda.example:{servidor.server_address[1]}"
+        puerto_tienda = servidor.server_address[1]
+        base = f"http://tienda.example:{puerto_tienda}"
         proxy_esperado = Proxy("127.0.0.1", 1, USUARIO_PROXY, SECRETO_PROXY)
-        with proxy_falso(
-            servidor.server_address[1], esperada=proxy_esperado.cabecera_autorizacion
-        ) as (puerto, estado):
+        with proxy_falso(puerto_tienda, esperada=proxy_esperado.cabecera_autorizacion) as (
+            puerto,
+            estado,
+        ):
             proxy = Proxy("127.0.0.1", puerto, USUARIO_PROXY, SECRETO_PROXY)
 
-            async def validar(url: str) -> str:
-                if not url.startswith(base + "/"):
-                    raise URLNoPermitida("Fuera de la tienda del test.")
-                return url
-
             async def ejecutar() -> Pagina:
-                descargador = DescargadorChromium(
-                    UA,
-                    timeout=15,
-                    validador=validar,
-                    espera_red_s=0.5,
-                    proxy=proxy,
-                    crear_rele=lambda p: ReleProxy(p, proxy_remoto=_siempre_remoto),
-                )
+                descargador = descargador_local(puerto_tienda, proxy=proxy)
                 try:
                     return await asyncio.wait_for(descargador.descargar(f"{base}/"), 60)
                 finally:
                     await descargador.cerrar()
 
-            try:
-                pagina = asyncio.run(ejecutar())
-            except Exception as error:
-                if "Executable doesn't exist" in str(error):
-                    pytest.skip("Chromium de Playwright no instalado")
-                raise
+            pagina: Pagina = _ejecutar(ejecutar)
     # Ha ido por el proxy (el nombre `tienda.example` solo lo «resuelve» el proxy falso)...
     assert estado.connects and all("tienda.example" in c for c in estado.connects)
     assert set(estado.autorizaciones) == {proxy_esperado.cabecera_autorizacion}
@@ -529,6 +908,7 @@ def test_por_el_proxy_un_401_basic_no_se_lleva_las_credenciales() -> None:
     assert pagina.estado == 401
     assert servidor.peticiones
     assert all("authorization" not in cabeceras for _, cabeceras in servidor.peticiones)
+    assert all("proxy-authorization" not in cabeceras for _, cabeceras in servidor.peticiones)
     assert "robadas" not in pagina.html
 
 
@@ -536,7 +916,7 @@ def test_por_el_proxy_un_401_basic_no_se_lleva_las_credenciales() -> None:
 
 
 @pytest.fixture
-def servidor_que_corta() -> Iterator[str]:
+def servidor_que_corta() -> Iterator[int]:
     """Acepta y cierra con RST (`SO_LINGER` 0), como un WAF que rechaza la IP."""
     escucha = socket.create_server(("127.0.0.1", 0))
     escucha.settimeout(0.2)
@@ -556,7 +936,7 @@ def servidor_que_corta() -> Iterator[str]:
     hilo = threading.Thread(target=aceptar, daemon=True)
     hilo.start()
     try:
-        yield f"http://127.0.0.1:{escucha.getsockname()[1]}"
+        yield escucha.getsockname()[1]
     finally:
         parar.set()
         hilo.join(5)
@@ -564,7 +944,35 @@ def servidor_que_corta() -> Iterator[str]:
 
 
 @pytest.mark.chromium
-def test_conexion_cortada_por_la_tienda(servidor_que_corta: str) -> None:
-    base = servidor_que_corta
+def test_conexion_cortada_por_la_tienda(servidor_que_corta: int) -> None:
+    puerto = servidor_que_corta
     with pytest.raises(ConexionCortada):
-        con_chromium(base, f"{base}/")
+        con_chromium(puerto, f"http://tienda.example:{puerto}/")
+
+
+@pytest.mark.chromium
+def test_si_chromium_muere_se_vuelve_a_arrancar(servidor: _Servidor) -> None:
+    puerto = servidor.server_address[1]
+    url = f"http://tienda.example:{puerto}/"
+
+    async def ejecutar() -> Pagina:
+        descargador = descargador_local(puerto)
+        try:
+            await asyncio.wait_for(descargador.descargar(url), 60)
+            navegador = descargador._navegador
+            assert navegador is not None
+            cdp = await navegador.new_browser_cdp_session()
+            with contextlib.suppress(ErrorPlaywright, TimeoutError):
+                await asyncio.wait_for(cdp.send("Browser.crash"), 5)
+            for _ in range(50):
+                if not navegador.is_connected():
+                    break
+                await asyncio.sleep(0.1)
+            assert not navegador.is_connected()
+            # Antes, el navegador muerto se reutilizaba para siempre (`TargetClosedError`).
+            return await asyncio.wait_for(descargador.descargar(url), 60)
+        finally:
+            await descargador.cerrar()
+
+    resultado = _ejecutar(ejecutar)
+    assert "Brembo P85075" in resultado.html

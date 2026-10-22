@@ -15,8 +15,10 @@ import pytest
 
 from precia.navegador.chromium import DescargadorChromium
 from precia.navegador.con_proxy import DescargadorConProxy
+from precia.navegador.curl import TransporteCurl
 from precia.navegador.http import DescargadorHTTP, TransporteURLLib
 from precia.navegador.proxy import ErrorProxy, ModoProxy, Proxy
+from precia.navegador.tipos import ErrorDescarga
 from precia.nucleo.config import Config
 from precia.nucleo.fuente_datos import FuenteDatos
 from precia.nucleo.fuente_demo import FuenteDemo
@@ -218,10 +220,15 @@ def test_la_demo_no_tiene_proxy() -> None:
     assert not estado.configurado and not estado.activo
 
 
+@pytest.mark.parametrize("transporte_http", ["curl", "urllib"])
 @pytest.mark.parametrize("modo", [ModoProxy.BLOQUEO, ModoProxy.SIEMPRE])
-def test_cableado_de_los_descargadores_con_proxy(tmp_path: Path, modo: ModoProxy) -> None:
+def test_cableado_de_los_descargadores_con_proxy(
+    tmp_path: Path, modo: ModoProxy, transporte_http: str
+) -> None:
     # Lo que sale por el «proxy» tiene que salir de verdad por él, y lo directo, sin él.
     real = fuente(tmp_path, EvomiFalso(), clave_evomi=CLAVE_EVOMI, proxy_modo=modo)
+    real.guardar_ajustes(Ajustes(transporte_http=transporte_http))
+    clase = TransporteCurl if transporte_http == "curl" else TransporteURLLib
     try:
         buscar(real)
         navegador = real._navegador
@@ -234,11 +241,13 @@ def test_cableado_de_los_descargadores_con_proxy(tmp_path: Path, modo: ModoProxy
         assert isinstance(http.directo, DescargadorHTTP)
         assert isinstance(http.por_proxy, DescargadorHTTP)
         directo_http, proxy_http = http.directo.transporte, http.por_proxy.transporte
-        assert isinstance(directo_http, TransporteURLLib) and directo_http.proxy is None
-        assert isinstance(proxy_http, TransporteURLLib) and proxy_http.proxy is PROXY
+        assert isinstance(directo_http, clase) and directo_http.proxy is None
+        assert isinstance(proxy_http, clase) and proxy_http.proxy is PROXY
         assert isinstance(chromium.directo, DescargadorChromium)
         assert isinstance(chromium.por_proxy, DescargadorChromium)
         assert chromium.directo.proxy is None and chromium.por_proxy.proxy is PROXY
+        # Chromium no lleva el UA de Ajustes: usa el de Chrome sacado del binario (ADR-023).
+        assert chromium.directo._user_agent is None and chromium.por_proxy._user_agent is None
     finally:
         asyncio.run(real.cerrar())
 
@@ -289,5 +298,66 @@ def test_si_se_cancela_la_primera_busqueda_se_vuelve_a_intentar(tmp_path: Path) 
         buscar(real)
         assert len(evomi.llamadas) == 2
         assert real.estado_proxy().activo
+    finally:
+        asyncio.run(real.cerrar())
+
+
+# --- Cliente HTTP de los ajustes (ADR-022) ------------------------------------------------------
+
+
+def _transporte_directo(real: FuenteReal) -> object:
+    http = _http_del_navegador(real)
+    assert isinstance(http, DescargadorHTTP)
+    return http.transporte
+
+
+def test_sin_proxy_el_cliente_por_defecto_es_curl(tmp_path: Path) -> None:
+    real = fuente(tmp_path, EvomiFalso())
+    try:
+        buscar(real)
+        transporte = _transporte_directo(real)
+        assert isinstance(transporte, TransporteCurl) and transporte.proxy is None
+    finally:
+        asyncio.run(real.cerrar())
+
+
+def test_sin_proxy_chromium_no_lleva_el_ua_de_ajustes(tmp_path: Path) -> None:
+    real = fuente(tmp_path, EvomiFalso())
+    try:
+        buscar(real)
+        navegador = real._navegador
+        assert navegador is not None
+        chromium = navegador._chromium
+        assert isinstance(chromium, DescargadorChromium) and chromium._user_agent is None
+    finally:
+        asyncio.run(real.cerrar())
+
+
+def test_cambiar_el_cliente_crea_otro_navegador_y_cierra_el_viejo(tmp_path: Path) -> None:
+    real = fuente(tmp_path, EvomiFalso())
+    try:
+        buscar(real)
+        viejo = _transporte_directo(real)
+        assert isinstance(viejo, TransporteCurl)
+        real.guardar_ajustes(Ajustes(transporte_http="urllib"))
+        buscar(real)
+        assert isinstance(_transporte_directo(real), TransporteURLLib)
+        with pytest.raises(ErrorDescarga, match="cerrado"):
+            viejo.pedir("http://tienda.example/", {}, 1, 1000)
+    finally:
+        asyncio.run(real.cerrar())
+
+
+def test_cliente_desconocido_usa_el_de_por_defecto(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # El almacén no valida el valor (alguien edita la BD): no debe romper cada búsqueda.
+    real = fuente(tmp_path, EvomiFalso())
+    real.guardar_ajustes(Ajustes(transporte_http="otro"))
+    try:
+        with caplog.at_level(logging.WARNING):
+            buscar(real)
+        assert isinstance(_transporte_directo(real), TransporteCurl)
+        assert "Cliente HTTP desconocido" in caplog.text
     finally:
         asyncio.run(real.cerrar())

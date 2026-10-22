@@ -16,8 +16,11 @@ from pathlib import Path
 import pytest
 
 from precia.navegador.http import (
+    FACTOR_TIEMPO_GRANDE,
+    MAXIMO_BYTES,
     DescargadorHTTP,
     RespuestaCruda,
+    TransporteNavegador,
     TransporteURLLib,
     conexion_validada,
     decodificar,
@@ -693,3 +696,65 @@ def test_cabeceras_a_goteo_por_https_respetan_el_tiempo_total(
         parar.set()
         escucha.close()
         hilo.join(5)
+
+
+# --- Transportes con huella de navegador (`TransporteNavegador`, ADR-022) -----------------------
+
+
+@dataclass
+class TransporteNavegadorFalso:
+    """Cumple `TransporteNavegador`: recibe el tiempo total y el tope exacto de cada descarga."""
+
+    llamadas: list[tuple[str, dict[str, str], float, int]] = field(default_factory=list)
+    cerrado: bool = False
+
+    def __call__(self, url: str, cabeceras: Mapping[str, str], timeout: float) -> RespuestaCruda:
+        raise AssertionError("Con un TransporteNavegador se usa `pedir`.")
+
+    def pedir(
+        self, url: str, cabeceras: Mapping[str, str], timeout: float, max_bytes: int
+    ) -> RespuestaCruda:
+        self.llamadas.append((url, dict(cabeceras), timeout, max_bytes))
+        return respuesta()
+
+    def cerrar(self) -> None:
+        self.cerrado = True
+
+
+def test_transporte_navegador_es_un_transporte_navegador() -> None:
+    assert isinstance(TransporteNavegadorFalso(), TransporteNavegador)
+    assert not isinstance(TransporteURLLib(), TransporteNavegador)
+
+
+def test_transporte_navegador_recibe_tiempo_y_tope() -> None:
+    transporte = TransporteNavegadorFalso()
+    d = DescargadorHTTP(UA, timeout=7, validador=validar_con_dns_publico, transporte=transporte)
+    asyncio.run(d.descargar(URL))
+    asyncio.run(d.descargar_grande(URL, max_bytes=1234))
+    (_, cabeceras, tiempo, tope), (_, _, tiempo_grande, tope_grande) = transporte.llamadas
+    assert (tiempo, tope) == (7, MAXIMO_BYTES)
+    assert (tiempo_grande, tope_grande) == (7 * FACTOR_TIEMPO_GRANDE, 1234)
+    # Las mismas cabeceras que con urllib: el transporte decide cuáles usa (curl, solo las suyas;
+    # su respaldo urllib con un proxy local, todas).
+    assert cabeceras["User-Agent"] == UA and cabeceras["Accept-Encoding"] == "identity"
+
+
+def test_cerrar_cierra_el_transporte_navegador() -> None:
+    transporte = TransporteNavegadorFalso()
+    d = DescargadorHTTP(UA, validador=validar_con_dns_publico, transporte=transporte)
+    asyncio.run(d.cerrar())
+    assert transporte.cerrado
+
+
+def test_transporte_plano_recibe_el_timeout_de_siempre() -> None:
+    tiempos: list[float] = []
+
+    def transporte(url: str, cabeceras: Mapping[str, str], timeout: float) -> RespuestaCruda:
+        tiempos.append(timeout)
+        return respuesta()
+
+    d = DescargadorHTTP(UA, timeout=7, validador=validar_con_dns_publico, transporte=transporte)
+    asyncio.run(d.descargar(URL))
+    asyncio.run(d.descargar_grande(URL))
+    asyncio.run(d.cerrar())
+    assert tiempos == [7, 7]

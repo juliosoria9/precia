@@ -30,7 +30,7 @@ from precia.nucleo.config import Config
 from precia.nucleo.fuente_datos import ErrorFuente, FuenteDatos
 from precia.nucleo.fuente_demo import FuenteDemo
 from precia.nucleo.fuente_real import FuenteReal
-from precia.nucleo.modelos import CAMPOS, Ajustes, Modo
+from precia.nucleo.modelos import CAMPOS, TRANSPORTES_HTTP, Ajustes, Modo
 from precia.seguimiento.graficas import grafica_historico
 from precia.web.formularios import (
     ErrorFormulario,
@@ -375,6 +375,9 @@ def _ajustes_desde_formulario(formulario: Parametros, actuales: Ajustes) -> Ajus
     proveedor = primero(formulario, "proveedor", actuales.proveedor)
     if proveedor not in PROVEEDORES:
         raise ErrorFormulario("Proveedor de IA no válido.")
+    transporte_http = primero(formulario, "transporte_http", actuales.transporte_http)
+    if transporte_http not in TRANSPORTES_HTTP:
+        raise ErrorFormulario("Cliente HTTP no válido.")
     presupuesto = actuales.presupuesto_mensual_usd
     if "presupuesto_mensual_usd" in formulario:
         presupuesto = leer_importe(primero(formulario, "presupuesto_mensual_usd"))
@@ -413,4 +416,5 @@ def _ajustes_desde_formulario(formulario: Parametros, actuales: Ajustes) -> Ajus
             )
         ),
         user_agent=texto("user_agent", "User-Agent", actuales.user_agent),
+        transporte_http=transporte_http,
     )

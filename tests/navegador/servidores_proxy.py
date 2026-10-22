@@ -1,5 +1,7 @@
 """Tienda y proxy `CONNECT` falsos en 127.0.0.1, para los tests del proxy (HTTP y Chromium).
 
+`socks` arma el saludo y la petición SOCKS5 con los que Chromium habla al relé (`navegador.rele`).
+
 El proxy falso hace lo que haría Evomi: lee el `CONNECT`, comprueba `Proxy-Authorization` y abre
 el túnel. El destino lo «resuelve» él: pidan el nombre o la IP que pidan, el túnel siempre llega a
 la tienda local. Así se ve qué destino pide el cliente sin preguntar a ningún DNS.
@@ -135,6 +137,25 @@ def tubo(a: socket.socket, b: socket.socket) -> None:
             if not datos:
                 return
             (b if origen is a else a).sendall(datos)
+
+
+def socks(
+    host: str | bytes, puerto: int, *, atyp: int = 3, metodos: bytes = b"\x00", cmd: int = 1
+) -> bytes:
+    """Saludo y petición SOCKS5 (RFC 1928) como los manda Chromium: sin autenticación.
+
+    Con `atyp=3`, `host` es el nombre (texto o bytes tal cual); con 1 o 4, una IP en texto.
+    """
+    if atyp == 3:
+        nombre = host.encode() if isinstance(host, str) else host
+        direccion = bytes([len(nombre)]) + nombre
+    elif atyp in (1, 4):
+        assert isinstance(host, str)
+        direccion = socket.inet_pton(socket.AF_INET if atyp == 1 else socket.AF_INET6, host)
+    else:
+        direccion = host.encode() if isinstance(host, str) else host
+    saludo = bytes([5, len(metodos)]) + metodos
+    return saludo + bytes([5, cmd, 0, atyp]) + direccion + puerto.to_bytes(2, "big")
 
 
 @contextlib.contextmanager

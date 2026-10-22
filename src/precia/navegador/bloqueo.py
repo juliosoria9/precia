@@ -1,8 +1,10 @@
 """Detección de CAPTCHA y bloqueos anti-bot.
 
-Solo se detecta para **parar** (el navegador lanza `Bloqueado` y no reintenta) o, con un proxy
-configurado, para repetir la petición **una vez** desde otra IP (`navegador.con_proxy`). Nunca se
-intenta resolver un desafío ni un CAPTCHA (nota 07, scraping ético).
+Solo se detecta para **parar** (el navegador lanza `Bloqueado`) o para repetir la petición **una
+vez**: con un proxy configurado, desde otra IP (`navegador.con_proxy`), y con Chromium, con otro
+cliente (`navegador.navegador`, ADR-023; nunca tras un 401, un 451 ni un 429 normal, el de límite
+de peticiones: el desafío de Kasada, que llega con un 429, sí). Nunca se intenta resolver un
+desafío ni un CAPTCHA.
 
 Un widget de CAPTCHA por sí solo no es un bloqueo: muchas tiendas cargan reCAPTCHA v3 en todas las
 páginas o lo ponen en el formulario de contacto de la ficha. Cuenta como bloqueo si llega con un
@@ -41,6 +43,11 @@ _MOTIVO_CLOUDFRONT = "Bloqueo del WAF de AWS (CloudFront «Request blocked»)."
 _MOTIVO_F5 = "Bloqueo del WAF de F5 (BIG-IP ASM)."
 _MOTIVO_KASADA = "Desafío anti-bot de Kasada."
 MOTIVO_LIMITE = "La tienda limita las peticiones (HTTP 429)."
+ESTADOS_SIN_RESCATE = frozenset({401, 451})
+"""Rechazos que nunca se repiten con Chromium (`navegador.navegador`). 401: la tienda pide
+credenciales y nunca se inicia sesión. 451: motivo legal o geográfico, que otro cliente desde la
+misma IP no cambia. El 429 tampoco (`MOTIVO_LIMITE`): es la tienda pidiendo que se vaya más
+despacio."""
 
 # Marcas que solo están en la página de desafío o de bloqueo de cada proveedor, no en su sensor.
 _PROVEEDORES = (

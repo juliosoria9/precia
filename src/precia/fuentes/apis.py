@@ -6,8 +6,8 @@
   `/products/{handle}.js` (lo que usa el botón «Añadir al carrito»).
 
 Solo se construyen URL de GET y se interpreta la respuesta; la descarga va por `navegador`, con
-sus límites, su validación anti-SSRF y su User-Agent honesto. No se reutiliza ninguna clave ni
-cookie: si una tienda pide credenciales para su API, no se usa.
+sus límites, su validación anti-SSRF y las cabeceras del transporte elegido. No se reutiliza
+ninguna clave ni cookie: si una tienda pide credenciales para su API, no se usa.
 
 Los valores salen de los datos de la propia tienda, así que van con `OrigenDato.API`, anclados
 por construcción y con confianza 1. Aun así la respuesta es **no confiable**: tamaño máximo,

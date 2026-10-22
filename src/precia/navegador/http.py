@@ -36,7 +36,7 @@ import zlib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 from urllib.parse import urljoin, urlsplit
 
 from precia.navegador.proxy import Proxy
@@ -106,11 +106,33 @@ class RespuestaCruda:
     estado: int
     cabeceras: Mapping[str, str]
     cuerpo: Lector
+    descomprimida: bool = False
+    """El transporte ya deshizo el `Content-Encoding` y quitó la cabecera (curl, ADR-022)."""
 
 
 Transporte = Callable[[str, Mapping[str, str], float], RespuestaCruda]
 """Hace **una** petición GET (sin seguir redirecciones). Se ejecuta en un hilo."""
 CrearSocket = Callable[..., socket.socket]
+
+
+@runtime_checkable
+class TransporteNavegador(Protocol):
+    """Transporte con huella de navegador (`TransporteCurl`, ADR-022).
+
+    Recibe el tiempo **total** de la descarga y su tope exacto de bytes (para no bajar 20 MiB de
+    una página que solo admite 5: con el proxy se pagan) y guarda conexiones y cookies, así que
+    hay que cerrarlo. Recibe las cabeceras de `DescargadorHTTP` y elige cuáles manda.
+    """
+
+    def __call__(
+        self, url: str, cabeceras: Mapping[str, str], timeout: float
+    ) -> RespuestaCruda: ...
+
+    def pedir(
+        self, url: str, cabeceras: Mapping[str, str], timeout: float, max_bytes: int
+    ) -> RespuestaCruda: ...
+
+    def cerrar(self) -> None: ...
 
 
 class DescargadorHTTP:
@@ -172,11 +194,20 @@ class DescargadorHTTP:
         raise ErrorDescarga("La tienda encadena demasiadas redirecciones.")
 
     async def cerrar(self) -> None:
-        """No hay conexiones persistentes que cerrar; existe para cumplir `Descargador`."""
+        """Cierra las conexiones y cookies del transporte con huella de navegador, si lo es.
+
+        Con urllib no hay nada que cerrar: cada petición abre y cierra su conexión.
+        """
+        if isinstance(self._transporte, TransporteNavegador):
+            await asyncio.to_thread(self._transporte.cerrar)
 
     def _pedir(self, url: str, max_bytes: int, tiempo: float) -> "_Resultado":
         try:
-            crudo = self._transporte(url, self._cabeceras, self._timeout)
+            if isinstance(self._transporte, TransporteNavegador):
+                crudo = self._transporte.pedir(url, self._cabeceras, tiempo, max_bytes)
+            else:
+                # urllib: el tiempo de cada lectura de siempre (el total lo vigila `_leer`).
+                crudo = self._transporte(url, self._cabeceras, self._timeout)
         except (OSError, http.client.HTTPException) as error:
             raise ErrorDescarga("No se pudo conectar con la tienda.") from error
         try:
@@ -204,7 +235,9 @@ class DescargadorHTTP:
             # En un error (404, 503...) lo que importa es el estado: el cuerpo ni se lee.
             return _Resultado(crudo.estado, tipo=mime)
         codificacion = cabeceras.get("content-encoding", "identity").strip().lower()
-        if codificacion not in ("", "identity") and not (
+        if crudo.descomprimida:
+            codificacion = "identity"
+        elif codificacion not in ("", "identity") and not (
             xml_gz and codificacion in CODIFICACIONES_GZIP
         ):
             # Pedimos `identity`: comprimir sin pedirlo solo se tolera en el fichero `.xml.gz`.
@@ -214,6 +247,14 @@ class DescargadorHTTP:
             raise ErrorDescarga("La página es demasiado grande.")
         datos = self._leer(crudo.cuerpo, max_bytes, tiempo)
         con_firma = datos.startswith(MAGIA_GZIP)
+        if crudo.descomprimida:
+            # Sin `Content-Encoding` ya: solo queda gzip si el fichero mismo lo es (un `.xml.gz`
+            # servido además con `Content-Encoding: gzip` llega con una sola capa, o con ninguna).
+            if con_firma and (xml_gz or mime in TIPOS_GZIP):
+                datos = descomprimir_gzip(datos, max_bytes)
+            if mime not in _TIPOS_DESCARGABLES:
+                mime = "application/xml"  # lo de dentro de un sitemap `.xml.gz`
+            return _Resultado(crudo.estado, html=decodificar(datos, charset, mime=mime), tipo=mime)
         if binario and not con_firma:
             raise ErrorDescarga(f"La respuesta no es una página web (tipo «{mime}»).")
         if mime in TIPOS_GZIP or codificacion in CODIFICACIONES_GZIP or (xml_gz and con_firma):
@@ -664,24 +705,33 @@ class _Corte:
             return not self._cortado
 
 
-def _mensaje_proxy(motivo: object) -> str:
-    """Por qué falló una petición por el proxy. Nunca cita las credenciales."""
-    if isinstance(motivo, _FalloProxy):
-        return "No se pudo conectar con el proxy."
-    if isinstance(motivo, _ProxyNoHTTP):
-        return (
-            "El proxy no respondió como un proxy HTTP: revisa el servidor y el puerto "
-            "(PRECIA_PROXY)."
-        )
-    encontrado = _TUNEL_FALLIDO.match(str(motivo)) if isinstance(motivo, OSError) else None
-    if encontrado is None:
-        return "No se pudo conectar con la tienda a través del proxy."
-    if encontrado[1] == "407":
+MENSAJE_PROXY_INALCANZABLE = "No se pudo conectar con el proxy."
+MENSAJE_PROXY_NO_HTTP = (
+    "El proxy no respondió como un proxy HTTP: revisa el servidor y el puerto (PRECIA_PROXY)."
+)
+MENSAJE_PROXY_OTRO = "No se pudo conectar con la tienda a través del proxy."
+
+
+def mensaje_tunel_rechazado(estado: int) -> str:
+    """El proxy contestó al `CONNECT` con `estado` (no 2xx). Compartido con `TransporteCurl`."""
+    if estado == 407:
         return (
             "El proxy rechazó la conexión (407): revisa sus credenciales "
             "(PRECIA_PROXY o EVOMI_API_KEY)."
         )
-    return f"El proxy no pudo abrir la conexión con la tienda (HTTP {encontrado[1]})."
+    return f"El proxy no pudo abrir la conexión con la tienda (HTTP {estado})."
+
+
+def _mensaje_proxy(motivo: object) -> str:
+    """Por qué falló una petición por el proxy. Nunca cita las credenciales."""
+    if isinstance(motivo, _FalloProxy):
+        return MENSAJE_PROXY_INALCANZABLE
+    if isinstance(motivo, _ProxyNoHTTP):
+        return MENSAJE_PROXY_NO_HTTP
+    encontrado = _TUNEL_FALLIDO.match(str(motivo)) if isinstance(motivo, OSError) else None
+    if encontrado is None:
+        return MENSAJE_PROXY_OTRO
+    return mensaje_tunel_rechazado(int(encontrado[1]))
 
 
 def _tipo_contenido(valor: str | None) -> tuple[str, str | None]:

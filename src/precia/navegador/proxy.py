@@ -1,8 +1,9 @@
 """Proxy de salida para las tiendas que bloquean al cliente automático por la reputación de la IP.
 
 Julio decidió usar proxies residenciales (Evomi) para esas tiendas: la petición sale por otra IP,
-pero con el mismo User-Agent honesto, la misma cortesía por dominio y las mismas defensas. Nunca
-se resuelve un CAPTCHA ni un desafío de JavaScript, ni se entra con una cuenta.
+pero con las mismas cabeceras que la conexión directa, la misma cortesía por dominio y las mismas
+defensas (con curl, las cabeceras son las de Chrome: ADR-022). Nunca se resuelve un CAPTCHA ni un
+desafío de JavaScript, ni se entra con una cuenta.
 
 Las credenciales del proxy son secretos: no aparecen en `repr`, en `str` ni en ningún mensaje de
 error. Solo salen en la cabecera `Proxy-Authorization` del `CONNECT`, que va al proxy y nunca a la

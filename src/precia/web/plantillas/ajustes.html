@@ -49,10 +49,19 @@
       <label>Espera mínima entre peticiones al mismo dominio
         <span class="con-sufijo"><input name="retardo_dominio_s" type="number" min="1" max="60" value="{{ a.retardo_dominio_s | int }}" required><span>s</span></span>
       </label>
-      <label class="crece">User-Agent (honesto e identificable)
+      <label class="crece">User-Agent (urllib, robots.txt y Evomi)
         <input name="user_agent" value="{{ a.user_agent }}" maxlength="200" required>
       </label>
     </div>
+    <div class="campo-fila">
+      <label>Cliente HTTP
+        <select name="transporte_http">
+          <option value="curl"{% if a.transporte_http == "curl" %} selected{% endif %}>curl con la huella de Chrome</option>
+          <option value="urllib"{% if a.transporte_http == "urllib" %} selected{% endif %}>urllib (Python)</option>
+        </select>
+      </label>
+    </div>
+    <p class="tenue">Con curl (por defecto, ADR-022), las descargas sin navegador llevan la huella TLS y HTTP/2 de Chrome y sus cabeceras, también su User-Agent; el de arriba lo usan urllib, el robots.txt y Evomi. Chromium lleva el de Chrome de su propio binario, sin «HeadlessChrome» (ADR-023), y una página bloqueada por HTTP se prueba una vez con él. Las cookies de cada tienda solo se guardan en memoria y nunca se inicia sesión.</p>
     <label class="interruptor">
       <input type="checkbox" name="respetar_robots" value="on"{% if a.respetar_robots %} checked{% endif %}>
       <span>Respetar el robots.txt de las tiendas</span>
@@ -95,6 +104,6 @@
       <div><dt>Tiendas por el proxy</dt><dd>{% if proxy.dominios %}{{ proxy.dominios | join(", ") }}{% else %}Ninguna todavía{% endif %}</dd></div>
     </dl>
   {% endif %}
-  <p class="tenue">Se configura en el fichero <code>.env</code> (nunca aquí): <code>PRECIA_PROXY=http://usuario:contraseña@servidor:puerto</code> para un proxy propio o <code>EVOMI_API_KEY</code> para el residencial de Evomi (si están las dos, manda <code>PRECIA_PROXY</code>), y <code>PRECIA_PROXY_MODO</code> (<code>bloqueo</code>, <code>siempre</code> o <code>nunca</code>). El User-Agent sigue siendo el honesto, se respeta la espera entre peticiones y nunca se resuelve un CAPTCHA.</p>
+  <p class="tenue">Se configura en el fichero <code>.env</code> (nunca aquí): <code>PRECIA_PROXY=http://usuario:contraseña@servidor:puerto</code> para un proxy propio o <code>EVOMI_API_KEY</code> para el residencial de Evomi (si están las dos, manda <code>PRECIA_PROXY</code>), y <code>PRECIA_PROXY_MODO</code> (<code>bloqueo</code>, <code>siempre</code> o <code>nunca</code>). Por el proxy salen las mismas cabeceras que sin él (las de Chrome con curl; el User-Agent de arriba con urllib), se respeta la espera entre peticiones y nunca se resuelve un CAPTCHA.</p>
 </section>
 {% endblock %}

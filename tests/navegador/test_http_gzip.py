@@ -458,3 +458,72 @@ def test_error_http_con_octet_stream_en_un_xml_gz_no_lee_el_cuerpo(estado: int) 
     pagina = asyncio.run(descargador(transporte).descargar(SITEMAP_GZ))
     assert pagina.estado == estado and pagina.html == ""
     assert cuerpo.lecturas == []
+
+
+# --- Respuestas ya descomprimidas por el transporte (curl, ADR-022) -----------------------------
+
+
+def ya_descomprimida(cuerpo: bytes, tipo: str | None) -> RespuestaCruda:
+    """Como la entrega `TransporteCurl`: curl ya quitó el `Content-Encoding` (y la cabecera)."""
+    cruda = respuesta(cuerpo, tipo=tipo)
+    return RespuestaCruda(cruda.estado, cruda.cabeceras, cruda.cuerpo, descomprimida=True)
+
+
+@pytest.mark.parametrize(
+    ("url", "cruda", "tipo", "texto"),
+    [
+        pytest.param(
+            f"{TIENDA}/ficha",
+            ya_descomprimida(b"<p>Freno</p>", "text/html; charset=utf-8"),
+            "text/html",
+            "<p>Freno</p>",
+            id="html",
+        ),
+        pytest.param(
+            SITEMAP_GZ,
+            ya_descomprimida(XML.encode(), "application/octet-stream"),
+            "application/xml",
+            XML,
+            id="xml-gz-binario-con-xml-plano",
+        ),
+        pytest.param(
+            SITEMAP_GZ,
+            ya_descomprimida(XML.encode(), "application/gzip"),
+            "application/xml",
+            XML,
+            id="xml-gz-gzip-con-xml-plano",
+        ),
+        pytest.param(
+            SITEMAP_GZ,
+            ya_descomprimida(gz(XML.encode()), "application/gzip"),
+            "application/xml",
+            XML,
+            id="xml-gz-gzip-con-gzip-dentro",
+        ),
+        pytest.param(
+            f"{TIENDA}/sitemap?formato=gz",
+            ya_descomprimida(XML.encode(), "application/gzip"),
+            "application/xml",
+            XML,
+            id="gzip-fuera-de-xml-gz-con-xml-plano",
+        ),
+    ],
+)
+def test_respuesta_ya_descomprimida(url: str, cruda: RespuestaCruda, tipo: str, texto: str) -> None:
+    transporte = TransporteFalso({url: [cruda]})
+    pagina = asyncio.run(descargador(transporte).descargar(url))
+    assert pagina.tipo_contenido == tipo
+    assert pagina.html == texto
+
+
+def test_ya_descomprimida_con_bomba_dentro_respeta_el_tope() -> None:
+    cruda = ya_descomprimida(gz(b"\x00" * (MAXIMO_BYTES + 1)), "application/gzip")
+    with pytest.raises(ErrorDescarga, match="grande"):
+        bajar(SITEMAP_GZ, cruda)
+
+
+def test_sin_descomprimir_sigue_rechazando_lo_comprimido_sin_pedirlo() -> None:
+    cruda = respuesta(gz(b"<p>Hola</p>"), content_encoding="gzip")
+    assert not cruda.descomprimida
+    with pytest.raises(ErrorDescarga, match="sin pedirlo"):
+        bajar(f"{TIENDA}/ficha", cruda)
