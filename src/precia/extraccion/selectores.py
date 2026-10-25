@@ -84,6 +84,17 @@ def extraer_valores(raiz: Nodo, selector: str) -> list[str]:
     return list(_valores(raiz, selector))
 
 
+def encaja(nodo: Nodo, selector: str) -> bool:
+    """Si `nodo` encaja con `selector` (solo la parte CSS), contando sus ancestros.
+
+    Como `Element.matches`: lanza `SelectorNoValido` si el selector no es del subconjunto.
+    """
+    if not isinstance(selector, str):
+        raise SelectorNoValido("El selector debe ser texto.")
+    contexto = _Contexto()
+    return any(contexto.comprobador(complejo)(nodo) for complejo in _analizar(selector))
+
+
 def dividir_selector(selector: str) -> tuple[str, str | None]:
     """`"img.foto @src"` → `("img.foto", "src")`; sin sufijo, el atributo es `None`."""
     if not isinstance(selector, str):

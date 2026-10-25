@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+	<sitemapindex xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+		xsi:schemaLocation="http://www.sitemaps.org/schemas/sitemap/0.9 http://www.sitemaps.org/schemas/sitemap/0.9/siteindex.xsd"
+		xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" >	<sitemap>
+		<loc>https://www.decantalo.com/es/es/module/lgsitemaps/sitemap?fc=module&amp;name=product_1_1</loc>
+		<lastmod>2026-10-24</lastmod>
+	</sitemap>
+	<sitemap>
+		<loc>https://www.decantalo.com/es/es/module/lgsitemaps/sitemap?fc=module&amp;name=category_1_1</loc>
+		<lastmod>2026-10-24</lastmod>
+	</sitemap>
+	<sitemap>
+		<loc>https://www.decantalo.com/es/es/module/lgsitemaps/sitemap?fc=module&amp;name=cms_1_1</loc>
+		<lastmod>2026-10-24</lastmod>
+	</sitemap>
+	<sitemap>
+		<loc>https://www.decantalo.com/es/es/module/lgsitemaps/sitemap?fc=module&amp;name=blog_1_1</loc>
+		<lastmod>2026-10-24</lastmod>
+	</sitemap>
+</sitemapindex>

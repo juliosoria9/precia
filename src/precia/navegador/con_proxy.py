@@ -12,8 +12,8 @@ sale por el proxy (`navegador.proxy`). Según el modo:
 
 La espera de cortesía es la de dos peticiones seguidas a la tienda: dentro del turno del
 `LimitadorDominio` (lo normal, desde `Navegador`), el mayor del retardo y el Crawl-delay, con la
-plaza global suelta mientras tanto (`cortesia.pausa_de_cortesia`); fuera de turno (el robots.txt),
-`espera_reintento_s`.
+plaza global suelta mientras tanto (`cortesia.pausa_de_cortesia`; también el robots.txt, que
+`ServicioRobots` pide en su turno); fuera de turno (sin `Navegador`), `espera_reintento_s`.
 
 Cuenta como bloqueo de la conexión directa:
 
@@ -48,6 +48,7 @@ from precia.navegador.proxy import ModoProxy
 from precia.navegador.tipos import (
     ConexionCortada,
     Descargador,
+    DescargadorConTiempo,
     DescargadorGrande,
     ErrorDescarga,
     Pagina,
@@ -161,6 +162,17 @@ class DescargadorConProxy:
         return await self._pedir(
             url, lambda por_proxy: (self._proxy if por_proxy else self._directo).descargar(url)
         )
+
+    async def descargar_con_tiempo(self, url: str, tiempo_s: float) -> Pagina:
+        """Como `descargar`, con otro tiempo total en cada intento si el interno lo admite (A7)."""
+
+        def pedir(por_proxy: bool) -> Awaitable[Pagina]:
+            interno = self._proxy if por_proxy else self._directo
+            if isinstance(interno, DescargadorConTiempo):
+                return interno.descargar_con_tiempo(url, tiempo_s)
+            return interno.descargar(url)
+
+        return await self._pedir(url, pedir)
 
     async def descargar_grande(self, url: str, *, max_bytes: int) -> Pagina:
         directo, proxy = self._directo, self._proxy

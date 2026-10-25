@@ -56,7 +56,7 @@ from precia.navegador.http import (
     mensaje_tunel_rechazado,
 )
 from precia.navegador.proxy import Proxy
-from precia.navegador.tipos import ErrorDescarga, URLNoPermitida
+from precia.navegador.tipos import DemasiadoGrande, ErrorDescarga, URLNoPermitida
 from precia.navegador.url import IP, ip_publica
 
 PERFIL_CHROME = "chrome"
@@ -346,7 +346,8 @@ class TransporteCurl:
         if mensaje is not None:
             # Fuera del `except`: con el proxy no queda ni el contexto (un `setopt` que falla
             # cita el valor, y podría ser la contraseña).
-            raise ErrorDescarga(mensaje) from causa
+            tipo = DemasiadoGrande if mensaje == MENSAJE_GRANDE else ErrorDescarga
+            raise tipo(mensaje) from causa
         assert respuesta is not None
         return respuesta, b"".join(trozos)
 

@@ -1,7 +1,7 @@
 """Agrupado por similitud de títulos con difflib (modo clásico)."""
 
 import random
-import time
+from difflib import SequenceMatcher
 
 import pytest
 
@@ -12,6 +12,7 @@ from precia.emparejado.texto import (
     normalizar_titulo,
     similitud,
 )
+from tests.cronometro import proporcion_de_cpu
 
 
 def test_normalizar_titulo() -> None:
@@ -110,7 +111,19 @@ def test_muchos_titulos_no_bloquean_el_bucle_de_eventos() -> None:
         "aceite",
     ]
     titulos = [" ".join(azar.choices(palabras, k=9)) for _ in range(150)]
-    inicio = time.perf_counter()
-    grupos = agrupar_por_texto(titulos)
-    assert time.perf_counter() - inicio < 1.2
-    assert sum(len(g) for g in grupos) == 150
+    assert sum(len(g) for g in agrupar_por_texto(titulos)) == 150
+
+    def cotas_baratas_de_todos_los_pares() -> None:
+        # Lo mínimo que hay que hacer: mirar cada par con la cota barata de difflib.
+        formas = [normalizar_titulo(t) for t in titulos]
+        for i, a in enumerate(formas):
+            for b in formas[:i]:
+                SequenceMatcher(None, a, b).quick_ratio()
+
+    # Se compara con esa referencia y no con un tope fijo, que fallaba con la CPU más lenta o
+    # más cargada (bug 6). Medido: agruparlos cuesta unas 3 veces lo que la referencia; sin
+    # mirar antes las cotas baratas (comparando cada par entero), de 7 a 11 veces.
+    proporcion = proporcion_de_cpu(
+        lambda: agrupar_por_texto(titulos), cotas_baratas_de_todos_los_pares, 5
+    )
+    assert proporcion < 5

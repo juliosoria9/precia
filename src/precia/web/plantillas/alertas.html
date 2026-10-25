@@ -3,7 +3,7 @@
 {% block contenido %}
 <section class="cabecera">
   <h1>Alertas</h1>
-  <p class="sub">PrecIA revisa los precios de forma programada y te avisa por email o Telegram cuando un producto baja del precio que hayas fijado. Las alertas se crean desde la ficha de cada producto.</p>
+  <p class="sub">PrecIA vuelve a mirar los precios cada cierto tiempo y te avisa por email o Telegram cuando un producto baja del precio que fijes. Las alertas se crean desde la ficha de cada producto.</p>
 </section>
 <section class="tarjeta">
   {% include "_lista_alertas.html" %}
@@ -11,7 +11,7 @@
 <section class="tarjeta nota">
   <h2>Cómo funciona</h2>
   <ol>
-    <li>El planificador repite la búsqueda con los perfiles ya creados, <strong>sin IA</strong> y respetando el límite por dominio.</li>
+    <li>El planificador repite la búsqueda con los perfiles ya creados, sin IA y con la espera mínima entre peticiones a cada tienda.</li>
     <li>Cada precio se guarda en el histórico (SQLite).</li>
     <li>Si el mejor precio queda por debajo del objetivo, se envía el aviso una sola vez hasta que vuelva a subir.</li>
   </ol>

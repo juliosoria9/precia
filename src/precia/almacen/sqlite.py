@@ -9,21 +9,30 @@ nunca por coma flotante, y las fechas en ISO 8601.
 
 El esquema evoluciona con `MIGRACIONES`: cada entrada es un script y `PRAGMA user_version`
 guarda cuántas se han aplicado. Una migración se aplica entera o no se aplica.
+
+Cada precio guarda cómo coincide su oferta con la referencia buscada (exacta, revisión o
+equivalente, B5) y cada alerta si cuenta solo las exactas, que es lo que hace por defecto.
+
+La caché del extractor de respaldo con IA (A3) guarda la huella sha256 del texto de la ficha, los
+campos pedidos, el modelo y los valores ya limpios: nunca el texto de la página ni el prompt.
 """
 
+import heapq
 import json
 import math
+import re
 import sqlite3
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import fields, replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from itertools import zip_longest
 from pathlib import Path
 from types import TracebackType
 from typing import Any, NamedTuple, Self
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from precia.emparejado.referencias import referencias_en
 from precia.emparejado.texto import normalizar_titulo
@@ -31,7 +40,9 @@ from precia.nucleo.modelos import (
     CLAVES_CAMPOS,
     Ajustes,
     Alerta,
+    Coincidencia,
     EstadoPerfil,
+    FalloConfiguracion,
     GrupoProducto,
     InfoCatalogo,
     LlamadaIA,
@@ -200,6 +211,83 @@ MIGRACIONES: tuple[str, ...] = (
         parcial INTEGER NOT NULL CHECK (parcial IN (0, 1))
     ) STRICT;
     """,
+    # 5: emparejado por OEM ampliado (B5): cómo coincide cada oferta con la referencia buscada y si
+    # una alerta cuenta solo las exactas (decisión de Julio). Las filas antiguas quedan como
+    # exactas: antes de B5 solo entraban exactas o grupos por texto, que no relajan nada.
+    """
+    ALTER TABLE precios ADD COLUMN coincidencia TEXT NOT NULL DEFAULT 'exacta'
+        CHECK (coincidencia IN ('exacta', 'revision', 'equivalente'));
+    ALTER TABLE alertas ADD COLUMN solo_exactas INTEGER NOT NULL DEFAULT 1
+        CHECK (solo_exactas IN (0, 1));
+    """,
+    # 6: caché del extractor de respaldo con IA (A3). Solo la huella del texto, los campos
+    # pedidos, el modelo y los valores ya limpios: nunca el texto de la página ni el prompt.
+    """
+    CREATE TABLE extracciones_ia (
+        texto_sha256 TEXT NOT NULL CHECK (length(texto_sha256) = 64),
+        campos TEXT NOT NULL,
+        modelo TEXT NOT NULL,
+        valores TEXT NOT NULL,
+        creado TEXT NOT NULL,
+        PRIMARY KEY (texto_sha256, campos, modelo)
+    ) STRICT, WITHOUT ROWID;
+    CREATE INDEX extracciones_ia_por_fecha ON extracciones_ia (creado);
+    """,
+    # 7: configuraciones fallidas de las tiendas sin perfil (A1, decisión de Julio S03): la
+    # última, cuántas van seguidas y desde cuándo se puede reintentar (NULL: el usuario pulsó
+    # «Reintentar»). La espera la decide el orquestador; aquí solo se guarda.
+    """
+    CREATE TABLE configuraciones_fallidas (
+        dominio TEXT PRIMARY KEY REFERENCES tiendas (dominio) ON DELETE CASCADE,
+        intentos INTEGER NOT NULL CHECK (intentos >= 1),
+        fecha TEXT NOT NULL,
+        motivo TEXT NOT NULL,
+        reintentar_desde TEXT
+    ) STRICT;
+    """,
+    # 8: la búsqueda que vio cada oferta por última vez (A1, con las ofertas que A3 sirve desde
+    # la caché con su fecha de descarga). La ficha del producto enseña las ofertas de la última
+    # visita a cada tienda: sin esto, una oferta de la caché (fecha antigua) desaparecía en
+    # cuanto otra de la misma visita era nueva. Las filas antiguas: visita = fecha, como antes.
+    """
+    ALTER TABLE precios ADD COLUMN visita TEXT NOT NULL DEFAULT '';
+    UPDATE precios SET visita = fecha;
+    """,
+    # 9: los sitemaps hijos de un índice que no cupieron en el tope de ficheros al hacer el
+    # catálogo (R2-C14b), en el orden en que se leerían. Una búsqueda descarga los que nombran la
+    # consulta y los quita de aquí. Solo URL de sitemaps de la tienda: ningún dato de producto.
+    """
+    CREATE TABLE catalogo_pendientes (
+        dominio TEXT NOT NULL REFERENCES tiendas (dominio) ON DELETE CASCADE,
+        url TEXT NOT NULL,
+        orden INTEGER NOT NULL,
+        PRIMARY KEY (dominio, url)
+    ) STRICT, WITHOUT ROWID;
+    """,
+    # 10: el prefijo de idioma o país de la portada con que se filtró el catálogo (causa R5-C),
+    # con sus tramos separados por «/» («es/es»; '' si no tiene). Al rehacer el catálogo cada 7
+    # días se vuelve a aplicar: antes solo se conocía el sitemap y entraban todos los países. Los
+    # catálogos ya guardados quedan sin prefijo, como se leían.
+    """
+    ALTER TABLE catalogos ADD COLUMN idioma TEXT NOT NULL DEFAULT '';
+    """,
+    # 11: la URL de la foto principal de la oferta (solo el enlace: la imagen nunca se descarga
+    # ni se guarda). '' = sin foto, como quedan las filas antiguas.
+    """
+    ALTER TABLE precios ADD COLUMN foto TEXT NOT NULL DEFAULT '';
+    """,
+    # 12: caché de la revisión con IA de los resultados (nota 05): un veredicto por oferta,
+    # con clave sha256 de modelo, consulta, filtro y lo enviado (sin el precio). TTL de 7 días.
+    """
+    CREATE TABLE revisiones_ia (
+        clave TEXT PRIMARY KEY,
+        clase TEXT NOT NULL,
+        motivo TEXT NOT NULL,
+        cumple_filtro INTEGER NOT NULL CHECK (cumple_filtro IN (0, 1)),
+        creado TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX revisiones_ia_por_fecha ON revisiones_ia (creado);
+    """,
 )
 
 # Solo para diagnóstico y tests: los nombres de PRAGMA no se pueden parametrizar.
@@ -221,8 +309,19 @@ MAX_RESULTADO_IA = 500
 MAX_AJUSTE_TEXTO = 500
 MAX_LIMITE_LLAMADAS = 10_000
 MAX_VALOR_CAMPO = 5_000
+TTL_REVISIONES_IA_S = 7 * 24 * 3600
+"""Cuánto vale un veredicto de la revisión con IA (el producto puede cambiar con el título)."""
+CLASES_REVISION = frozenset({"misma_pieza", "accesorio", "variante", "kit", "otra"})
+"""Las de `emparejado.semantico.ClaseOferta` (el almacén no depende de `emparejado`)."""
+MAX_MOTIVO_REVISION = 140
+_CLAVE_REVISION = re.compile(r"[0-9a-f]{64}")
 """Lo que admite `extraccion.ficha` en un valor (`MAX_VALOR`)."""
 MAX_CRITERIO = 200
+MAX_FOTO = 2000
+"""Lo que admite `extraccion.imagenes` en la URL de una foto (`MAX_URL_FOTO`)."""
+_NO_EN_FOTO = frozenset("\"'<>`\\")
+MAX_MOTIVO_FALLO = 1000
+"""Caracteres del motivo de una configuración fallida (A1)."""
 _ORIGENES = frozenset(o.value for o in OrigenDato)
 MAX_TEXTO_BUSQUEDA = 500
 # Caracteres de `str(Decimal)`: sobra para cualquier precio o coste real (28 cifras de precisión).
@@ -233,6 +332,12 @@ MAX_ENTRADA = 500
 """Lo que admite `perfiles.entrada.normalizar_entrada` en la URL de entrada (nota 16 §A)."""
 MAX_CATALOGO = 100_000
 """URL del catálogo de una tienda (nota 16 §B): si hay más, se guardan estas y queda `parcial`."""
+MAX_PENDIENTES_CATALOGO = 5_000
+"""Sitemaps hijos sin leer que se recuerdan por tienda (R2-C14b); el resto se olvida."""
+MAX_TRAMOS_IDIOMA = 2
+"""Tramos que puede tener el prefijo de idioma del catálogo (`/es/es/`, R5-C)."""
+_TRAMO_IDIOMA = re.compile(r"[a-z]{2}(?:[-_][a-z]{2})?")
+"""Un tramo de prefijo de idioma o país (`es`, `es-es`, `en_gb`), como `perfiles.catalogo`."""
 MAX_PALABRAS_URL = 300
 """Lo que da como mucho `fuentes.sitemap.palabras_url`."""
 MAX_LASTMOD = 64
@@ -244,7 +349,16 @@ MAX_REFERENCIAS_CONSULTA = 4
 # Palabras de 3 letras o más que casi nunca salen en un slug: si contaran, «disco de freno para
 # el Golf» exigiría «para» en la URL.
 _PALABRAS_VACIAS_CATALOGO = frozenset({"con", "del", "las", "los", "para", "por", "una", "uno"})
+MIN_PALABRA_RAIZ = 6
+"""Una palabra de la consulta que no casa con ninguna URL se prueba por su raíz si tiene al
+menos estas letras (R5-J)."""
+MIN_RAIZ = 5
+# Terminaciones flexivas comunes (español e inglés), de la más larga a la más corta: así
+# «polarizadas» da «polariz» (y no «polarizad») y casa con «polarized» (que también da «polariz»).
+_TERMINACIONES_CATALOGO = ("adas", "ados", "idas", "idos", "ing", "as", "os", "es", "ed", "s")
 _PUERTOS = {"http": 80, "https": 443}
+_ALFANUMERICO = re.compile(r"[0-9a-z]+")
+"""Las palabras de un texto en minúsculas, como las deja `normalizar_titulo` (si es ASCII)."""
 
 
 class ErrorAlmacen(Exception):
@@ -324,12 +438,53 @@ def _fecha(valor: object, campo: str) -> str:
     return valor.isoformat()
 
 
-def _url_de_la_tienda(valor: object, campo: str, dominio: str, maximo: int) -> str:
+def _url_de_sitemap_de_la_tienda(valor: object, campo: str, dominio: str, maximo: int) -> str:
+    """`valor` es la URL de un fichero sitemap de la tienda: como `_url_de_la_tienda`, pero el
+    host puede ser también un subdominio estricto del dominio (`static.xtralife.com`).
+
+    La misma regla con la que se descargan (`fuentes.sitemap.url_de_sitemap`, causa R5-B): el
+    sitemap del catálogo y los hijos pendientes o leídos de un índice. Las fichas, no.
+    """
+    return _url_de_la_tienda(valor, campo, dominio, maximo, subdominio=True)
+
+
+def _foto(valor: object) -> str:
+    """La URL de la foto para guardarla ('' sin foto), o `DatoNoValido` si no es segura."""
+    if valor is None:
+        return ""
+    if not foto_guardable(valor):
+        raise DatoNoValido(
+            f"foto: se espera una URL https de hasta {MAX_FOTO} caracteres, sin espacios ni "
+            "comillas"
+        )
+    return str(valor)
+
+
+def foto_guardable(valor: object) -> bool:
+    """Si `valor` es una URL `https` con host, sin espacios, comillas ni `<>`, y no muy larga.
+
+    La regla se repite a propósito aquí (sin importar `extraccion`): el almacén no se fía de quien
+    lo llama, y al leer se vuelve a aplicar por si la base de datos se ha tocado a mano.
+    """
+    if not isinstance(valor, str) or len(valor) > MAX_FOTO or not valor.startswith("https://"):
+        return False
+    if any(c.isspace() or not c.isprintable() or c in _NO_EN_FOTO for c in valor):
+        return False
+    try:
+        return bool(urlsplit(valor).hostname)
+    except ValueError:
+        return False
+
+
+def _url_de_la_tienda(
+    valor: object, campo: str, dominio: str, maximo: int, *, subdominio: bool = False
+) -> str:
     """`valor` es una URL http(s) absoluta del host de la tienda (con o sin `www.`).
 
     El almacén no guarda nada que apunte a otro servidor: las URL del catálogo vienen de un
     sitemap (dato de la web) y se descargan después. No sustituye a `validar_url` (anti-SSRF),
-    que se aplica siempre al descargar.
+    que se aplica siempre al descargar. Con `subdominio`, vale también un subdominio estricto
+    del dominio, sin etiquetas vacías (solo para ficheros sitemap).
     """
     texto = _texto(valor, campo, maximo)
     error = DatoNoValido(f"{campo}: se espera una URL http(s) de {dominio}")
@@ -347,10 +502,16 @@ def _url_de_la_tienda(valor: object, campo: str, dominio: str, maximo: int) -> s
         partes.scheme not in _PUERTOS
         or "@" in partes.netloc
         or puerto not in (None, _PUERTOS[partes.scheme])
-        or partes.hostname not in (dominio, f"www.{dominio}")
+        or not _host_de_la_tienda(partes.hostname, dominio, subdominio=subdominio)
     ):
         raise error
     return texto
+
+
+def _host_de_la_tienda(host: str | None, dominio: str, *, subdominio: bool) -> bool:
+    if host in (dominio, f"www.{dominio}"):
+        return True
+    return subdominio and host is not None and host.endswith("." + dominio) and all(host.split("."))
 
 
 def _patron_like(texto: str) -> str:
@@ -379,6 +540,125 @@ def _terminos_catalogo(consulta: str) -> tuple[list[str], list[str]]:
                 break
     referencias = sorted(r.lower() for r in referencias_en(texto))[:MAX_REFERENCIAS_CONSULTA]
     return palabras, referencias
+
+
+def _raiz_catalogo(palabra: str) -> str | None:
+    """La raíz de `palabra` sin su terminación flexiva (la más larga que deje al menos
+    `MIN_RAIZ` letras), o `None` si es más corta que `MIN_PALABRA_RAIZ` o no tiene ninguna."""
+    if len(palabra) < MIN_PALABRA_RAIZ:
+        return None
+    for terminacion in _TERMINACIONES_CATALOGO:
+        if palabra.endswith(terminacion) and len(palabra) - len(terminacion) >= MIN_RAIZ:
+            return palabra[: -len(terminacion)]
+    return None
+
+
+def _posicion_en_el_nombre(url: str, palabras: tuple[str, ...]) -> int:
+    """Lugar de la primera palabra del nombre del producto que empieza por una de `palabras`.
+
+    El nombre es el tramo de la ruta con más palabras con letras (a igualdad, el último): en
+    `/recambio-automovil-segunda-mano/faro-derecho/seat/ibiza/90652_faro-derecho-seat….html` es
+    el último, y en `/audiolibro-harry-potter-y-el-caliz…/9781781105054/17916831`, el primero.
+    Se cuentan solo las palabras con letras («2027» o el id de delante no cuentan). Si el nombre
+    no tiene ninguna, `MAX_PALABRAS_URL` (después de todas las que la tienen).
+    """
+    # La URL ya es http(s) y de la tienda (`guardar_catalogo`): se corta a mano, sin `urlsplit`,
+    # que en una búsqueda que casa con todo el catálogo se nota.
+    ruta = url.partition("://")[2].partition("#")[0].partition("?")[0].partition("/")[2]
+    if "%" in ruta:
+        ruta = unquote(ruta)
+    if ruta.isascii():  # Lo mismo que `normalizar_titulo` en cada tramo, pero de una vez.
+        tramos = [_ALFANUMERICO.findall(tramo) for tramo in ruta.lower().split("/")]
+    else:
+        tramos = [normalizar_titulo(tramo).split() for tramo in ruta.split("/")]
+    nombre: list[str] = []
+    for tramo in tramos:
+        suyas = [p for p in tramo if not p.isdigit()]
+        if suyas and len(suyas) >= len(nombre):
+            nombre = suyas
+    for lugar, suya in enumerate(nombre):
+        if suya.startswith(palabras):
+            return lugar
+    return MAX_PALABRAS_URL
+
+
+class _UrlsGuardadas:
+    """Las URL del catálogo de una tienda que ya están en la base más las que se van añadiendo,
+    para no repetirlas al ampliar. `in` pregunta a la base: el catálogo puede tener 100 000."""
+
+    def __init__(self, con: sqlite3.Connection, dominio: str) -> None:
+        self._con = con
+        self._dominio = dominio
+        self._nuevas: set[str] = set()
+
+    def __contains__(self, url: str) -> bool:
+        if url in self._nuevas:
+            return True
+        consulta = "SELECT 1 FROM catalogo WHERE dominio = ? AND url = ?"
+        return self._con.execute(consulta, (self._dominio, url)).fetchone() is not None
+
+    def add(self, url: str) -> None:
+        self._nuevas.add(url)
+
+
+def _filas_catalogo(
+    dominio: str,
+    entradas: Iterable[tuple[str, str, str | None]],
+    maximo: int,
+    vistas: set[str] | _UrlsGuardadas,
+) -> tuple[list[tuple[str, str, str, str | None]], bool]:
+    """Las filas de `entradas` que no están en `vistas`, como mucho `maximo`, y si sobraba
+    alguna (el resto no se lee). Una entrada no válida es `DatoNoValido`."""
+    filas: list[tuple[str, str, str, str | None]] = []
+    for entrada in entradas:
+        if len(filas) >= maximo:
+            return filas, True
+        if not isinstance(entrada, tuple) or len(entrada) != 3:
+            raise DatoNoValido("entradas: se espera (url, palabras, lastmod)")
+        url, palabras, lastmod = entrada
+        _url_de_la_tienda(url, "url", dominio, MAX_URL)
+        normalizadas = _palabras_catalogo(palabras)
+        if lastmod is not None:
+            _texto(lastmod, "lastmod", MAX_LASTMOD)
+        if url in vistas:
+            continue
+        vistas.add(url)
+        filas.append((dominio, url, normalizadas, lastmod))
+    return filas, False
+
+
+def _idioma_catalogo(idioma: object) -> str:
+    """El prefijo de idioma del catálogo como se guarda (`("es", "es")` → `"es/es"`, R5-C). Uno
+    que no son como mucho `MAX_TRAMOS_IDIOMA` tramos con forma de idioma o país es
+    `DatoNoValido`."""
+    if isinstance(idioma, str) or not isinstance(idioma, Sequence):
+        raise DatoNoValido("idioma: tiene que ser una secuencia de tramos")
+    tramos = list(idioma)
+    if len(tramos) > MAX_TRAMOS_IDIOMA or not all(
+        isinstance(t, str) and _TRAMO_IDIOMA.fullmatch(t) for t in tramos
+    ):
+        raise DatoNoValido(f"idioma: {tramos!r} no es un prefijo de idioma o país")
+    return "/".join(tramos)
+
+
+def _idioma_guardado(texto: str) -> tuple[str, ...]:
+    return tuple(texto.split("/")) if texto else ()
+
+
+def _hijos_pendientes(
+    dominio: str, hijos: Iterable[str], vistos: set[str], maximo: int
+) -> list[str]:
+    """Los sitemaps hijos sin leer que no están en `vistos`, sin repetir y como mucho `maximo`
+    (los que no caben se olvidan). Uno que no es de la tienda es `DatoNoValido`."""
+    nuevos: list[str] = []
+    for hijo in hijos:
+        if len(nuevos) >= maximo:
+            break
+        _url_de_sitemap_de_la_tienda(hijo, "pendiente", dominio, MAX_URL)
+        if hijo not in vistos:
+            vistos.add(hijo)
+            nuevos.append(hijo)
+    return nuevos
 
 
 def _palabras_catalogo(palabras: object) -> str:
@@ -423,6 +703,13 @@ class Almacen:
             # En `:memory:` el modo queda en «memory»; WAL solo aplica a ficheros.
             self._con.execute("PRAGMA journal_mode = WAL")
             self._migrar(migraciones)
+            # Un almacén abierto con menos migraciones (los tests de migración) no tiene la
+            # tabla de A1: sus tiendas se leen sin fallo.
+            con_fallos = self._con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table'"
+                " AND name = 'configuraciones_fallidas'"
+            ).fetchone()
+            self._select_tiendas = _SELECT_TIENDAS if con_fallos else _SELECT_TIENDAS_SIN_FALLOS
         except BaseException:
             self._con.close()
             raise
@@ -526,7 +813,7 @@ class Almacen:
 
     def tiendas(self) -> list[Tienda]:
         with self._cerrojo:
-            filas = self._consultar("SELECT * FROM tiendas ORDER BY dominio")
+            filas = self._consultar(f"{self._select_tiendas} ORDER BY t.dominio")
             versiones: dict[str, list[VersionPerfil]] = {}
             for perfil in self._perfiles("SELECT * FROM perfiles ORDER BY dominio, version"):
                 versiones.setdefault(perfil.dominio, []).append(_version_perfil(perfil))
@@ -534,7 +821,7 @@ class Almacen:
 
     def tienda(self, dominio: str) -> Tienda | None:
         with self._cerrojo:
-            filas = self._consultar("SELECT * FROM tiendas WHERE dominio = ?", (dominio,))
+            filas = self._consultar(f"{self._select_tiendas} WHERE t.dominio = ?", (dominio,))
             if not filas:
                 return None
             return _tienda(filas[0], [_version_perfil(p) for p in self.versiones(dominio)])
@@ -577,6 +864,56 @@ class Almacen:
                     f"UPDATE tiendas SET {asignaciones} WHERE dominio = ?",
                     (*(valor for _, valor in cambios), dominio),
                 )
+        return self._tienda_o_error(dominio)
+
+    def registrar_fallo_configuracion(
+        self,
+        dominio: str,
+        motivo: str,
+        fecha: datetime,
+        *,
+        intentos: int,
+        reintentar_desde: datetime | None,
+    ) -> Tienda:
+        """Guarda la última configuración fallida de la tienda (A1); sustituye a la anterior.
+
+        `intentos` son los fallos seguidos, contando este. Hasta `reintentar_desde` el
+        orquestador no vuelve a configurar la tienda.
+        """
+        _texto(motivo, "motivo", MAX_MOTIVO_FALLO)
+        texto_fecha = _fecha(fecha, "fecha")
+        if _entero(intentos, "intentos") < 1:
+            raise DatoNoValido("intentos: al menos 1")
+        desde = None if reintentar_desde is None else _fecha(reintentar_desde, "reintentar_desde")
+        with self._transaccion() as con:
+            if not con.execute("SELECT 1 FROM tiendas WHERE dominio = ?", (dominio,)).fetchone():
+                raise TiendaNoEncontrada(dominio)
+            con.execute(
+                "INSERT INTO configuraciones_fallidas (dominio, intentos, fecha, motivo,"
+                " reintentar_desde) VALUES (?, ?, ?, ?, ?) ON CONFLICT (dominio) DO UPDATE SET"
+                " intentos = excluded.intentos, fecha = excluded.fecha,"
+                " motivo = excluded.motivo, reintentar_desde = excluded.reintentar_desde",
+                (dominio, intentos, texto_fecha, motivo, desde),
+            )
+        return self._tienda_o_error(dominio)
+
+    def borrar_fallo_configuracion(self, dominio: str) -> None:
+        """Olvida la configuración fallida de la tienda (ya tiene perfil). Sin fallo, nada."""
+        with self._transaccion() as con:
+            con.execute("DELETE FROM configuraciones_fallidas WHERE dominio = ?", (dominio,))
+
+    def levantar_espera(self, dominio: str) -> Tienda:
+        """Quita la espera de una configuración fallida (botón «Reintentar», A1).
+
+        Conserva los intentos y el motivo: si vuelve a fallar, la espera sigue creciendo.
+        """
+        with self._transaccion() as con:
+            if not con.execute("SELECT 1 FROM tiendas WHERE dominio = ?", (dominio,)).fetchone():
+                raise TiendaNoEncontrada(dominio)
+            con.execute(
+                "UPDATE configuraciones_fallidas SET reintentar_desde = NULL WHERE dominio = ?",
+                (dominio,),
+            )
         return self._tienda_o_error(dominio)
 
     # --- Perfiles ---
@@ -658,6 +995,8 @@ class Almacen:
         entradas: Iterable[tuple[str, str, str | None]],
         *,
         parcial: bool,
+        pendientes: Iterable[str] = (),
+        idioma: Sequence[str] = (),
     ) -> InfoCatalogo:
         """Sustituye todo el catálogo de la tienda, en una transacción, y devuelve su resumen.
 
@@ -666,27 +1005,26 @@ class Almacen:
         que la consulta de `buscar_catalogo`. Una entrada no válida es `DatoNoValido` y no
         cambia nada. Las URL repetidas cuentan una vez. Se guardan como mucho `MAX_CATALOGO`:
         si `entradas` trae más, el resto no se lee y el catálogo queda `parcial`.
+
+        `pendientes` son los sitemaps hijos que no se leyeron (R2-C14b), también de la tienda:
+        sustituyen a los anteriores (como mucho `MAX_PENDIENTES_CATALOGO`, sin repetir).
+
+        `idioma` es el prefijo de idioma o país con que se filtró (`perfiles.catalogo.Catalogo
+        .idioma`, R5-C): se guarda para rehacer el catálogo con el mismo filtro.
         """
         _texto(dominio, "dominio", MAX_DOMINIO)
-        _url_de_la_tienda(sitemap, "sitemap", dominio, MAX_URL)
-        parcial = bool(parcial)
-        filas: list[tuple[str, str, str, str | None]] = []
-        vistas: set[str] = set()
-        for entrada in entradas:
-            if len(filas) >= MAX_CATALOGO:
-                parcial = True
-                break
-            if not isinstance(entrada, tuple) or len(entrada) != 3:
-                raise DatoNoValido("entradas: se espera (url, palabras, lastmod)")
-            url, palabras, lastmod = entrada
-            _url_de_la_tienda(url, "url", dominio, MAX_URL)
-            normalizadas = _palabras_catalogo(palabras)
-            if lastmod is not None:
-                _texto(lastmod, "lastmod", MAX_LASTMOD)
-            if url not in vistas:
-                vistas.add(url)
-                filas.append((dominio, url, normalizadas, lastmod))
-        info = InfoCatalogo(dominio, sitemap, self._reloj(), len(filas), parcial)
+        _url_de_sitemap_de_la_tienda(sitemap, "sitemap", dominio, MAX_URL)
+        prefijo = _idioma_catalogo(idioma)
+        filas, desbordado = _filas_catalogo(dominio, entradas, MAX_CATALOGO, set())
+        hijos = _hijos_pendientes(dominio, pendientes, set(), MAX_PENDIENTES_CATALOGO)
+        info = InfoCatalogo(
+            dominio,
+            sitemap,
+            self._reloj(),
+            len(filas),
+            bool(parcial) or desbordado,
+            _idioma_guardado(prefijo),
+        )
         actualizado = _fecha(info.actualizado, "actualizado")
         with self._transaccion() as con:
             if not con.execute("SELECT 1 FROM tiendas WHERE dominio = ?", (dominio,)).fetchone():
@@ -695,14 +1033,101 @@ class Almacen:
             con.executemany(
                 "INSERT INTO catalogo (dominio, url, palabras, lastmod) VALUES (?, ?, ?, ?)", filas
             )
+            con.execute("DELETE FROM catalogo_pendientes WHERE dominio = ?", (dominio,))
+            con.executemany(
+                "INSERT INTO catalogo_pendientes (dominio, url, orden) VALUES (?, ?, ?)",
+                [(dominio, hijo, orden) for orden, hijo in enumerate(hijos)],
+            )
             con.execute(
-                "INSERT INTO catalogos (dominio, sitemap, actualizado, total, parcial)"
-                " VALUES (?, ?, ?, ?, ?) ON CONFLICT (dominio) DO UPDATE SET"
+                "INSERT INTO catalogos (dominio, sitemap, actualizado, total, parcial, idioma)"
+                " VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (dominio) DO UPDATE SET"
                 " sitemap = excluded.sitemap, actualizado = excluded.actualizado,"
-                " total = excluded.total, parcial = excluded.parcial",
-                (dominio, sitemap, actualizado, info.total, int(parcial)),
+                " total = excluded.total, parcial = excluded.parcial, idioma = excluded.idioma",
+                (dominio, sitemap, actualizado, info.total, int(info.parcial), prefijo),
             )
         return info
+
+    def ampliar_catalogo(
+        self,
+        dominio: str,
+        leidos: Iterable[str],
+        entradas: Iterable[tuple[str, str, str | None]],
+        *,
+        parcial: bool,
+        pendientes: Iterable[str] = (),
+    ) -> InfoCatalogo:
+        """Añade al catálogo las URL de unos sitemaps hijos leídos en una búsqueda (R2-C14b).
+
+        `leidos` salen de los pendientes (aunque no hayan dado nada: no se vuelven a descargar
+        hasta que se rehaga el catálogo) y `pendientes` (los hijos de un índice dentro del
+        índice) se añaden al final. Las `entradas` se validan como en `guardar_catalogo` y las
+        que ya estaban no se repiten; si no caben en `MAX_CATALOGO`, el catálogo queda `parcial`.
+        La fecha no cambia: el refresco lo rehace entero. Sin catálogo es `DatoNoValido`.
+        """
+        _texto(dominio, "dominio", MAX_DOMINIO)
+        quitar = [
+            (dominio, _url_de_sitemap_de_la_tienda(u, "leido", dominio, MAX_URL)) for u in leidos
+        ]
+        with self._transaccion() as con:
+            anterior = con.execute(
+                "SELECT sitemap, actualizado, parcial, idioma FROM catalogos WHERE dominio = ?",
+                (dominio,),
+            ).fetchone()
+            if anterior is None:
+                raise DatoNoValido(f"{dominio} no tiene catálogo que ampliar")
+            total = int(
+                con.execute(
+                    "SELECT COUNT(*) FROM catalogo WHERE dominio = ?", (dominio,)
+                ).fetchone()[0]
+            )
+            filas, desbordado = _filas_catalogo(
+                dominio, entradas, MAX_CATALOGO - total, _UrlsGuardadas(con, dominio)
+            )
+            con.executemany("DELETE FROM catalogo_pendientes WHERE dominio = ? AND url = ?", quitar)
+            ya = {
+                fila[0]
+                for fila in con.execute(
+                    "SELECT url FROM catalogo_pendientes WHERE dominio = ?", (dominio,)
+                )
+            }
+            hijos = _hijos_pendientes(
+                dominio, pendientes, ya | {u for _, u in quitar}, MAX_PENDIENTES_CATALOGO - len(ya)
+            )
+            siguiente = int(
+                con.execute(
+                    "SELECT COALESCE(MAX(orden), -1) + 1 FROM catalogo_pendientes"
+                    " WHERE dominio = ?",
+                    (dominio,),
+                ).fetchone()[0]
+            )
+            con.executemany(
+                "INSERT INTO catalogo_pendientes (dominio, url, orden) VALUES (?, ?, ?)",
+                [(dominio, hijo, siguiente + n) for n, hijo in enumerate(hijos)],
+            )
+            con.executemany(
+                "INSERT INTO catalogo (dominio, url, palabras, lastmod) VALUES (?, ?, ?, ?)", filas
+            )
+            total += len(filas)
+            parcial = bool(anterior[2]) or bool(parcial) or desbordado
+            con.execute(
+                "UPDATE catalogos SET total = ?, parcial = ? WHERE dominio = ?",
+                (total, int(parcial), dominio),
+            )
+        return InfoCatalogo(
+            dominio,
+            anterior[0],
+            datetime.fromisoformat(anterior[1]),
+            total,
+            parcial,
+            _idioma_guardado(anterior[3]),
+        )
+
+    def hijos_pendientes(self, dominio: str) -> list[str]:
+        """Los sitemaps hijos sin leer del catálogo de la tienda, en orden (R2-C14b)."""
+        filas = self._consultar(
+            "SELECT url FROM catalogo_pendientes WHERE dominio = ? ORDER BY orden", (dominio,)
+        )
+        return [f["url"] for f in filas]
 
     def catalogo(self, dominio: str) -> InfoCatalogo | None:
         """El resumen del catálogo de la tienda, o `None` si no se ha guardado nunca."""
@@ -716,16 +1141,43 @@ class Almacen:
             actualizado=datetime.fromisoformat(fila["actualizado"]),
             total=fila["total"],
             parcial=bool(fila["parcial"]),
+            idioma=_idioma_guardado(fila["idioma"]),
         )
 
-    def buscar_catalogo(self, dominio: str, consulta: str, *, limite: int) -> list[str]:
-        """Las URL del catálogo que encajan con la consulta, como mucho `limite`.
+    def buscar_catalogo(
+        self,
+        dominio: str,
+        consulta: str,
+        *,
+        limite: int,
+        es_listado: Callable[[str], bool] | None = None,
+    ) -> list[str]:
+        """Las URL del catálogo que encajan con la consulta, las `limite` más relevantes.
 
         Encajan las que tienen en sus palabras todas las de la consulta (normalizadas, de 3
-        letras o más, sin las vacías como «para») o alguna de sus referencias OEM, comparada sin
-        espacios («1k0 698 151» encaja con «1K0698151»). Si no hay ninguna, las que tienen más
-        palabras de la consulta (las empatadas en el máximo). Una consulta sin palabras ni
-        referencias no devuelve nada. Orden: primero las de referencia y después por URL.
+        letras o más, sin las vacías como «para»; basta con que aparezcan: «faro» encaja con
+        «faros» y con «farola») o alguna de sus referencias OEM, comparada sin espacios («1k0 698
+        151» encaja con «1K0698151»). Una consulta sin palabras ni referencias no devuelve nada.
+
+        Una palabra de `MIN_PALABRA_RAIZ` letras o más que no casa con ninguna URL de la tienda
+        se cambia por su raíz sin la terminación flexiva (R5-J, `_raiz_catalogo`): «polarizadas»
+        pasa a «polariz» y casa con «polarized»; «pilotos», a «pilot» y casa con «piloto». Las que
+        sí casan no se tocan. Cuesta una segunda consulta, y solo cuando hay alguna así.
+
+        Si no encaja ninguna, se agrupan las que tienen alguna palabra por el conjunto de las
+        que casan y se quedan los grupos que no están dentro de otro (R5-I): con «vino tinto
+        rioja», {rioja} y {vino, tinto}, pero no {tinto}. Los grupos se turnan, empezando por
+        el de la palabra más rara del catálogo (la que casan menos URL). Así, en una tienda de
+        vinos, los riojas no se quedan fuera por los kits de «vino tinto»: que las palabras de
+        la categoría salgan en el slug no hace a la URL más relevante. Dentro de cada grupo
+        manda el orden de abajo; con un solo grupo, es el de siempre.
+
+        Orden (R2-C14a): primero las de referencia; después, las que no son páginas de listado
+        (las que `es_listado` da por marca, categoría…; sin `es_listado`, ninguna lo es); luego
+        las que tienen más palabras de la consulta al principio de una palabra («faros» sí,
+        «antifaro» no) y más como palabra entera («faro» antes que «faros»); luego las que la
+        nombran antes en el nombre del producto (`_posicion_en_el_nombre`); y por último la URL,
+        para que el orden sea estable. El límite se aplica después de ordenar.
         """
         if _entero(limite, "limite") == 0 or limite > MAX_LIMITE_CATALOGO:
             raise DatoNoValido(f"limite: entre 1 y {MAX_LIMITE_CATALOGO}")
@@ -734,25 +1186,63 @@ class Almacen:
         palabras, referencias = _terminos_catalogo(consulta)
         if not palabras and not referencias:
             return []
+        filas = self._filas_que_casan(dominio, palabras, referencias)
+        # Una palabra que no casa con ninguna URL de la tienda se prueba por su raíz (R5-J):
+        # «polarizadas» no está en ningún slug, pero «polariz» casa con «polarized».
+        raices = {
+            p: r
+            for p in palabras
+            if (r := _raiz_catalogo(p)) and not any(p in f["palabras"] for f in filas)
+        }
+        if raices:
+            palabras = list(dict.fromkeys(raices.get(p, p) for p in palabras))
+            filas = self._filas_que_casan(dominio, palabras, referencias)
+        elegidas = [f for f in filas if f["oem"] or f["aciertos"] == len(palabras)]
+        prefijos = tuple(palabras)
+
+        def clave(fila: sqlite3.Row) -> tuple[int, int, bool, int, int, int, str]:
+            url: str = fila["url"]
+            suyas = fila["palabras"].split()
+            inicios = sum(any(s.startswith(p) for s in suyas) for p in palabras)
+            enteras = len(set(palabras).intersection(suyas))
+            listado = es_listado is not None and es_listado(url)
+            posicion = _posicion_en_el_nombre(url, prefijos)
+            return (-fila["oem"], -fila["aciertos"], listado, -inicios, -enteras, posicion, url)
+
+        if elegidas or not filas:
+            return [f["url"] for f in heapq.nsmallest(limite, elegidas, key=clave)]
+        # Sin ninguna con todas (ni con referencia): grupos maximales, por turnos (R5-I). Se casa
+        # como el LIKE de arriba, por subcadena (las palabras ya están normalizadas).
+        grupos: dict[frozenset[str], list[sqlite3.Row]] = {}
+        for fila in filas:
+            casadas = frozenset(p for p in palabras if p in fila["palabras"])
+            grupos.setdefault(casadas, []).append(fila)
+        cuantas = {p: sum(len(v) for g, v in grupos.items() if p in g) for p in palabras}
+        maximales = sorted(
+            (g for g in grupos if not any(g < otro for otro in grupos)),
+            key=lambda g: (min(cuantas[p] for p in g), -len(g), sorted(g)),
+        )
+        turnos = zip_longest(*(heapq.nsmallest(limite, grupos[g], key=clave) for g in maximales))
+        return [f["url"] for vuelta in turnos for f in vuelta if f is not None][:limite]
+
+    def _filas_que_casan(
+        self, dominio: str, palabras: list[str], referencias: list[str]
+    ) -> list[sqlite3.Row]:
+        """Las URL de la tienda con alguna de `palabras` o de `referencias`, con cuántas palabras
+        casan (`aciertos`) y si casa alguna referencia (`oem`)."""
         # Las expresiones solo repiten texto fijo; las palabras van siempre como parámetros.
         aciertos = " + ".join(["(palabras LIKE ? ESCAPE '\\')"] * len(palabras)) or "0"
         oem = " OR ".join(["(REPLACE(palabras, ' ', '') LIKE ? ESCAPE '\\')"] * len(referencias))
-        filas = self._consultar(
-            f"SELECT url, aciertos, oem FROM (SELECT url, {aciertos} AS aciertos,"
-            f" {oem or '0'} AS oem FROM catalogo WHERE dominio = ?)"
-            " WHERE aciertos > 0 OR oem ORDER BY oem DESC, aciertos DESC, url LIMIT ?",
+        return self._consultar(
+            f"SELECT url, palabras, aciertos, oem FROM (SELECT url, palabras, {aciertos} AS"
+            f" aciertos, {oem or '0'} AS oem FROM catalogo WHERE dominio = ?)"
+            " WHERE aciertos > 0 OR oem",
             (
                 *(_patron_like(p) for p in palabras),
                 *(_patron_like(r) for r in referencias),
                 dominio,
-                limite,
             ),
         )
-        completas = [f["url"] for f in filas if f["oem"] or f["aciertos"] == len(palabras)]
-        if completas or not filas:
-            return completas
-        maximo = filas[0]["aciertos"]
-        return [f["url"] for f in filas if f["aciertos"] == maximo]
 
     # --- Histórico de precios ---
 
@@ -770,8 +1260,21 @@ class Almacen:
         campos: Mapping[str, ValorCampo] | None = None,
         disponible: bool = True,
         criterio: str = "",
+        coincidencia: Coincidencia = Coincidencia.EXACTA,
+        visita: datetime | None = None,
+        foto: str | None = None,
     ) -> None:
         """Una oferta en el histórico. `titulo`, `campos` y `criterio` son los que enseña la web.
+
+        `foto` es la URL `https` de la foto principal (`foto_guardable`); `None`, sin foto. Solo se
+        guarda el enlace, nunca la imagen.
+
+        `coincidencia` dice cómo coincide la oferta con la referencia buscada (B5): las alertas
+        por defecto solo cuentan las exactas.
+
+        `fecha` es cuándo se descargó la oferta (la de la caché si salió de ella, A3) y `visita`,
+        la búsqueda que la ha visto (por defecto, `fecha`). La misma oferta con la misma fecha y
+        el mismo precio no crea otra fila: se apunta en esa visita (A1).
 
         Solo se admiten los campos declarados en `nucleo.modelos.CAMPOS` (nota 08: no se guarda
         nada que el usuario no haya pedido, como el nombre de un vendedor particular).
@@ -784,9 +1287,15 @@ class Almacen:
         _texto(url, "url", MAX_URL)
         importe = _importe(precio, "precio")
         instante = _fecha(fecha, "fecha")
+        visto = instante if visita is None else _fecha(visita, "visita")
         _texto(titulo, "titulo", MAX_NOMBRE_PRODUCTO, vacio=True)
         _texto(criterio, "criterio", MAX_CRITERIO, vacio=True)
         texto_campos = _codificar_campos(campos or {})
+        texto_foto = _foto(foto)
+        try:
+            texto_coincidencia = Coincidencia(coincidencia).value
+        except ValueError:
+            raise DatoNoValido("coincidencia: exacta, revision o equivalente") from None
         with self._transaccion() as con:
             con.execute(
                 "INSERT INTO productos (id, nombre, referencia_oem, criterio) VALUES (?, ?, ?, ?)"
@@ -796,36 +1305,61 @@ class Almacen:
                 " ELSE excluded.criterio END",
                 (producto_id, nombre, referencia_oem, criterio),
             )
-            con.execute(
-                "INSERT INTO precios (producto_id, tienda, url, precio, fecha, dia, titulo,"
-                " campos, disponible) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    producto_id,
-                    tienda,
-                    url,
-                    importe,
-                    instante,
-                    fecha.date().isoformat(),
-                    titulo,
-                    texto_campos,
-                    int(bool(disponible)),
-                ),
+            # La misma oferta con la misma fecha y el mismo precio ya está: es una ficha servida
+            # desde la caché en una búsqueda repetida (A3). No se duplica: se apunta en esta
+            # visita (A1). Sin índice UNIQUE, que fallaría con los duplicados que ya hay en las
+            # bases de datos guardadas: se actualiza la última de ellas.
+            parametros = (
+                producto_id,
+                tienda,
+                url,
+                importe,
+                instante,
+                fecha.date().isoformat(),
+                titulo,
+                texto_campos,
+                int(bool(disponible)),
+                texto_coincidencia,
+                visto,
+                texto_foto,
             )
+            vista = con.execute(
+                "UPDATE precios SET titulo = ?7, campos = ?8, disponible = ?9,"
+                " coincidencia = ?10, visita = ?11, foto = ?12"
+                " WHERE id = (SELECT MAX(id) FROM precios"
+                " WHERE producto_id = ?1 AND tienda = ?2 AND url = ?3 AND precio = ?4"
+                # Como instante y no como texto: con el cambio de hora, la misma descarga de la
+                # caché llega con otro desfase («01:00+02:00» y «00:00+01:00»).
+                " AND julianday(fecha) = julianday(?5))",
+                parametros,
+            )
+            if vista.rowcount == 0:
+                con.execute(
+                    "INSERT INTO precios (producto_id, tienda, url, precio, fecha, dia, titulo,"
+                    " campos, disponible, coincidencia, visita, foto)"
+                    " VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    parametros,
+                )
 
     def ultimas_ofertas(self, producto_id: str) -> list[Oferta]:
         """Las ofertas de la última visita a cada tienda para el producto, por orden de tienda.
 
         Un grupo puede tener varias ofertas de la misma tienda (dos fichas parecidas): se
-        devuelven todas las de su último guardado, una por URL, y no las de visitas anteriores.
+        devuelven todas las de su última visita, una por URL, y no las de visitas anteriores.
+        Cuenta la visita y no la fecha: una oferta servida desde la caché lleva la fecha de su
+        descarga (A3), pero la ha visto esta búsqueda (A1).
         """
         filas = self._consultar(
             "SELECT p.tienda, p.url, p.precio, p.titulo, p.campos, p.disponible,"
-            " o.nombre AS producto FROM precios p JOIN productos o ON o.id = p.producto_id"
-            " WHERE p.producto_id = ? AND p.fecha = ("
-            " SELECT MAX(q.fecha) FROM precios q WHERE q.producto_id = p.producto_id"
+            " p.coincidencia, p.foto, o.nombre AS producto"
+            " FROM precios p JOIN productos o ON o.id = p.producto_id"
+            # La última visita como instante (`julianday`): como texto, en la hora repetida del
+            # cambio de hora «02:10+01:00» iría antes que «02:30+02:00».
+            " WHERE p.producto_id = ? AND julianday(p.visita) = ("
+            " SELECT MAX(julianday(q.visita)) FROM precios q WHERE q.producto_id = p.producto_id"
             " AND q.tienda = p.tienda) AND p.id = ("
             " SELECT MAX(r.id) FROM precios r WHERE r.producto_id = p.producto_id"
-            " AND r.tienda = p.tienda AND r.fecha = p.fecha AND r.url = p.url)"
+            " AND r.tienda = p.tienda AND r.visita = p.visita AND r.url = p.url)"
             " ORDER BY p.tienda, p.id",
             (producto_id,),
         )
@@ -838,6 +1372,9 @@ class Almacen:
                 precio=Decimal(f["precio"]),
                 campos=_decodificar_campos(f["campos"]),
                 disponible=bool(f["disponible"]),
+                coincidencia=Coincidencia(f["coincidencia"]),
+                # Se revalida al leer: un valor tocado a mano que no sea seguro no llega a la web.
+                foto=f["foto"] if foto_guardable(f["foto"]) else None,
             )
             for f in filas
         ]
@@ -862,10 +1399,14 @@ class Almacen:
         )
 
     def historico(self, producto_id: str) -> list[SerieHistorico]:
-        """Una serie por tienda (por orden alfabético) con el último precio de cada día."""
+        """Una serie por tienda (por orden alfabético) con el último precio de cada día.
+
+        Solo las ofertas exactas (B5): las equivalentes y las revisiones son otras piezas, con
+        otro precio, y el punto del día dependería de qué ficha se descargó la última.
+        """
         filas = self._consultar(
             "SELECT tienda, dia, precio FROM precios WHERE producto_id = ?"
-            " ORDER BY tienda, dia, fecha, id",
+            " AND coincidencia = 'exacta' ORDER BY tienda, dia, julianday(fecha), id",
             (producto_id,),
         )
         por_tienda: dict[str, dict[date, Decimal]] = {}
@@ -937,7 +1478,10 @@ class Almacen:
 
     # --- Alertas ---
 
-    def crear_alerta(self, producto_id: str, umbral: Decimal, canal: str) -> Alerta:
+    def crear_alerta(
+        self, producto_id: str, umbral: Decimal, canal: str, *, solo_exactas: bool = True
+    ) -> Alerta:
+        """Alerta de precio; con `solo_exactas` (por defecto), solo cuentan las ofertas exactas."""
         texto_umbral = _importe(umbral, "umbral", positivo=True)
         _texto(canal, "canal", MAX_CANAL)
         with self._transaccion() as con:
@@ -946,17 +1490,26 @@ class Almacen:
             if producto is None:
                 raise ProductoNoEncontrado(producto_id)
             cursor = con.execute(
-                "INSERT INTO alertas (producto_id, umbral, canal) VALUES (?, ?, ?)",
-                (producto_id, texto_umbral, canal),
+                "INSERT INTO alertas (producto_id, umbral, canal, solo_exactas)"
+                " VALUES (?, ?, ?, ?)",
+                (producto_id, texto_umbral, canal, int(bool(solo_exactas))),
             )
             identificador = cursor.lastrowid
         assert identificador is not None
-        return Alerta(identificador, producto_id, str(producto[0]), Decimal(texto_umbral), canal)
+        return Alerta(
+            identificador,
+            producto_id,
+            str(producto[0]),
+            Decimal(texto_umbral),
+            canal,
+            solo_exactas=bool(solo_exactas),
+        )
 
     def alertas(self) -> list[Alerta]:
         filas = self._consultar(
             "SELECT a.id, a.producto_id, p.nombre, a.umbral, a.canal, a.activa,"
-            " a.ultima_activacion FROM alertas a JOIN productos p ON p.id = a.producto_id"
+            " a.ultima_activacion, a.solo_exactas"
+            " FROM alertas a JOIN productos p ON p.id = a.producto_id"
             " ORDER BY a.id"
         )
         return [
@@ -968,6 +1521,7 @@ class Almacen:
                 canal=f["canal"],
                 activa=bool(f["activa"]),
                 ultima_activacion=_leer_fecha(f["ultima_activacion"]),
+                solo_exactas=bool(f["solo_exactas"]),
             )
             for f in filas
         ]
@@ -1028,6 +1582,105 @@ class Almacen:
                 fila,
             )
 
+    # --- Caché del extractor de IA (A3) ---
+
+    def leer_extraccion_ia(
+        self, texto_sha256: str, campos: Sequence[str], modelo: str, *, max_edad_s: float
+    ) -> dict[str, str] | None:
+        """Valores guardados del extractor, o `None` si no hay, han caducado o están dañados."""
+        clave = _clave_extraccion(texto_sha256, campos, modelo)
+        filas = self._consultar(
+            "SELECT valores, creado FROM extracciones_ia"
+            " WHERE texto_sha256 = ? AND campos = ? AND modelo = ?",
+            clave,
+        )
+        if not filas:
+            return None
+        try:
+            # La edad se mide en Python, exacta (como `CachePaginas`); un reloj que mezcle
+            # fechas con y sin zona da TypeError y cuenta como fallo de caché.
+            edad = (self._reloj() - datetime.fromisoformat(filas[0]["creado"])).total_seconds()
+            valores = json.loads(filas[0]["valores"])
+        except (TypeError, ValueError):
+            return None
+        if not 0 <= edad <= max_edad_s or not isinstance(valores, dict):
+            return None
+        pedidos = set(clave[1].split(","))
+        if not all(
+            isinstance(v, str) and k in pedidos and len(v) <= MAX_VALOR_CAMPO
+            for k, v in valores.items()
+        ):
+            return None
+        return valores
+
+    def guardar_extraccion_ia(
+        self, texto_sha256: str, campos: Sequence[str], modelo: str, valores: Mapping[str, str]
+    ) -> None:
+        clave = _clave_extraccion(texto_sha256, campos, modelo)
+        pedidos = set(clave[1].split(","))
+        for campo, valor in valores.items():
+            if campo not in pedidos:
+                raise DatoNoValido(f"Campo no pedido en la extracción: {campo!r}")
+            _texto(valor, campo, MAX_VALOR_CAMPO)
+        texto = json.dumps(dict(valores), ensure_ascii=False, sort_keys=True)
+        with self._transaccion() as con:
+            con.execute(
+                "INSERT INTO extracciones_ia (texto_sha256, campos, modelo, valores, creado)"
+                " VALUES (?, ?, ?, ?, ?) ON CONFLICT (texto_sha256, campos, modelo)"
+                " DO UPDATE SET valores = excluded.valores, creado = excluded.creado",
+                (*clave, texto, self._reloj().isoformat()),
+            )
+
+    def borrar_extracciones_ia(self, *, max_edad_s: float) -> int:
+        """Borra las caducadas y dice cuántas.
+
+        Compara el texto ISO: es aproximado si el reloj cambia de zona (horario de verano), pero
+        la lectura comprueba la edad exacta.
+        """
+        limite = (self._reloj() - timedelta(seconds=max_edad_s)).isoformat()
+        with self._transaccion() as con:
+            return con.execute("DELETE FROM extracciones_ia WHERE creado < ?", (limite,)).rowcount
+
+    # --- Caché de la revisión con IA de los resultados ---
+
+    def leer_revision_ia(self, clave: str, *, max_edad_s: float) -> tuple[str, str, bool] | None:
+        """`(clase, motivo, cumple_filtro)` guardado, o `None` si no hay, caducó o está dañado."""
+        filas = self._consultar(
+            "SELECT clase, motivo, cumple_filtro, creado FROM revisiones_ia WHERE clave = ?",
+            (clave,),
+        )
+        if not filas:
+            return None
+        fila = filas[0]
+        try:
+            edad = (self._reloj() - datetime.fromisoformat(fila["creado"])).total_seconds()
+        except (TypeError, ValueError):
+            return None
+        if not 0 <= edad <= max_edad_s or fila["clase"] not in CLASES_REVISION:
+            return None
+        return fila["clase"], fila["motivo"], bool(fila["cumple_filtro"])
+
+    def guardar_revision_ia(self, clave: str, clase: str, motivo: str, cumple_filtro: bool) -> None:
+        if not isinstance(clave, str) or not _CLAVE_REVISION.fullmatch(clave):
+            raise DatoNoValido("clave: sha256 en hexadecimal")
+        if clase not in CLASES_REVISION:
+            raise DatoNoValido(f"Clase de revisión no válida: {clase!r}")
+        _texto(motivo, "motivo", MAX_MOTIVO_REVISION, vacio=True)
+        with self._transaccion() as con:
+            con.execute(
+                "INSERT INTO revisiones_ia (clave, clase, motivo, cumple_filtro, creado)"
+                " VALUES (?, ?, ?, ?, ?) ON CONFLICT (clave) DO UPDATE SET"
+                " clase = excluded.clase, motivo = excluded.motivo,"
+                " cumple_filtro = excluded.cumple_filtro, creado = excluded.creado",
+                (clave, clase, motivo, int(bool(cumple_filtro)), self._reloj().isoformat()),
+            )
+
+    def borrar_revisiones_ia(self, *, max_edad_s: float) -> int:
+        """Borra las caducadas y dice cuántas (aproximado, como `borrar_extracciones_ia`)."""
+        limite = (self._reloj() - timedelta(seconds=max_edad_s)).isoformat()
+        with self._transaccion() as con:
+            return con.execute("DELETE FROM revisiones_ia WHERE creado < ?", (limite,)).rowcount
+
     def gasto_mes_usd(self) -> Decimal:
         """Coste de las llamadas del mes en curso según el reloj del almacén."""
         filas = self._consultar(
@@ -1057,6 +1710,18 @@ class Almacen:
             )
             for f in filas
         ]
+
+
+def _clave_extraccion(
+    texto_sha256: object, campos: Sequence[str], modelo: object
+) -> tuple[str, str, str]:
+    """La clave de la caché del extractor: sha256 en hexadecimal, campos ordenados y modelo."""
+    if not isinstance(texto_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", texto_sha256):
+        raise DatoNoValido("texto_sha256: se espera un sha256 en hexadecimal")
+    pedidos = sorted(set(campos))
+    if not pedidos or any(c not in CLAVES_CAMPOS for c in pedidos):
+        raise DatoNoValido("campos: se esperan campos de `CAMPOS`")
+    return texto_sha256, ",".join(pedidos), _texto(modelo, "modelo", MAX_ETIQUETA_IA)
 
 
 def _codificar_campos(campos: Mapping[str, ValorCampo]) -> str:
@@ -1213,7 +1878,26 @@ def _version_perfil(perfil: Perfil) -> VersionPerfil:
     )
 
 
+_SELECT_TIENDAS = (
+    "SELECT t.*, f.intentos AS fallo_intentos, f.fecha AS fallo_fecha, f.motivo AS fallo_motivo,"
+    " f.reintentar_desde AS fallo_reintentar FROM tiendas t"
+    " LEFT JOIN configuraciones_fallidas f ON f.dominio = t.dominio"
+)
+"""Las tiendas con su última configuración fallida, si la hay (A1)."""
+_SELECT_TIENDAS_SIN_FALLOS = "SELECT t.*, NULL AS fallo_intentos FROM tiendas t"
+
+
 def _tienda(fila: sqlite3.Row, versiones: Sequence[VersionPerfil]) -> Tienda:
+    fallo = None
+    if fila["fallo_intentos"] is not None:
+        fecha = _leer_fecha(fila["fallo_fecha"])
+        assert fecha is not None
+        fallo = FalloConfiguracion(
+            intentos=fila["fallo_intentos"],
+            fecha=fecha,
+            motivo=fila["fallo_motivo"],
+            reintentar_desde=_leer_fecha(fila["fallo_reintentar"]),
+        )
     return Tienda(
         dominio=fila["dominio"],
         nombre=fila["nombre"],
@@ -1224,6 +1908,7 @@ def _tienda(fila: sqlite3.Row, versiones: Sequence[VersionPerfil]) -> Tienda:
         bloqueos=fila["bloqueos"],
         versiones=tuple(versiones),
         entrada=fila["entrada"],
+        fallo=fallo,
     )
 
 

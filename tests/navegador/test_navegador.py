@@ -16,7 +16,6 @@ from precia.navegador.tipos import (
     ConexionCortada,
     ErrorDescarga,
     Pagina,
-    ProhibidoPorRobots,
     URLNoPermitida,
 )
 from tests.navegador.falsos import (
@@ -96,12 +95,13 @@ def test_url_no_permitida_no_toca_la_red() -> None:
     assert m.robots_http.pedidas == [] and m.http.pedidas == []
 
 
-def test_robots_prohibe() -> None:
+def test_robots_prohibe_se_visita_igual_y_queda_anotado() -> None:
+    # ADR-017 (enmienda del 2026-10-25): el robots.txt nunca impide visitar; solo se avisa.
     carrito = f"{TIENDA}/es/carrito"
     m = Montaje({carrito: pagina(carrito)})
-    with pytest.raises(ProhibidoPorRobots):
-        m.obtener(carrito)
-    assert m.http.pedidas == []
+    m.obtener(carrito)
+    assert m.http.pedidas == [carrito]
+    assert m.navegador.robots_ignorado("www.recambios-ejemplo.example")
 
 
 def test_respeta_el_crawl_delay() -> None:
@@ -115,7 +115,8 @@ def test_respeta_el_crawl_delay() -> None:
         await m.navegador.obtener(FICHA)
 
     asyncio.run(dos())
-    assert m.reloj.esperas == [pytest.approx(4.0)]
+    # El robots.txt también es una petición a la tienda (ADR-017): la búsqueda espera tras él.
+    assert m.reloj.esperas == [pytest.approx(4.0), pytest.approx(4.0)]
 
 
 @pytest.mark.parametrize(
@@ -152,13 +153,13 @@ def test_sin_cache_si_se_pide(tmp_path: Path) -> None:
     assert m.http.pedidas == [FICHA, FICHA]
 
 
-def test_la_cache_no_salta_robots(tmp_path: Path) -> None:
+def test_la_cache_tambien_anota_el_robots_ignorado(tmp_path: Path) -> None:
     carrito = f"{TIENDA}/es/carrito"
     m = Montaje({}, cache=tmp_path)
     assert m.cache is not None
     m.cache.guardar(pagina(carrito))
-    with pytest.raises(ProhibidoPorRobots):
-        m.obtener(carrito)
+    assert m.obtener(carrito).desde_cache
+    assert m.navegador.robots_ignorado("www.recambios-ejemplo.example")
 
 
 def test_errores_http_no_se_guardan(tmp_path: Path) -> None:
@@ -184,11 +185,11 @@ def test_js_sin_chromium() -> None:
         m.obtener(FICHA, js=True)
 
 
-def test_redireccion_final_prohibida_por_robots() -> None:
+def test_redireccion_final_prohibida_por_robots_se_usa_y_queda_anotada() -> None:
     carrito = f"{TIENDA}/es/carrito"
     m = Montaje({BUSQUEDA: pagina(BUSQUEDA, url_final=carrito)})
-    with pytest.raises(ProhibidoPorRobots):
-        m.obtener(BUSQUEDA)
+    assert m.obtener(BUSQUEDA).url_final == carrito
+    assert m.navegador.robots_ignorado("www.recambios-ejemplo.example")
 
 
 def test_errores_del_descargador_se_propagan() -> None:
@@ -232,8 +233,9 @@ def test_un_403_seco_tambien_se_reintenta_con_chromium() -> None:
 def test_el_reintento_respeta_la_cortesia() -> None:
     m = Montaje({FICHA: desafio()}, paginas_js={FICHA: pagina(FICHA, RENDERIZADA)})
     m.obtener(FICHA)
-    # Dos peticiones a la misma tienda: el segundo turno espera el intervalo (1 s).
-    assert m.reloj.esperas == [pytest.approx(1.0)]
+    # Tres peticiones a la misma tienda (robots.txt, HTTP y Chromium): cada turno tras el primero
+    # espera el intervalo (1 s).
+    assert m.reloj.esperas == [pytest.approx(1.0), pytest.approx(1.0)]
 
 
 def test_si_chromium_tambien_esta_bloqueado_se_para() -> None:
@@ -355,14 +357,15 @@ def test_js_bloqueado_no_reintenta() -> None:
 
 
 def test_bloqueo_en_robots_no_va_por_chromium() -> None:
+    # El robots.txt nunca se rescata con Chromium; como se ignora (ADR-017), un desafío en él no
+    # corta la visita: la página se pide por HTTP como siempre.
     m = Montaje({FICHA: pagina(FICHA)}, paginas_js={FICHA: pagina(FICHA, RENDERIZADA)})
     m.robots_http.respuestas[ROBOTS] = pagina(
         ROBOTS, fixture("cloudflare_just_a_moment.html"), estado=403
     )
-    with pytest.raises(Bloqueado):
-        m.obtener(FICHA)
+    assert not m.obtener(FICHA).por_chromium
     assert m.chromium is not None and m.chromium.pedidas == []
-    assert m.http.pedidas == []
+    assert m.robots_http.pedidas == [ROBOTS] and m.http.pedidas == [FICHA]
 
 
 def test_tienda_rescatada_va_directa_a_chromium() -> None:
@@ -470,3 +473,45 @@ def test_un_429_de_kasada_si_se_rescata_con_chromium() -> None:
     m = Montaje({FICHA: kasada}, paginas_js={FICHA: pagina(FICHA, RENDERIZADA)})
     assert m.obtener(FICHA).html == RENDERIZADA
     assert m.chromium is not None and m.chromium.pedidas == [FICHA]
+
+
+# --- Una página a medias no se guarda en la caché ------------------------------------------------
+
+A_MEDIAS = (
+    Path(__file__).parent.parent
+    / "fixtures"
+    / "reales"
+    / "amazon_portada_202_solo_cabecera_chromium.html"
+).read_text(encoding="utf-8")
+
+
+def test_un_2xx_distinto_de_200_sin_cuerpo_no_se_guarda_en_cache(tmp_path: Path) -> None:
+    # Encontrado por Julio al probar la app con amazon.es: Chromium capturó la portada a medias
+    # tras el desafío anti-bot (solo el `<head>`, con el 202 del desafío). Guardada, «Reintentar»
+    # volvía a usarla durante las 6 h de la caché.
+    m = Montaje(
+        {FICHA: desafio()},
+        paginas_js={FICHA: pagina(FICHA, A_MEDIAS, estado=202)},
+        cache=tmp_path,
+    )
+    assert m.obtener(FICHA).html == A_MEDIAS
+    assert list(tmp_path.iterdir()) == []
+    m.obtener(FICHA)
+    assert m.chromium is not None and m.chromium.pedidas == [FICHA, FICHA]
+
+
+@pytest.mark.parametrize(
+    ("estado", "html", "tipo"),
+    [
+        (202, RENDERIZADA, "text/html"),  # Un 202 con su `<body>` es una página completa.
+        (200, "<html><head><title>Ficha</title></head></html>", "text/html"),
+        (202, "<?xml version='1.0'?><OpenSearchDescription/>", "application/xml"),
+    ],
+    ids=["202-con-cuerpo", "200-sin-body", "202-xml"],
+)
+def test_lo_demas_se_sigue_guardando_en_cache(
+    tmp_path: Path, estado: int, html: str, tipo: str
+) -> None:
+    m = Montaje({FICHA: pagina(FICHA, html, estado=estado, tipo=tipo)}, cache=tmp_path)
+    m.obtener(FICHA)
+    assert m.obtener(FICHA).desde_cache

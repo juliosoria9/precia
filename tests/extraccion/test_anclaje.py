@@ -1,11 +1,11 @@
 """Anclaje (memoria §4): un valor solo se da por bueno si aparece en la página."""
 
-import time
 from decimal import Decimal
 
 import pytest
 
 from precia.extraccion.anclaje import anclado, normalizar, precio_anclado
+from tests.cronometro import segundos_de_cpu
 
 PAGINA = (
     "Faro delantero izquierdo VALEO para Volkswagen Golf VI. Referencia OEM: 5K0 941 005 E. "
@@ -92,11 +92,13 @@ def test_anclaje_en_una_pagina_grande() -> None:
     trozo = "Faro {i} · 1 {i:03d},50 € · Tel. 912 345 {i:03d} · Talla {i} · Envío 4,95 € · "
     pagina = "".join(trozo.format(i=i % 1000) for i in range(20_000))
     assert len(pagina) > 1_000_000
-    inicio = time.perf_counter()
-    assert precio_anclado(Decimal("1999.50"), pagina)
-    assert not precio_anclado(Decimal("1"), pagina)
-    assert anclado("faro 999", pagina)
-    assert time.perf_counter() - inicio < 10
+
+    def comprobar() -> None:
+        assert precio_anclado(Decimal("1999.50"), pagina)
+        assert not precio_anclado(Decimal("1"), pagina)
+        assert anclado("faro 999", pagina)
+
+    assert segundos_de_cpu(comprobar, 10) < 10
 
 
 @pytest.mark.parametrize(

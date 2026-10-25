@@ -1,11 +1,11 @@
 """Detección de CAPTCHA y bloqueos anti-bot. Ante cualquiera de ellos se para: nunca se evaden."""
 
-import time
 from pathlib import Path
 
 import pytest
 
 from precia.navegador.bloqueo import detectar_bloqueo
+from tests.cronometro import segundos_de_cpu
 from tests.navegador.falsos import pagina
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "navegador"
@@ -85,10 +85,9 @@ def test_html_vacio() -> None:
 # --- HTML hostil: la detección corre en el bucle de eventos y no puede tardar segundos -----------
 
 
-def _cronometrar(html: str, estado: int) -> float:
-    inicio = time.perf_counter()
-    detectar_bloqueo(pagina(URL, html, estado=estado))
-    return time.perf_counter() - inicio
+def _cronometrar(html: str, estado: int, limite: float = 2) -> float:
+    """Segundos de CPU de la detección: el mejor de hasta 3 intentos (bug 6)."""
+    return segundos_de_cpu(lambda: detectar_bloqueo(pagina(URL, html, estado=estado)), limite)
 
 
 def test_muchos_atributos_class_sin_cerrar_no_disparan_el_tiempo() -> None:

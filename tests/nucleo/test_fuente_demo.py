@@ -1,4 +1,6 @@
 import asyncio
+from dataclasses import replace
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -10,15 +12,18 @@ from precia.nucleo.fuente_datos import (
     TiendaYaExiste,
     URLEntradaNoValida,
 )
-from precia.nucleo.fuente_demo import FuenteDemo
+from precia.nucleo.fuente_demo import TIENDAS, FuenteDemo
 from precia.nucleo.modelos import (
     ConsultaBusqueda,
     EstadoPaso,
     EstadoPerfil,
+    EstadoTienda,
+    FalloConfiguracion,
     Modo,
     OrigenDato,
     ResultadoBusqueda,
 )
+from tests.nucleo.falsos import SeguimientoFalso
 
 
 def _buscar(**kwargs: object) -> ResultadoBusqueda:
@@ -80,11 +85,29 @@ def test_filtra_por_tiendas_elegidas() -> None:
     assert [p.tienda for p in resultado.progreso] == ["recambiosnorte.example"]
 
 
-def test_tienda_que_prohibe_en_robots_se_omite() -> None:
+def test_tienda_que_prohibe_en_robots_se_visita_con_aviso() -> None:
+    # ADR-017, enmienda del 2026-10-25: el robots.txt nunca deja fuera una tienda.
+    prohibe = replace(
+        TIENDAS[0],
+        robots="Lo prohíbe; se ignora por decisión del usuario (ADR-017)",
+        robots_permite=False,
+    )
+    fuente = FuenteDemo(_tiendas=[prohibe])
+    resultado = asyncio.run(fuente.buscar(ConsultaBusqueda(texto="pastillas")))
+    progreso = next(p for p in resultado.progreso if p.tienda == prohibe.dominio)
+    robots = progreso.pasos[0]
+    assert robots.nombre == "robots.txt" and robots.estado is EstadoPaso.AVISO
+    assert "se ignora por decisión del usuario (ADR-017)" in robots.detalle
+    assert any(o.tienda == prohibe.dominio for g in resultado.grupos for o in g.ofertas)
+
+
+def test_tienda_sin_perfil_de_la_demo_no_ensena_el_paso_del_robots() -> None:
+    # En la demo una tienda sin perfil no se visita: un paso «robots.txt … se ignora» daría a
+    # entender que sí. Su aviso sigue en Tiendas y en la etiqueta del inicio.
     resultado = _buscar(texto="pastillas")
-    omitida = next(p for p in resultado.progreso if p.tienda == "autodescuento.example")
-    assert omitida.pasos[0].estado is EstadoPaso.OMITIDO
-    assert all(o.tienda != "autodescuento.example" for g in resultado.grupos for o in g.ofertas)
+    progreso = next(p for p in resultado.progreso if p.tienda == "autodescuento.example")
+    assert [p.nombre for p in progreso.pasos] == ["perfil"]
+    assert progreso.pasos[0].estado is EstadoPaso.OMITIDO
 
 
 def test_descarta_accesorios_y_variantes_con_motivo() -> None:
@@ -99,6 +122,10 @@ def test_crear_alerta() -> None:
     alerta = fuente.crear_alerta("pastillas-1k0698151", Decimal("30"), "telegram")
     assert len(fuente.alertas()) == antes + 1
     assert alerta.producto_nombre
+    assert alerta.solo_exactas is True
+    amplia = fuente.crear_alerta("pastillas-1k0698151", Decimal("25"), "email", solo_exactas=False)
+    assert fuente.alertas()[-1] == amplia
+    assert amplia.solo_exactas is False
 
 
 def test_historico_y_producto() -> None:
@@ -142,9 +169,9 @@ def test_modo_auto_usa_ia_cuando_una_tienda_falla() -> None:
 
 def test_en_modo_clasico_no_hay_descartes_semanticos() -> None:
     motivos = [d.motivo for d in _buscar(texto="pastillas", modo=Modo.CLASICO).descartados]
-    assert motivos and not any(m.startswith("🤖") for m in motivos)
+    assert motivos and not any(m.startswith("IA · ") for m in motivos)
     motivos_ia = [d.motivo for d in _buscar(texto="pastillas", modo=Modo.IA).descartados]
-    assert any(m.startswith("🤖") for m in motivos_ia)
+    assert any(m.startswith("IA · ") for m in motivos_ia)
 
 
 def test_ningun_perfil_hecho_por_la_ia_se_fija_sin_revision_humana() -> None:
@@ -283,3 +310,26 @@ def test_revisar_dos_veces_no_vale() -> None:
 
 def test_cerrar_no_hace_nada_en_la_demo() -> None:
     asyncio.run(FuenteDemo().cerrar())
+
+
+def test_reintentar_configuracion_en_la_demo() -> None:
+    t = datetime(2026, 10, 22, 12, 0)
+    fallo = FalloConfiguracion(2, t, "No se ha podido configurar.", t + timedelta(days=1))
+    caida = replace(TIENDAS[0], estado=EstadoPerfil.SIN_PERFIL, versiones=(), fallo=fallo)
+    fuente = FuenteDemo(_tiendas=[caida, *TIENDAS[1:]])
+    tienda = fuente.reintentar_configuracion(caida.dominio.upper())
+    assert tienda.fallo == FalloConfiguracion(2, t, "No se ha podido configurar.", None)
+    assert fuente.tienda(caida.dominio) == tienda
+    # Sin fallo no cambia nada.
+    otra = TIENDAS[1]
+    assert fuente.reintentar_configuracion(otra.dominio) == otra
+    with pytest.raises(TiendaNoExiste):
+        fuente.reintentar_configuracion("no-existe.example")
+
+
+def test_la_demo_avisa_hecha_por_tienda() -> None:
+    seg = SeguimientoFalso()
+    elegidas = (TIENDAS[0].dominio, TIENDAS[1].dominio)
+    consulta = ConsultaBusqueda("1K0698151", tiendas=elegidas)
+    asyncio.run(FuenteDemo().buscar(consulta, seguimiento=seg))
+    assert seg.estados == [(d, EstadoTienda.HECHA) for d in elegidas]

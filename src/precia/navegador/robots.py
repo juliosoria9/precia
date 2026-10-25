@@ -9,9 +9,18 @@ las tiendas como `Disallow: /*?order=` no se respetarían.
 - Gana la regla más larga que coincide; a igual longitud, `Allow`.
 - Un 4xx significa que no hay robots.txt (se permite todo); un 5xx o un error de red, que no se
   puede saber (se prohíbe todo). Un 429 se trata como 5xx: la web pide que bajemos el ritmo.
+  Ese «prohíbe todo» no es una regla leída: el origen queda marcado (`ilegible`) y el navegador no
+  lo anota como ignorado, porque el aviso «lo prohíbe; se ignora» sería falso.
 - Excepción al RFC: si la respuesta es un desafío anti-bot (p. ej. un 403 de Cloudflare, caso
-  real de oscaro.es), no es que no haya robots.txt, es un muro. Se prohíbe todo y se recuerda el
-  motivo para que el navegador lo trate como `Bloqueado` aunque se ignore el robots.txt (ADR-017).
+  real de oscaro.es), no es que no haya robots.txt, es que no se puede leer. Se prohíbe todo y se
+  recuerda el motivo (`bloqueo`): el navegador, que nunca deja de visitar por el robots.txt
+  (ADR-017), lo trata como si no lo hubiera, sin anotarlo como ignorado: la página detecta su
+  propio bloqueo y tiene su rescate con Chromium (ADR-023, causa R3-B).
+- Lo que se lee aquí solo sirve para avisar de lo que prohíbe, para el Crawl-delay y para los
+  sitemaps: ninguna regla impide una visita (enmienda de ADR-017 del 2026-10-25).
+- El robots.txt es una petición más a la tienda: con un limitador (`usar_turnos`, lo pone el
+  `Navegador`) se pide en un turno de su dominio, así que nunca coincide con otra petición nuestra
+  a la misma tienda (ADR-017), tampoco con la de otra búsqueda simultánea (B6).
 """
 
 import asyncio
@@ -24,13 +33,20 @@ from dataclasses import dataclass, field
 from urllib.parse import quote, urlsplit
 
 from precia.navegador.bloqueo import detectar_bloqueo
-from precia.navegador.tipos import Descargador, ErrorNavegador
+from precia.navegador.cortesia import LimitadorDominio
+from precia.navegador.tipos import Descargador, DescargadorConTiempo, ErrorNavegador, Pagina
 
 MAXIMO_BYTES = 500 * 1024
 MAXIMO_RETARDO_S = 60.0
 TTL_S = 24 * 3600.0
 # Un fallo pasajero del servidor no debe dejar la tienda prohibida un día entero.
 TTL_ERROR_S = 10 * 60.0
+TIEMPO_ROBOTS_S = 10.0
+"""Tiempo total del robots.txt (A7), si el descargador lo admite: un fichero de texto pequeño que
+una tienda lenta tardaba en dar hasta 19,6 s. Si falla, cuenta como error y se guarda
+`TTL_ERROR_S`. No baja de 10 s (lo mismo que una página): con 5 s fallaban robots.txt válidos de
+la campaña (tiendanimal.es 8,18 s, amazon.es 8,31 s), la tienda salía como «Lo prohíbe» y se
+perdían sus sitemaps durante `TTL_ERROR_S`."""
 MAX_SITEMAPS_ROBOTS = 20
 """Líneas `Sitemap:` que se guardan de un robots.txt (nota 16, sección B); las demás se ignoran."""
 MAX_LONGITUD_SITEMAP = 2000
@@ -151,6 +167,13 @@ class ServicioRobots:
         self._cache: dict[str, _Entrada] = {}
         self._candados: dict[str, asyncio.Lock] = {}
         self._bloqueos: dict[str, str] = {}
+        self._ilegibles: set[str] = set()
+        """Orígenes cuyo último robots.txt no se pudo leer (5xx, 429, error de red o desafío)."""
+        self._limitador: LimitadorDominio | None = None
+
+    def usar_turnos(self, limitador: LimitadorDominio) -> None:
+        """Pide cada robots.txt en un turno de cortesía de su dominio (ADR-017)."""
+        self._limitador = limitador
 
     async def permitido(self, url: str) -> bool:
         """`url` ya validada. Indica si nuestro User-Agent puede pedirla."""
@@ -162,7 +185,7 @@ class ServicioRobots:
     async def sitemaps(self, url: str) -> tuple[str, ...]:
         """`url` ya validada. Sitemaps declarados en el robots.txt de su origen.
 
-        Usa el robots.txt ya leído o lo lee entonces, se respete o no (ADR-017). Si no hay
+        Usa el robots.txt ya leído o lo lee entonces (se ignora, ADR-017, pero se lee). Si no hay
         robots.txt, no se pudo leer o era un desafío anti-bot, no hay ninguno. Las URL son datos
         de la web: quien las descargue las valida y comprueba que son de la misma tienda.
         """
@@ -173,6 +196,12 @@ class ServicioRobots:
         """Motivo si el robots.txt de ese origen respondió con un desafío anti-bot."""
         partes = urlsplit(url)
         return self._bloqueos.get(f"{partes.scheme}://{partes.netloc}")
+
+    def ilegible(self, url: str) -> bool:
+        """Si el robots.txt de ese origen no se pudo leer: su «prohíbe todo» no es una regla de la
+        tienda, así que no hay nada que avisar como ignorado (ADR-017)."""
+        partes = urlsplit(url)
+        return f"{partes.scheme}://{partes.netloc}" in self._ilegibles
 
     def retardo(self, dominio: str) -> float | None:
         """Crawl-delay de los robots.txt ya leídos para ese host (sin esquema ni puerto)."""
@@ -194,8 +223,22 @@ class ServicioRobots:
             return reglas
 
     async def _descargar(self, origen: str) -> tuple[ReglasRobots, float]:
+        reglas, ttl = await self._descargar_reglas(origen)
+        if reglas is PROHIBIR_TODO:
+            self._ilegibles.add(origen)
+        else:
+            self._ilegibles.discard(origen)
+        return reglas, ttl
+
+    async def _descargar_reglas(self, origen: str) -> tuple[ReglasRobots, float]:
         try:
-            pagina = await self._descargador.descargar(f"{origen}/robots.txt")
+            url = f"{origen}/robots.txt"
+            if self._limitador is None:
+                pagina = await self._pedir(url)
+            else:
+                host = urlsplit(origen).hostname or ""
+                async with self._limitador.turno(host, retardo_minimo=self.retardo(host)):
+                    pagina = await self._pedir(url)
         except ErrorNavegador:
             return PROHIBIR_TODO, min(self._ttl, TTL_ERROR_S)
         motivo = detectar_bloqueo(pagina)
@@ -208,6 +251,11 @@ class ServicioRobots:
         if 400 <= pagina.estado < 500 and pagina.estado != 429:
             return PERMITIR_TODO, self._ttl
         return PROHIBIR_TODO, min(self._ttl, TTL_ERROR_S)
+
+    async def _pedir(self, url: str) -> Pagina:
+        if isinstance(self._descargador, DescargadorConTiempo):
+            return await self._descargador.descargar_con_tiempo(url, TIEMPO_ROBOTS_S)
+        return await self._descargador.descargar(url)
 
 
 def _agente_coincide(agente: str, token: str) -> bool:

@@ -1,6 +1,5 @@
 """Detección de la plataforma de una tienda por su portada y plantillas de búsqueda HTML."""
 
-import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -13,6 +12,7 @@ from precia.fuentes.plataformas import (
     plantillas_html,
 )
 from precia.navegador.tipos import Pagina
+from tests.cronometro import segundos_de_cpu
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "fuentes"
 
@@ -115,9 +115,7 @@ def test_atributo_hostil_no_cuela_una_plataforma() -> None:
 
 def test_html_hostil_enorme_se_analiza_en_tiempo_lineal() -> None:
     hostil = "<script>" + "prestashop " * 200_000 + "</script>" + '<div class="x">' * 50_000
-    inicio = time.perf_counter()
-    detectar_plataforma(_pagina(hostil))
-    assert time.perf_counter() - inicio < 5
+    assert segundos_de_cpu(lambda: detectar_plataforma(_pagina(hostil)), 5) < 5
 
 
 # --- Moneda de Shopify ------------------------------------------------------------------------
@@ -136,9 +134,8 @@ def test_moneda_shopify_otra_moneda_y_ausente() -> None:
 
 def test_moneda_shopify_con_entrada_hostil() -> None:
     hostil = "<script>" + "Shopify.currency = {" * 100_000 + "</script>"
-    inicio = time.perf_counter()
     assert moneda_shopify(_pagina(hostil)) is None
-    assert time.perf_counter() - inicio < 2
+    assert segundos_de_cpu(lambda: moneda_shopify(_pagina(hostil)), 2) < 2
 
 
 # --- Plantillas de búsqueda HTML --------------------------------------------------------------

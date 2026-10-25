@@ -181,3 +181,75 @@ def test_pausa_de_cortesia_cancelada_no_devuelve_una_plaza_de_mas() -> None:
         return maximo == 1
 
     assert asyncio.run(probar())
+
+
+# --- C1: una descarga cancelada deja el dominio ocupado un margen ------------------------------
+
+
+def _cancelar_en_turno(lim: LimitadorDominio, dominio: str) -> None:
+    """Abre un turno de `dominio` que espera para siempre y lo cancela (Cancelar, plazo)."""
+
+    async def probar() -> None:
+        async def descarga() -> None:
+            async with lim.turno(dominio):
+                await asyncio.Event().wait()
+
+        tarea = asyncio.create_task(descarga())
+        await asyncio.sleep(0)
+        tarea.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await tarea
+
+    asyncio.run(probar())
+
+
+def test_turno_cancelado_deja_el_dominio_ocupado_el_margen() -> None:
+    # La descarga cancelada sigue en su hilo (`asyncio.to_thread`) hasta su timeout: la
+    # siguiente petición al mismo dominio espera el margen además del intervalo (ADR-017).
+    reloj = Reloj()
+    lim = LimitadorDominio(2.0, margen_cancelado_s=60, reloj=reloj, dormir=reloj.dormir)
+    _cancelar_en_turno(lim, "tienda.example")
+    asyncio.run(lim.esperar_turno("otra.example"))
+    assert reloj.esperas == []
+    asyncio.run(lim.esperar_turno("tienda.example"))
+    assert reloj.esperas == [pytest.approx(62.0)]
+
+
+def test_sin_margen_se_comporta_como_antes() -> None:
+    lim, reloj = limitador(2.0)
+    _cancelar_en_turno(lim, "tienda.example")
+    asyncio.run(lim.esperar_turno("tienda.example"))
+    assert reloj.esperas == [pytest.approx(2.0)]
+
+
+def test_margen_cancelado_negativo_no_vale() -> None:
+    with pytest.raises(ValueError, match="margen"):
+        LimitadorDominio(2.0, margen_cancelado_s=-1)
+
+
+def test_el_heredero_comparte_la_fila_de_cada_dominio_con_el_viejo() -> None:
+    """B6: con varias búsquedas a la vez, una puede seguir con el navegador viejo mientras otra
+    estrena el de unos ajustes nuevos. Los dos limitadores tienen que poner en fila las
+    peticiones al mismo dominio: nunca dos en vuelo a la vez (ADR-017)."""
+    viejo, reloj = limitador(2.0)
+    nuevo = LimitadorDominio(1.0, reloj=reloj, dormir=reloj.dormir)
+    nuevo.heredar(viejo)
+    en_vuelo = 0
+    maximo = 0
+
+    async def pedir(lim: LimitadorDominio) -> None:
+        nonlocal en_vuelo, maximo
+        async with lim.turno("tienda.example"):
+            en_vuelo += 1
+            maximo = max(maximo, en_vuelo)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            en_vuelo -= 1
+
+    async def a_la_vez() -> None:
+        await asyncio.gather(pedir(viejo), pedir(nuevo), pedir(viejo), pedir(nuevo))
+
+    asyncio.run(a_la_vez())
+    assert maximo == 1
+    # Cada uno espera con su propio retardo desde la petición anterior, sea de quien sea.
+    assert reloj.esperas == [pytest.approx(1.0), pytest.approx(2.0), pytest.approx(1.0)]

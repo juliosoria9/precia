@@ -225,6 +225,37 @@ def test_errores_de_red_prohiben_todo(error: Exception) -> None:
     assert not asyncio.run(robots.permitido(f"{TIENDA}/ficha"))
 
 
+@pytest.mark.parametrize(
+    ("respuesta", "leido"),
+    [
+        (pagina(ROBOTS, "User-agent: *\nDisallow: /\n", tipo="text/plain"), True),
+        (pagina(ROBOTS, "", estado=404), True),
+        (pagina(ROBOTS, "User-agent: *\nDisallow: /\n", estado=500), False),
+        (pagina(ROBOTS, "User-agent: *\nDisallow: /\n", estado=429), False),
+        (ErrorDescarga("tiempo agotado"), False),
+    ],
+    ids=["200", "404", "500", "429", "error-de-red"],
+)
+def test_ilegible_distingue_lo_leido_de_lo_que_no_se_pudo_leer(
+    respuesta: Pagina | Exception, leido: bool
+) -> None:
+    # ADR-017: sin reglas leídas no hay nada que avisar como ignorado.
+    robots, _ = servicio(respuesta)
+    asyncio.run(robots.permitido(f"{TIENDA}/ficha"))
+    assert robots.ilegible(f"{TIENDA}/ficha") is not leido
+
+
+def test_ilegible_se_olvida_cuando_luego_se_lee() -> None:
+    reloj = Reloj()
+    robots, descargador = servicio(pagina(ROBOTS, "", estado=503), reloj)
+    asyncio.run(robots.permitido(f"{TIENDA}/a"))
+    assert robots.ilegible(f"{TIENDA}/a")
+    reloj.ahora += 11 * 60
+    descargador.respuestas[ROBOTS] = pagina(ROBOTS, "User-agent: *\nDisallow: /\n")
+    asyncio.run(robots.permitido(f"{TIENDA}/a"))
+    assert not robots.ilegible(f"{TIENDA}/a")
+
+
 def test_cache_por_origen_con_caducidad() -> None:
     reloj = Reloj()
     robots, descargador = servicio(pagina(ROBOTS, "User-agent: *\nDisallow: /x\n"), reloj)

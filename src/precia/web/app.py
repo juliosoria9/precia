@@ -3,13 +3,18 @@
 La web solo habla con una `FuenteDatos`: la `FuenteDemo` (datos de ejemplo, en memoria) o la
 `FuenteReal` (orquestador + SQLite). `crear_app` recibe la fuente ya hecha y la cierra al apagar;
 `aplicacion_desde_config` elige cuál según la configuración (`--demo` o `PRECIA_DEMO`).
+
+Una búsqueda va en segundo plano (C1, `nucleo.tareas`): `GET /buscar` la lanza y lleva a
+`/busquedas/{id}`, cuya página sondea con htmx el estado de cada tienda. Atrás o F5 piden esa
+URL y ven lo que hay en memoria: no se vuelve a buscar.
 """
 
 import mimetypes
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -25,12 +30,14 @@ from starlette.exceptions import HTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from precia import __version__
+from precia.emparejado.referencias import referencias_en
 from precia.nucleo import formato
 from precia.nucleo.config import Config
 from precia.nucleo.fuente_datos import ErrorFuente, FuenteDatos
 from precia.nucleo.fuente_demo import FuenteDemo
 from precia.nucleo.fuente_real import FuenteReal
-from precia.nucleo.modelos import CAMPOS, TRANSPORTES_HTTP, Ajustes, Modo
+from precia.nucleo.modelos import CAMPOS, TRANSPORTES_HTTP, Ajustes, EstadoTienda, Modo
+from precia.nucleo.tareas import DemasiadasBusquedas, GestorBusquedas, TareaBusqueda
 from precia.seguimiento.graficas import grafica_historico
 from precia.web.formularios import (
     ErrorFormulario,
@@ -41,6 +48,7 @@ from precia.web.formularios import (
     leer_formulario,
     leer_importe,
     leer_version,
+    parametros_de_consulta,
     primero,
 )
 from precia.web.seguridad import MiddlewareSeguridad
@@ -57,6 +65,21 @@ CANALES = ("email", "telegram")
 PROVEEDORES = ("api", "ollama")
 MAX_ENTRADA_ESCRITA = 600
 """Lo que se devuelve al formulario de lo que escribió el usuario, para que lo corrija."""
+ESPERA_INICIAL_S = 0.5
+"""Lo que espera `GET /buscar` a que termine la búsqueda antes de enseñar el progreso (C1): la
+demo, la caché o una búsqueda repetida salen ya terminadas, sin pasar por el sondeo."""
+_ID_BUSQUEDA = re.compile(r"[0-9a-f]{16}")
+ETIQUETAS_ESTADO = {
+    EstadoTienda.EN_COLA: "En cola",
+    EstadoTienda.DESCARGANDO: "Descargando",
+    EstadoTienda.CONFIGURANDO: "Configurando",
+    EstadoTienda.HECHA: "Hecha",
+    EstadoTienda.BLOQUEADA: "Bloqueada",
+    EstadoTienda.EN_ESPERA: "En espera",
+    EstadoTienda.PLAZO: "Plazo agotado",
+    EstadoTienda.CANCELADA: "Cancelada",
+}
+"""Etiqueta del estado de cada tienda en la página de una búsqueda (C1)."""
 
 NAVEGACION = (
     ("/", "Buscar"),
@@ -78,16 +101,46 @@ def _entorno() -> Environment:
     entorno.filters["fecha_corta"] = formato.fecha_corta
     entorno.filters["fecha_hora"] = formato.fecha_hora
     entorno.filters["url_segura"] = url_segura
+    entorno.filters["foto_segura"] = foto_segura
+    # «Sin resultados» no propone escribir una referencia OEM si ya se ha escrito una (B5).
+    entorno.filters["con_referencia_oem"] = lambda texto: bool(referencias_en(texto))
     entorno.globals["CAMPOS"] = CAMPOS
     entorno.globals["NAVEGACION"] = NAVEGACION
     entorno.globals["MODOS"] = Modo
     entorno.globals["VERSION"] = __version__
+    entorno.globals["ETIQUETAS_ESTADO"] = ETIQUETAS_ESTADO
+    entorno.globals["parametros_de_consulta"] = parametros_de_consulta
     return entorno
 
 
 def url_segura(url: str) -> str:
     """Las URL vienen de las tiendas: solo se enlazan las http(s); `javascript:` y demás, no."""
     return url if urlsplit(url).scheme in ("http", "https") else "#"
+
+
+MAX_FOTO = 2000
+_NO_EN_FOTO = frozenset("\"'<>`\\")
+
+
+def foto_segura(url: object) -> str | None:
+    """Última barrera antes del `<img src>`: la URL si es `https` con host y sin nada raro.
+
+    La foto ya llega validada desde la extracción y el almacén; aquí se repite lo mínimo por si
+    una fuente de datos (o una base de datos tocada a mano) trae otra cosa. `None`: sin foto.
+    """
+    if not isinstance(url, str) or len(url) > MAX_FOTO or not url.startswith("https://"):
+        return None
+    if any(c.isspace() or not c.isprintable() or c in _NO_EN_FOTO for c in url):
+        return None
+    try:
+        return url if urlsplit(url).hostname else None
+    except ValueError:
+        return None
+
+
+def _ahora() -> datetime:
+    """Hora local con zona, como las fechas que guarda el almacén."""
+    return datetime.now().astimezone()
 
 
 def _es_htmx(request: Request) -> bool:
@@ -107,18 +160,34 @@ def _parametros(request: Request) -> dict[str, list[str]]:
 
 
 def crear_app(
-    fuente: FuenteDatos | None = None, *, hosts: tuple[str, ...] = HOSTS_LOCALES
+    fuente: FuenteDatos | None = None,
+    *,
+    hosts: tuple[str, ...] = HOSTS_LOCALES,
+    espera_inicial_s: float = ESPERA_INICIAL_S,
+    gestor: GestorBusquedas | None = None,
+    reloj: Callable[[], datetime] = _ahora,
 ) -> FastAPI:
+    """`gestor` lleva las búsquedas en segundo plano (C1); por defecto, uno sobre `fuente`.
+
+    `reloj` da el `ahora` de las plantillas: con él se ve si la espera de una configuración
+    fallida (A1) sigue en pie o ya ha vencido.
+    """
     datos: FuenteDatos = fuente if fuente is not None else FuenteDemo()
+    busquedas = gestor if gestor is not None else GestorBusquedas(datos)
     plantillas = Jinja2Templates(env=_entorno())
 
     @asynccontextmanager
     async def ciclo_de_vida(_: FastAPI) -> AsyncIterator[None]:
-        # Al apagar se cierran el navegador (Chromium) y la base de datos de la fuente real.
+        # Al apagar se cancelan las búsquedas en marcha y luego se cierran el navegador
+        # (Chromium) y la base de datos de la fuente real: en ese orden, para que ninguna
+        # búsqueda siga usando un navegador cerrado.
         try:
             yield
         finally:
-            await datos.cerrar()
+            try:
+                await busquedas.cerrar()
+            finally:
+                await datos.cerrar()
 
     app = FastAPI(
         title="PrecIA",
@@ -129,6 +198,7 @@ def crear_app(
         lifespan=ciclo_de_vida,
     )
     app.state.fuente = datos
+    app.state.gestor = busquedas
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(hosts))
     app.add_middleware(MiddlewareSeguridad)
     app.mount("/estaticos", StaticFiles(directory=RAIZ / "estaticos"), name="estaticos")
@@ -141,11 +211,31 @@ def crear_app(
             "ruta": request.url.path,
             "es_htmx": _es_htmx(request),
             "google_activado": datos.ajustes().google_activado,
-            "respetar_robots": datos.ajustes().respetar_robots,
+            "ahora": reloj(),
         }
         return plantillas.TemplateResponse(
             request, plantilla, {**base, **contexto}, status_code=estado
         )
+
+    def url_busqueda(tarea: TareaBusqueda) -> str:
+        """La URL de una búsqueda: con su consulta, para el formulario si la tarea ya no está."""
+        return f"/busquedas/{tarea.id}?{parametros_de_consulta(tarea.consulta)}"
+
+    def tarea_de(id_busqueda: str) -> TareaBusqueda | None:
+        return busquedas.tarea(id_busqueda) if _ID_BUSQUEDA.fullmatch(id_busqueda) else None
+
+    def fragmento_busqueda(
+        request: Request, tarea: TareaBusqueda | None, estado: int = 200
+    ) -> HTMLResponse:
+        """La búsqueda en curso o terminada (`_busqueda.html`); sin tarea, el aviso de que ya no
+        está, sin sondeo."""
+        contexto = {
+            "tarea": tarea,
+            "consulta": tarea.consulta if tarea else None,
+            # «Sin resultados» dice si no hay ninguna tienda dada de alta.
+            "tiendas": datos.tiendas(),
+        }
+        return pagina(request, "_busqueda.html", contexto, estado)
 
     def contexto_producto(id_producto: str) -> dict[str, Any] | None:
         grupo = datos.producto(id_producto)
@@ -170,7 +260,12 @@ def crear_app(
         return pagina(request, "inicio.html", {"tiendas": datos.tiendas(), "consulta": None})
 
     @app.get("/buscar", response_class=HTMLResponse)
-    async def buscar(request: Request) -> HTMLResponse:
+    async def buscar(request: Request) -> Response:
+        """Lanza la búsqueda en segundo plano y lleva a su página, `/busquedas/{id}` (C1).
+
+        Sin htmx, un 303. Con htmx, el fragmento de la búsqueda y `HX-Push-Url`: `/buscar` no
+        queda en el historial, así que Atrás o F5 no la relanzan.
+        """
         parametros = _parametros(request)
         contexto: dict[str, Any] = {"tiendas": datos.tiendas(), "consulta": None}
         estado = 200
@@ -192,12 +287,68 @@ def crear_app(
             else:
                 consulta = replace(consulta, tiendas=elegidas)
                 contexto["consulta"] = consulta
-                contexto["resultado"] = await datos.buscar(consulta)
+                todas = elegidas or tuple(t.dominio for t in contexto["tiendas"])
+                try:
+                    tarea = busquedas.lanzar(consulta, todas)
+                except DemasiadasBusquedas as error:
+                    contexto["error"] = str(error)
+                    estado = 429
+                else:
+                    # Si acaba enseguida (demo, caché), se pinta ya terminada, sin sondeo.
+                    await busquedas.esperar(tarea, espera_inicial_s)
+                    respuesta: Response
+                    if _es_htmx(request):
+                        respuesta = fragmento_busqueda(request, tarea)
+                        respuesta.headers["HX-Push-Url"] = url_busqueda(tarea)
+                    else:
+                        respuesta = RedirectResponse(url_busqueda(tarea), status_code=303)
+                    respuesta.headers["Vary"] = "HX-Request"
+                    return respuesta
         plantilla = "_resultados.html" if _es_htmx(request) else "inicio.html"
         respuesta = pagina(request, plantilla, contexto, estado)
         # La misma URL devuelve página o fragmento según HX-Request: que ninguna caché los mezcle.
         respuesta.headers["Vary"] = "HX-Request"
         return respuesta
+
+    @app.get("/busquedas/{id_busqueda}", response_class=HTMLResponse)
+    async def busqueda(request: Request, id_busqueda: str) -> HTMLResponse:
+        """La página de una búsqueda, en curso o terminada. Siempre entera: es la URL a la que
+        vuelven Atrás y F5 (también la restauración del historial de htmx)."""
+        tarea = tarea_de(id_busqueda)
+        contexto: dict[str, Any] = {"tiendas": datos.tiendas(), "tarea": tarea}
+        if tarea is not None:
+            contexto["consulta"] = tarea.consulta
+            return pagina(request, "inicio.html", contexto)
+        # Caducada o de antes de reiniciar: el formulario, relleno con la consulta de la URL.
+        try:
+            contexto["consulta"] = consulta_desde_parametros(_parametros(request))
+        except ErrorFormulario:
+            contexto["consulta"] = None
+        contexto["perdida"] = True
+        return pagina(request, "inicio.html", contexto, 404)
+
+    @app.get("/busquedas/{id_busqueda}/estado", response_class=HTMLResponse)
+    async def estado_busqueda(request: Request, id_busqueda: str) -> Response:
+        """El fragmento que sondea la página cada segundo; 204 si no ha cambiado (`v`)."""
+        tarea = tarea_de(id_busqueda)
+        if tarea is None:
+            return fragmento_busqueda(request, None, 404)
+        if tarea.activa and request.query_params.get("v") == str(tarea.version):
+            # Sin repintar: así no se cierran los desplegables ni salta el foco.
+            return Response(status_code=204)
+        return fragmento_busqueda(request, tarea)
+
+    @app.post("/busquedas/{id_busqueda}/cancelar", response_class=HTMLResponse)
+    async def cancelar_busqueda(request: Request, id_busqueda: str) -> Response:
+        tarea = tarea_de(id_busqueda)
+        if tarea is None:
+            if _es_htmx(request):
+                return fragmento_busqueda(request, None, 404)
+            raise HTTPException(404)
+        await busquedas.cancelar(tarea.id)
+        if not _es_htmx(request):
+            return RedirectResponse(url_busqueda(tarea), status_code=303)
+        return fragmento_busqueda(request, tarea)
 
     @app.get("/productos/{id_producto}", response_class=HTMLResponse)
     async def producto(request: Request, id_producto: str) -> HTMLResponse:
@@ -241,6 +392,7 @@ def crear_app(
             "alta": request.query_params.get("alta") == "1",
             "revisado": request.query_params.get("revisado") == "1",
             "entrada_cambiada": request.query_params.get("entrada") == "1",
+            "reintentar": request.query_params.get("reintentar") == "1",
         }
         return pagina(request, "tienda.html", contexto)
 
@@ -277,6 +429,20 @@ def crear_app(
             return pagina(request, "tienda.html", {"tienda": actual, "error": str(error)}, 422)
         return RedirectResponse(f"/tiendas/{quote(revisada.dominio)}?revisado=1", status_code=303)
 
+    @app.post("/tiendas/{dominio}/reintentar", response_class=HTMLResponse)
+    async def reintentar_configuracion(request: Request, dominio: str) -> Response:
+        """A1: quita la espera tras una configuración fallida."""
+        encontrada = datos.tienda(dominio)
+        if encontrada is None:
+            raise HTTPException(404)
+        try:
+            leer_formulario(await request.body())
+            tienda = datos.reintentar_configuracion(encontrada.dominio)
+        except (ErrorFormulario, ErrorFuente) as error:
+            actual = datos.tienda(encontrada.dominio) or encontrada
+            return pagina(request, "tienda.html", {"tienda": actual, "error": str(error)}, 422)
+        return RedirectResponse(f"/tiendas/{quote(tienda.dominio)}?reintentar=1", status_code=303)
+
     @app.get("/alertas", response_class=HTMLResponse)
     async def alertas(request: Request) -> HTMLResponse:
         return pagina(request, "alertas.html", {"alertas": datos.alertas()})
@@ -292,7 +458,14 @@ def crear_app(
             canal = primero(formulario, "canal", "email")
             if canal not in CANALES:
                 raise ErrorFormulario("Canal de aviso no válido.")
-            datos.crear_alerta(id_producto, leer_importe(primero(formulario, "umbral")), canal)
+            # B5: sin marcar la casilla, la alerta solo cuenta las ofertas exactas.
+            solo_exactas = primero(formulario, "equivalentes", "") != "1"
+            datos.crear_alerta(
+                id_producto,
+                leer_importe(primero(formulario, "umbral")),
+                canal,
+                solo_exactas=solo_exactas,
+            )
         except ErrorFormulario as error:
             if _es_htmx(request):
                 # El error va junto al formulario, sin borrar la lista de alertas.
@@ -401,10 +574,10 @@ def _ajustes_desde_formulario(formulario: Parametros, actuales: Ajustes) -> Ajus
             if "enviado" in formulario
             else actuales.google_activado
         ),
-        respetar_robots=(
-            primero(formulario, "respetar_robots") == "on"
+        revisar_resultados=(
+            primero(formulario, "revisar_resultados") == "on"
             if "enviado" in formulario
-            else actuales.respetar_robots
+            else actuales.revisar_resultados
         ),
         retardo_dominio_s=float(
             entero(

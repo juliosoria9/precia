@@ -1,0 +1,11 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://www.coolmod.com/sitemap.xml
+Sitemap: https://www.coolmod.com/sitemap2.xml
+Sitemap: https://www.coolmod.com/sitemap_categories.xml
+Sitemap: https://www.coolmod.com/sitemap_products.xml
+Sitemap: https://www.coolmod.com/sitemap_manufacturers.xml
+Sitemap: https://www.coolmod.com/sitemap_manufacturers_categories.xml
+Sitemap: https://www.coolmod.com/sitemap_contents.xml
+Sitemap: https://www.coolmod.com/sitemap_promotions.xml

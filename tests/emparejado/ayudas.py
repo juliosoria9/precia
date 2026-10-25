@@ -22,6 +22,7 @@ def ficha(
     marca: str | None = None,
     moneda: str = "EUR",
     url: str = "https://tienda.example/p/1",
+    citadas: frozenset[str] = frozenset(),
 ) -> FichaExtraida:
     campos: dict[str, ValorCampo] = {}
     if precio is not None:
@@ -38,7 +39,9 @@ def ficha(
     if marca is not None:
         campos["marca"] = ValorCampo(marca, OrigenDato.JSONLD)
     importe = None if precio is None else Precio(Decimal(precio), moneda, f"{precio} €")
-    return FichaExtraida(url=url, titulo=titulo, precio=importe, campos=campos)
+    return FichaExtraida(
+        url=url, titulo=titulo, precio=importe, campos=campos, referencias_citadas=citadas
+    )
 
 
 def candidata(

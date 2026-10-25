@@ -62,6 +62,22 @@ def test_claves_desconocidas_se_ignoran_y_las_que_faltan_toman_el_defecto(tmp_pa
         assert a.leer_ajustes() == Ajustes(tope_llamadas_busqueda=3)
 
 
+def test_respetar_robots_guardado_de_antes_se_lee_y_se_descarta(tmp_path: Path) -> None:
+    # ADR-017, enmienda del 2026-10-25: el ajuste ya no existe. La BD de Julio puede tenerlo.
+    ruta = tmp_path / "precia.db"
+    Almacen(ruta).cerrar()
+    con = sqlite3.connect(ruta)
+    con.execute("INSERT INTO ajustes (clave, valor) VALUES ('respetar_robots', 'true')")
+    con.commit()
+    con.close()
+    with Almacen(ruta) as a:
+        leidos = a.leer_ajustes()
+        assert leidos == Ajustes()
+        assert not hasattr(leidos, "respetar_robots")
+        a.guardar_ajustes(leidos)
+        assert a.leer_ajustes() == Ajustes()
+
+
 @pytest.mark.parametrize(
     ("clave", "valor"),
     [
@@ -141,3 +157,9 @@ def test_transporte_http_por_defecto_es_curl(almacen: Almacen) -> None:
 def test_transporte_http_ida_y_vuelta(almacen: Almacen) -> None:
     almacen.guardar_ajustes(Ajustes(transporte_http="urllib"))
     assert almacen.leer_ajustes().transporte_http == "urllib"
+
+
+def test_cortesia_por_defecto_un_segundo() -> None:
+    # B1 (decisión de Julio): 1,0 s por defecto. Siguen la petición única en vuelo por dominio
+    # y el máximo con el Crawl-delay (ADR-017).
+    assert Ajustes().retardo_dominio_s == 1.0

@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from precia.almacen.sqlite import MIGRACIONES, Almacen, ErrorAlmacen
+from precia.nucleo.modelos import Coincidencia
 
 
 def test_aplica_todas_las_migraciones(tmp_path: Path) -> None:
@@ -21,7 +22,7 @@ def test_aplica_todas_las_migraciones(tmp_path: Path) -> None:
     finally:
         con.close()
     esperadas = {"tiendas", "perfiles", "busquedas", "productos", "precios"}
-    esperadas |= {"llamadas_ia", "alertas", "ajustes"}
+    esperadas |= {"llamadas_ia", "alertas", "ajustes", "extracciones_ia"}
     assert esperadas <= tablas
 
 
@@ -157,8 +158,9 @@ def test_la_migracion_4_conserva_perfiles_precios_y_alertas(tmp_path: Path) -> N
         "SELECT * FROM productos ORDER BY id",
     )
     antes = [_volcado(ruta, sql) for sql in consultas]
-    with Almacen(ruta) as almacen:
-        assert almacen.pragma("user_version") == len(MIGRACIONES) >= 4
+    # Solo hasta la 4: la 5 añade columnas y cambiaría el volcado `SELECT *` (tiene su test).
+    with Almacen(ruta, migraciones=MIGRACIONES[:4]) as almacen:
+        assert almacen.pragma("user_version") == 4
         assert [p.version for p in almacen.versiones("a.example")] == [1, 2]
         tienda = almacen.tienda("a.example")
         assert tienda is not None and tienda.entrada is None and tienda.bloqueos == 2
@@ -236,3 +238,107 @@ def test_la_migracion_4_tambien_sirve_en_una_base_nueva(tmp_path: Path) -> None:
     assert _volcado(ruta, "PRAGMA foreign_key_check") == []
     columnas = [f[1] for f in _volcado(ruta, "PRAGMA table_info(tiendas)")]
     assert columnas[-1] == "entrada"
+
+
+# --- Migración 5 (B5): coincidencia de cada oferta y alertas solo de exactas ------------------
+
+
+def test_la_migracion_5_anade_coincidencia_y_solo_exactas(tmp_path: Path) -> None:
+    ruta = tmp_path / "precia.db"
+    Almacen(ruta, migraciones=MIGRACIONES[:4]).cerrar()
+    con = sqlite3.connect(ruta)
+    try:
+        con.execute("INSERT INTO productos (id, nombre) VALUES ('oem-1k0698151', 'Pastillas')")
+        con.execute(
+            "INSERT INTO precios (producto_id, tienda, url, precio, fecha, dia)"
+            " VALUES ('oem-1k0698151', 'a.example', 'https://a.example/p', '42.50',"
+            " '2026-10-06T09:05:00', '2026-10-06')"
+        )
+        con.execute(
+            "INSERT INTO alertas (producto_id, umbral, canal) VALUES ('oem-1k0698151', '40', 'web')"
+        )
+        con.commit()
+    finally:
+        con.close()
+    with Almacen(ruta) as almacen:
+        assert almacen.pragma("user_version") == len(MIGRACIONES)
+        # Antes de B5 solo entraban exactas (o grupos por texto, que no relajan nada).
+        assert almacen.ultimas_ofertas("oem-1k0698151")[0].coincidencia is Coincidencia.EXACTA
+        assert almacen.alertas()[0].solo_exactas is True
+    con = sqlite3.connect(ruta)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute(
+                "INSERT INTO precios (producto_id, tienda, url, precio, fecha, dia, coincidencia)"
+                " VALUES ('oem-1k0698151', 'a.example', 'https://a.example/p', '1',"
+                " '2026-10-07T09:05:00', '2026-10-07', 'otra')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute(
+                "INSERT INTO alertas (producto_id, umbral, canal, solo_exactas)"
+                " VALUES ('oem-1k0698151', '40', 'web', 2)"
+            )
+    finally:
+        con.close()
+
+
+# --- Caché del extractor de IA (A3) -----------------------------------------------------------
+
+
+def test_migra_la_cache_del_extractor_desde_la_version_anterior(tmp_path: Path) -> None:
+    ruta = tmp_path / "precia.db"
+    # La caché es la migración 6: se parte de la 5 (con `[:-1]`, A1 la habría dado ya hecha).
+    with Almacen(ruta, migraciones=MIGRACIONES[:5]) as almacen:
+        almacen.alta_tienda("tienda.example", "Tienda")
+    with Almacen(ruta) as almacen:
+        assert almacen.pragma("user_version") == len(MIGRACIONES)
+        assert [t.dominio for t in almacen.tiendas()] == ["tienda.example"]
+        almacen.guardar_extraccion_ia("0" * 64, ("estado",), "api/m#v1", {})
+        assert almacen.leer_extraccion_ia("0" * 64, ("estado",), "api/m#v1", max_edad_s=60) == {}
+
+
+# --- Hijos del índice sin leer (R2-C14b) ---------------------------------------------------------
+
+
+def test_migra_los_hijos_pendientes_del_catalogo_desde_la_version_anterior(tmp_path: Path) -> None:
+    ruta = tmp_path / "precia.db"
+    # La lista de hijos sin leer es la migración 9: se parte de la 8.
+    with Almacen(ruta, migraciones=MIGRACIONES[:8]) as almacen:
+        almacen.alta_tienda("tienda.example", "Tienda")
+    with Almacen(ruta) as almacen:
+        assert almacen.pragma("user_version") == len(MIGRACIONES) == 12
+        hijo = "https://tienda.example/sitemap-faros.xml"
+        almacen.guardar_catalogo(
+            "tienda.example", "https://tienda.example/s.xml", [], parcial=True, pendientes=[hijo]
+        )
+        assert almacen.hijos_pendientes("tienda.example") == [hijo]
+    estrictas = {f[1]: f[5] for f in _volcado(ruta, "PRAGMA table_list")}
+    assert estrictas["catalogo_pendientes"] == 1
+    (foranea,) = _volcado(ruta, "PRAGMA foreign_key_list(catalogo_pendientes)")
+    assert foranea[2:4] == ("tiendas", "dominio") and foranea[6] == "CASCADE"
+    assert _clave_primaria(ruta, "catalogo_pendientes") == ["dominio", "url"]
+
+
+# --- Prefijo de idioma del catálogo (R5-C) ------------------------------------------------------
+
+
+def test_migra_el_prefijo_de_idioma_del_catalogo_desde_la_version_anterior(tmp_path: Path) -> None:
+    ruta = tmp_path / "precia.db"
+    # El prefijo de idioma es la migración 10: se parte de la 9 con un catálogo guardado, que
+    # queda sin prefijo (como se leía antes).
+    with Almacen(ruta, migraciones=MIGRACIONES[:9]) as almacen:
+        almacen.alta_tienda("tienda.example", "Tienda")
+    con = sqlite3.connect(ruta)
+    try:
+        con.execute(
+            "INSERT INTO catalogos (dominio, sitemap, actualizado, total, parcial)"
+            " VALUES ('tienda.example', 'https://tienda.example/s.xml',"
+            " '2026-10-19T12:00:00+00:00', 0, 0)"
+        )
+        con.commit()
+    finally:
+        con.close()
+    with Almacen(ruta) as almacen:
+        assert almacen.pragma("user_version") == len(MIGRACIONES) == 12
+        info = almacen.catalogo("tienda.example")
+        assert info is not None and info.idioma == ()

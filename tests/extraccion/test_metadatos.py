@@ -1,6 +1,5 @@
 """Producto estructurado desde OpenGraph (`og:*`, `product:*`) y microdatos de schema.org."""
 
-import time
 from decimal import Decimal
 from pathlib import Path
 
@@ -9,6 +8,7 @@ import pytest
 from precia.extraccion.dom import analizar
 from precia.extraccion.metadatos import leer_importe, producto_metadatos
 from precia.extraccion.tipos import Precio, ProductoJSONLD
+from tests.cronometro import segundos_de_cpu
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "extraccion"
 PRESTASHOP = "https://recambios-ejemplo.es"
@@ -295,18 +295,17 @@ def test_anidamiento_hostil_no_rompe_ni_tarda() -> None:
     # Más allá de 512 niveles `dom` cuelga los elementos del último admitido (y su texto, del
     # padre), así que el valor va en un atributo.
     profundo = "<div>" * 10_000 + '<meta itemprop="name" content="Fondo">' + "</div>" * 10_000
-    inicio = time.perf_counter()
     producto = _producto(_microdatos(profundo))
-    assert time.perf_counter() - inicio < 5
     assert producto is not None and producto.nombre == "Fondo"
+    assert segundos_de_cpu(lambda: _producto(_microdatos(profundo)), 5) < 5
 
 
 def test_miles_de_ambitos_no_tardan() -> None:
     ambitos = _microdatos('<span itemprop="name">X</span>', "https://schema.org/Thing") * 20_000
     vacios = _microdatos("<i>sin datos</i>") * 20_000
-    inicio = time.perf_counter()
-    assert _producto(ambitos + vacios) is None
-    assert time.perf_counter() - inicio < 5
+    html = ambitos + vacios
+    assert _producto(html) is None
+    assert segundos_de_cpu(lambda: _producto(html), 5) < 5
 
 
 # --- Revisión: productos que no son el de la ficha ------------------------------------------
@@ -426,3 +425,17 @@ def test_nombre_y_marca_en_un_enlace_son_su_texto_y_no_la_url() -> None:
     producto = _producto(html)
     assert producto is not None
     assert producto.nombre == "Faro Golf VI"
+
+
+@pytest.mark.parametrize("tipo", ["Book", "Audiobook", "VideoGame", "SoftwareApplication"])
+def test_microdatos_de_obras_que_se_venden(tipo: str) -> None:
+    html = _microdatos(
+        '<h1 itemprop="name">Obra</h1>'
+        '<div itemprop="offers" itemscope itemtype="https://schema.org/Offer">'
+        '<span itemprop="price" content="20">20 €</span></div>',
+        f"https://schema.org/{tipo}",
+    )
+    producto = _producto(html)
+    assert producto is not None
+    assert producto.nombre == "Obra"
+    assert producto.precio is not None and producto.precio.importe == 20

@@ -31,10 +31,6 @@ class URLNoPermitida(ErrorNavegador):
     """Esquema, host, puerto o IP no permitidos (defensa SSRF)."""
 
 
-class ProhibidoPorRobots(ErrorNavegador):
-    """El robots.txt del dominio prohíbe la ruta para nuestro User-Agent."""
-
-
 class Bloqueado(ErrorNavegador):
     """La web responde con un CAPTCHA o un bloqueo anti-bot. Nunca se intenta resolver.
 
@@ -44,14 +40,24 @@ class Bloqueado(ErrorNavegador):
     peticiones). Si también se bloquea, la tienda se para.
     """
 
-    def __init__(self, url: str, motivo: str) -> None:
+    def __init__(self, url: str, motivo: str, *, seco: bool = False) -> None:
         super().__init__(f"Bloqueo en {url}: {motivo}")
         self.url = url
         self.motivo = motivo
+        self.seco = seco
+        """Si es un rechazo seco (`bloqueo.es_rechazo_seco`): un 401/403/405/451 pequeño, sin
+        proveedor anti-bot, sin CAPTCHA y sin frase de desafío. El catálogo lo toma por un sitemap
+        que no existe en una ruta que nadie declaró (causa R4-D)."""
 
 
 class ErrorDescarga(ErrorNavegador):
     """Red, tiempo de espera, tamaño excesivo o contenido que no es HTML."""
+
+
+class DemasiadoGrande(ErrorDescarga):
+    """La respuesta pasa del tope de bytes (leídos o descomprimidos) del transporte HTTP. El
+    catálogo lo distingue de los demás fallos: deja de leer un índice cuyos hijos no caben (A5 del
+    plan de velocidad)."""
 
 
 class ConexionCortada(ErrorDescarga):
@@ -65,6 +71,13 @@ class Descargador(Protocol):
     async def descargar(self, url: str) -> Pagina: ...
 
     async def cerrar(self) -> None: ...
+
+
+@runtime_checkable
+class DescargadorConTiempo(Descargador, Protocol):
+    """Un descargador que admite otro tiempo total para una petición (el robots.txt, A7)."""
+
+    async def descargar_con_tiempo(self, url: str, tiempo_s: float) -> Pagina: ...
 
 
 @runtime_checkable

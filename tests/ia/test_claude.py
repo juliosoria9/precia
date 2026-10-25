@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from precia.ia.claude import URL_API, ProveedorClaude
-from precia.ia.salida import RechazoDelModelo, SalidaNoValidaConConsumo
+from precia.ia.salida import RechazoDelModelo, SalidaCortada, SalidaNoValidaConConsumo
 from precia.ia.tipos import ErrorIA, IANoDisponible, PeticionIA, SalidaNoValida
 from precia.ia.transporte import ErrorTransporte
 from tests.ia.falsos import EsperaFalsa, RelojFalso, TransporteFalso, respuesta_json
@@ -154,6 +154,22 @@ def test_max_tokens_es_salida_incompleta() -> None:
     transporte = TransporteFalso([mensaje_ok('{"precio": "38,', stop_reason="max_tokens")])
     with pytest.raises(SalidaNoValida, match="incompleta"):
         completar(proveedor(transporte))
+
+
+def test_max_tokens_es_salida_cortada_con_su_consumo() -> None:
+    """R2-TOK: el servicio distingue el corte por el tope de tokens del JSON mal formado."""
+    transporte = TransporteFalso(
+        [mensaje_ok('{"precio": "38,', stop_reason="max_tokens", salida=512)]
+    )
+    with pytest.raises(SalidaCortada) as error:
+        completar(proveedor(transporte))
+    assert error.value.consumo.tokens_salida == 512
+
+
+def test_json_mal_formado_no_es_salida_cortada() -> None:
+    with pytest.raises(SalidaNoValida) as error:
+        completar(proveedor(TransporteFalso([mensaje_ok('{"precio": 38}')])))
+    assert not isinstance(error.value, SalidaCortada)
 
 
 def test_refusal_no_se_reintenta() -> None:

@@ -31,7 +31,7 @@ from precia.nucleo.modelos import Ajustes, EstadoPerfil
 from precia.nucleo.orquestador import BLOQUEO, ESTRUCTURADOS
 from precia.perfiles.tipos import TIPO_API_WOOCOMMERCE
 from precia.web.app import crear_app
-from tests.asgi import ClienteASGI
+from tests.asgi import ClienteASGI, Respuesta
 from tests.navegador.falsos import validar_con_dns_publico
 from tests.perfiles.plataformas import WOO, WOO_API, WOO_PLANTILLA, WOO_PORTADA, WOO_TITULOS
 from tests.perfiles.plataformas import fixture as fixture_fuentes
@@ -96,9 +96,23 @@ class Montaje:
         assert respuesta.estado == 303, respuesta.texto
 
     def buscar(self, consulta: str) -> str:
-        respuesta = self.web.get(f"/buscar?{consulta}", cabeceras={"HX-Request": "true"})
-        assert respuesta.estado == 200
-        return respuesta.texto
+        return asyncio.run(self._buscar_hasta_el_final(consulta)).texto
+
+    async def _buscar_hasta_el_final(self, consulta: str) -> Respuesta:
+        """C1: lanza la búsqueda (como el formulario, con htmx) y sondea su estado hasta que
+        termina, todo en un bucle: `asyncio.run` cancelaría la búsqueda al salir."""
+        respuesta = await self.web.aget(f"/buscar?{consulta}", {"HX-Request": "true"})
+        assert respuesta.estado == 200, respuesta.texto
+        id_busqueda = respuesta.cabeceras["hx-push-url"].split("?")[0].rsplit("/", 1)[-1]
+        for _ in range(500):
+            if "every 1s" not in respuesta.texto:
+                return respuesta
+            await asyncio.sleep(0.01)
+            respuesta = await self.web.aget(
+                f"/busquedas/{id_busqueda}/estado", {"HX-Request": "true"}
+            )
+            assert respuesta.estado == 200, respuesta.texto
+        raise AssertionError("La búsqueda no ha terminado")
 
     @property
     def peticiones_ia(self) -> list[str]:
@@ -133,6 +147,8 @@ def montar(tmp_path: Path) -> Iterator[Any]:
             crear_descargadores=descargadores,
             validador=validar_con_dns_publico,
             reloj=lambda: AHORA,
+            # La tienda falsa vende faros de Golf: es su consulta de prueba (A1).
+            consultas_configuracion=("faro golf",),
             crear_proveedor=crear_proveedor,
         )
         fuente.guardar_ajustes(replace(fuente.ajustes(), retardo_dominio_s=0.0))
@@ -155,8 +171,9 @@ def test_tienda_woocommerce_se_configura_por_su_api_sin_ia(montar: Any) -> None:
     m.alta(WOO)
     html = m.buscar("texto=faro+golf&modo=auto")
 
-    # Sin una sola llamada a la IA: la tienda tiene API pública y responde con productos.
-    assert m.peticiones_ia == []
+    # La IA no configura nada: la tienda tiene API pública y responde con productos.
+    # Auto revisa además los resultados con la IA (ajuste activado por defecto).
+    assert m.peticiones_ia == ["revision"]
     perfil = m.fuente.almacen.perfil_vigente(WOO)
     assert perfil is not None
     assert (perfil.tipo, perfil.url_busqueda, perfil.revisado) == (
@@ -166,7 +183,8 @@ def test_tienda_woocommerce_se_configura_por_su_api_sin_ia(montar: Any) -> None:
     )
     assert "API pública de WooCommerce" in html and "pendiente de revisión" in html
     assert "Faro delantero izquierdo VW Golf VI" in html and "89,90 €" in html
-    assert WOO_TITULOS[1] in html
+    # Las pastillas no nombran «faro golf» (A2, bug 2).
+    assert WOO_TITULOS[1] not in html
     assert "API tienda" in html  # El origen de cada valor.
     # La portada y la API (una vez al configurar y otra, ya de la caché, al buscar); ni el
     # formulario HTML ni ninguna ficha.
@@ -201,7 +219,8 @@ def test_tienda_nextjs_sin_formulario_y_listado_de_next_data(montar: Any) -> Non
     # 1. Sin <form>: el buscador sale del enlace «Buscar» de la cabecera, probando los
     #    nombres de parámetro habituales hasta dar con el que devuelve un listado.
     html = m.buscar("texto=faro+golf&modo=auto")
-    assert m.peticiones_ia == ["configurador", "configurador"]
+    # Auto revisa además los resultados con la IA (ajuste activado por defecto).
+    assert m.peticiones_ia == ["configurador", "configurador", "revision"]
     perfil = m.fuente.almacen.perfil_vigente(NEXT)
     assert perfil is not None and perfil.url_busqueda == f"{NEXT_BASE}/es/search?query={{consulta}}"
     assert transporte.sin_robots()[:4] == [
@@ -221,8 +240,9 @@ def test_tienda_nextjs_sin_formulario_y_listado_de_next_data(montar: Any) -> Non
     assert ESTRUCTURADOS in html
     for producto in PRODUCTOS:
         assert producto.titulo in html
-    # Ni reparador ni perfil roto: las ofertas salen con precio anclado.
-    assert m.peticiones_ia == ["configurador", "configurador"]
+    # Ni reparador ni perfil roto: las ofertas salen con precio anclado. Solo otra revisión de
+    # los resultados de Auto (la consulta es otra).
+    assert m.peticiones_ia == ["configurador", "configurador", "revision", "revision"]
     vigente = m.fuente.almacen.perfil_vigente(NEXT)
     assert vigente is not None and vigente.version == 1
     tienda = m.fuente.tienda(NEXT)

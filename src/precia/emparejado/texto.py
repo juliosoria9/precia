@@ -22,6 +22,10 @@ _BORDES = " |-·,;:/" + chr(0x2013) + chr(0x2014)  # Rayas: hay tiendas que las 
 
 def normalizar_titulo(texto: str) -> str:
     """Minúsculas, sin acentos ni signos y con los espacios colapsados."""
+    if texto.isascii():
+        # Sin acentos que quitar: el mismo resultado, sin recorrer letra a letra (el catálogo
+        # local normaliza así los tramos de miles de URL en cada búsqueda).
+        return _NO_ALFANUMERICO.sub(" ", texto.lower()).strip()
     descompuesto = unicodedata.normalize("NFKD", texto.lower())
     sin_acentos = "".join(c for c in descompuesto if not unicodedata.combining(c))
     return _NO_ALFANUMERICO.sub(" ", sin_acentos).strip()

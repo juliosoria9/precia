@@ -15,8 +15,9 @@ no puede usar el navegador para un SSRF:
   automático a `dns.google` saltándose el relé y no admite `--force-webrtc-ip-handling-policy`.
   Con `ARGUMENTOS`, WebRTC no manda UDP fuera del proxy y no hay QUIC. Lo comprueba un test con el
   netlog de Chromium (ninguna conexión fuera de 127.0.0.1).
-- `route("**/*")` es la primera criba, por URL: aborta lo que no pasa el validador y las imágenes,
-  fuentes y medios; el resto sigue con `continue_` por la red de Chromium. Los service workers se
+- `route("**/*")` es la primera criba, por URL: aborta lo que no pasa el validador, las imágenes,
+  fuentes y medios, y la analítica de terceros (`HOSTS_ANALITICA`, A9: así la red queda quieta
+  antes); el resto sigue con `continue_` por la red de Chromium. Los service workers se
   bloquean, los WebSocket se cierran sin conectar y cada descarga usa un contexto nuevo (sin
   cookies ni almacenamiento entre páginas).
 - Si el relé rechaza un salto de la navegación (`ERR_SOCKS_CONNECTION_FAILED`), se vuelve a validar
@@ -45,6 +46,7 @@ import re
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from playwright.async_api import (
     Browser,
@@ -66,7 +68,22 @@ from precia.navegador.url import Validador, validar_url
 registro = logging.getLogger(__name__)
 
 RECURSOS_BLOQUEADOS = frozenset({"image", "font", "media"})
-ESPERA_RED_S = 2.0
+ESPERA_RED_S = 1.0
+"""Lo que se espera como mucho a que la red quede quieta tras `domcontentloaded` (A9; antes 2 s).
+Sin la analítica de terceros, que nunca la deja quieta, suele bastar."""
+HOSTS_ANALITICA = (
+    "googletagmanager.com",
+    "google-analytics.com",
+    "analytics.google.com",
+    "doubleclick.net",
+    "facebook.net",
+    "facebook.com",
+    "hotjar.com",
+    "hotjar.io",
+    "clarity.ms",
+)
+"""Analítica y píxeles de terceros (el host o sus subdominios) que se abortan (A9): no pintan el
+producto y mantienen la red ocupada. Genérico, igual para todas las tiendas."""
 ARGUMENTOS = ("--force-webrtc-ip-handling-policy=disable_non_proxied_udp", "--disable-quic")
 """Los dos existen en el headless shell. Nunca `--disable-features`: pisa la lista de Playwright."""
 IDIOMA = "es-ES"
@@ -135,6 +152,9 @@ class FiltroPeticiones:
         if peticion.resource_type in RECURSOS_BLOQUEADOS:
             await ruta.abort("blockedbyclient")
             return
+        if not _es_navegacion_principal(peticion) and _es_analitica(peticion.url):
+            await ruta.abort("blockedbyclient")
+            return
         try:
             await self._validador(peticion.url)
         except URLNoPermitida as error:
@@ -179,6 +199,14 @@ def metadatos_de_chrome(valores: Mapping[str, Any]) -> dict[str, Any]:
 
 def _es_corte(mensaje: str | None) -> bool:
     return mensaje is not None and _CORTE.search(mensaje) is not None
+
+
+def _es_analitica(url: str) -> bool:
+    try:
+        host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    return any(host == h or host.endswith("." + h) for h in HOSTS_ANALITICA)
 
 
 def _es_navegacion_principal(peticion: _Peticion) -> bool:

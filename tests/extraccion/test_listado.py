@@ -13,6 +13,7 @@ from precia.navegador.tipos import Pagina
 from precia.perfiles.tipos import Perfil
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "extraccion"
+REALES = Path(__file__).parent.parent / "fixtures" / "reales"
 URL_BUSQUEDA = "https://www.desguaces-ejemplo.es/buscar?q=faro+golf"
 BASE = "https://www.desguaces-ejemplo.es"
 
@@ -54,6 +55,8 @@ def test_listado_real(pagina: Pagina) -> None:
             "Faro delantero izquierdo Golf VI",
             f"{BASE}/pieza/faro-delantero-izquierdo-golf-vi-77123",
             Precio(Decimal("89.90"), "EUR", "89,90 €"),
+            # La foto de la tarjeta; el logo de la cabecera está fuera de los resultados.
+            f"{BASE}/media/piezas/77123-1.jpg",
         ),
         ResultadoListado(
             "Faro delantero derecho Golf VI & regulador",
@@ -151,3 +154,161 @@ def test_la_consulta_de_la_url_se_codifica() -> None:
     [resultado] = extraer_listado(_pagina(html), perfil)
     assert resultado.url == f"{BASE}/p?ref=faro%20golf&n=%221%22"
     assert not any(c.isspace() or c == '"' for c in resultado.url)
+
+
+@pytest.mark.parametrize("selector", [".price", ".price bdi"])
+def test_oferta_woocommerce_lee_el_precio_vigente(selector: str) -> None:
+    html = (
+        '<li><a href="/p/1">Faro Golf</a><p class="price"><del><bdi>59,90&nbsp;€</bdi></del> '
+        "<ins><bdi>39,90&nbsp;€</bdi></ins></p></li>"
+        '<li><a href="/p/2">Piloto Golf</a><p class="price"><bdi>48,40&nbsp;€</bdi> '
+        "<small>40,00 € sin IVA</small></p></li>"
+    )
+    perfil = replace(
+        PERFIL,
+        sel_resultado="li",
+        sel_titulo="a",
+        sel_enlace="a @href",
+        sel_precio_listado=selector,
+    )
+    resultados = extraer_listado(_pagina(html), perfil)
+    assert [r.precio.importe if r.precio else None for r in resultados] == [
+        Decimal("39.90"),
+        Decimal("48.40"),
+    ]
+
+
+def test_oscaro_real_lee_el_precio_actual() -> None:
+    # Tarjetas reales de Oscaro: «Ancien prix : 17,06 €» va antes que «Prix actuel : 14,50 €»
+    # en `div.price`, y el listado se quedaba con el tachado.
+    url = "https://www.oscaro.es/es/search?q=faro"
+    html = (REALES / "oscaro_busqueda_faro_ofertas.html").read_text(encoding="utf-8")
+    perfil = replace(
+        PERFIL,
+        dominio="oscaro.es",
+        url_busqueda="https://www.oscaro.es/es/search?q={consulta}",
+        sel_resultado="article.productbox",
+        sel_titulo="h2",
+        sel_enlace="a @href",
+        sel_precio_listado="div.price",
+    )
+    resultados = extraer_listado(_pagina(html, url), perfil)
+    assert [r.precio.importe if r.precio else None for r in resultados] == [
+        Decimal("14.50"),
+        Decimal("126.62"),
+        Decimal("47.35"),
+    ]
+    assert resultados[2].url.endswith("-2423844-259-p")
+
+
+def test_mediamarkt_real_lee_el_precio_vigente_y_no_el_pvp_tachado() -> None:
+    # R2-B4: el PVP tachado («39,90 €») va en `data-test="mms-strike-price-type-rrp"`, sin clase
+    # ni id que lo delaten, delante del vigente («29,99 €») en el mismo bloque de precio.
+    url = "https://www.mediamarkt.es/es/search.html?query=filtro"
+    html = (REALES / "mediamarkt_busqueda_filtro_tarjetas.html").read_bytes().decode("utf-8")
+    perfil = replace(
+        PERFIL,
+        dominio="mediamarkt.es",
+        url_busqueda="https://www.mediamarkt.es/es/search.html?query={consulta}",
+        sel_resultado="[data-test=mms-product-card]",
+        sel_titulo="h3",
+        sel_enlace="a[data-test=mms-router-link-product-list-item-link] @href",
+        sel_precio_listado="[data-test=mms-price]",
+    )
+    resultados = extraer_listado(_pagina(html, url), perfil)
+    assert [r.precio.importe if r.precio else None for r in resultados] == [
+        Decimal("29.99"),
+        Decimal("30.99"),
+        Decimal("26.99"),
+    ]
+
+
+# --- R2-C13: la tarjeta es el propio enlace (`<a href>` que envuelve el producto) -------------
+
+PCCOMPONENTES = replace(
+    PERFIL,
+    dominio="pccomponentes.com",
+    url_busqueda="https://www.pccomponentes.com/buscar/?query={consulta}",
+    sel_titulo="h3.product-card__title",
+    sel_precio_listado="[data-e2e=price-card]",
+)
+
+
+@pytest.mark.parametrize(
+    ("sel_resultado", "sel_enlace"),
+    [
+        ("a.wrapper-s5NDOZ", "@href"),
+        ("a.wrapper-s5NDOZ", "a.wrapper-s5NDOZ @href"),
+        ("a.wrapper-s5NDOZ", "a @href"),
+        ("div.product-card", "a @href"),
+        ("div.product-card", "a.wrapper-s5NDOZ @href"),
+    ],
+)
+def test_pccomponentes_real_tarjeta_que_es_el_propio_enlace(
+    sel_resultado: str, sel_enlace: str
+) -> None:
+    # En la rejilla real cada resultado es `<a class="wrapper-…" href>` que envuelve
+    # `div.product-card`: el enlace no es descendiente del resultado, sino el resultado mismo o
+    # su ancestro. El menú tiene otro `<a class="wrapper-s5NDOZ">` fuera de la rejilla.
+    url = "https://www.pccomponentes.com/search/?query=filtro"
+    html = (REALES / "pccomponentes_busqueda_tarjeta_enlace.html").read_bytes().decode("utf-8")
+    perfil = replace(PCCOMPONENTES, sel_resultado=sel_resultado, sel_enlace=sel_enlace)
+    resultados = extraer_listado(_pagina(html, url), perfil)
+    assert [r.url for r in resultados] == [
+        "https://www.pccomponentes.com/aspiradora-sin-cable-dreame-r20-slim-190aw-motor-sin-"
+        "escobillas-autonomia-90min-filtro-multietapa",
+        "https://www.pccomponentes.com/aspiradora-en-seco-y-humedo-dyson-v16-piston-animal-"
+        "submarine-sin-cable-900-w-filtro-hepa-autonomia-70-min",
+        "https://www.pccomponentes.com/aspiradora-sin-cable-rowenta-x-force-flex-9-60-rh2048wo-"
+        "100aw-filtro-lavable-autonomia-45min",
+    ]
+    assert resultados[0].titulo.startswith("Aspiradora sin cable Dreame R20 Slim")
+    assert [r.precio.importe if r.precio else None for r in resultados] == [
+        Decimal("199"),
+        Decimal("809.01"),
+        Decimal("167.92"),
+    ]
+
+
+def _tarjetas(cuerpo: str) -> Pagina:
+    return _pagina(f'<html><body><div id="resultados">{cuerpo}</div></body></html>')
+
+
+def test_el_enlace_que_envuelve_a_varios_resultados_no_se_usa() -> None:
+    # Una envoltura común a toda la rejilla no es el enlace de ningún resultado.
+    pagina = _tarjetas(
+        '<a class="rejilla" href="/ofertas">'
+        '<div class="card"><h3>Faro izquierdo</h3></div>'
+        '<div class="card"><h3>Faro derecho</h3></div>'
+        "</a>"
+    )
+    perfil = replace(PERFIL, sel_resultado="div.card", sel_titulo="h3", sel_enlace="a @href")
+    assert extraer_listado(pagina, perfil) == []
+
+
+def test_si_un_descendiente_encaja_gana_al_enlace_que_envuelve_el_resultado() -> None:
+    pagina = _tarjetas(
+        '<div class="x" data-url="/fuera">'
+        '<div class="card"><h3>Faro izquierdo</h3><span class="x" data-url="/dentro"></span></div>'
+        "</div>"
+    )
+    perfil = replace(PERFIL, sel_resultado="div.card", sel_titulo="h3", sel_enlace=".x @data-url")
+    assert [r.url for r in extraer_listado(pagina, perfil)] == [f"{BASE}/dentro"]
+
+
+def test_el_enlace_lejano_no_se_toma_por_el_del_resultado() -> None:
+    # Solo cuentan el propio resultado y sus ancestros cercanos, no un `<a>` cualquiera de
+    # más arriba (aquí, cinco niveles por encima y con un solo resultado dentro).
+    pagina = _tarjetas(
+        '<a href="/lejos"><div><div><div><div><div class="card"><h3>Faro</h3></div>'
+        "</div></div></div></div></a>"
+    )
+    perfil = replace(PERFIL, sel_resultado="div.card", sel_titulo="h3", sel_enlace="a @href")
+    assert extraer_listado(pagina, perfil) == []
+
+
+def test_el_titulo_no_se_busca_fuera_del_resultado() -> None:
+    # El respaldo es solo para sel_enlace: el título sigue siendo relativo al resultado.
+    pagina = _tarjetas('<a href="/p1" title="Faro"><div class="card"><span>x</span></div></a>')
+    perfil = replace(PERFIL, sel_resultado="div.card", sel_titulo="a @title", sel_enlace="a @href")
+    assert extraer_listado(pagina, perfil) == []

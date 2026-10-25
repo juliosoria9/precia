@@ -1,6 +1,7 @@
 """Resultados de búsqueda desde datos estructurados: JSON-LD `ItemList` y JSON embebido."""
 
 import json
+import math
 import time
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -18,6 +19,7 @@ from precia.extraccion.embebidos import (
 )
 from precia.extraccion.tipos import Precio, ResultadoListado
 from precia.navegador.tipos import Pagina
+from tests.cronometro import proporcion_de_cpu, segundos_de_cpu
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "extraccion"
 TIENDA = "https://tienda.es"
@@ -49,6 +51,10 @@ def _estado(dato: Any, variable: str = "__INITIAL_STATE__") -> str:
 
 def _listado(html: str, dominio: str = "tienda.es", **opciones: int) -> list[ResultadoListado]:
     return listado_estructurado(_pagina(html), dominio, **opciones)
+
+
+def _sin_resultados(html: str) -> None:
+    assert _listado(html) == []
 
 
 def _productos(*productos: dict[str, Any]) -> str:
@@ -319,9 +325,8 @@ def test_json_gigante_se_ignora_sin_tardar() -> None:
     relleno = [{"name": "Relleno", "sku": "x" * 90}] * 200_000  # unos 20 MB
     texto = json.dumps({"products": [{"name": "Faro", "url": "/p/faro", "price": 3}, *relleno]})
     assert len(texto) > 20_000_000
-    inicio = time.perf_counter()
-    assert _listado(f'<script id="__NEXT_DATA__" type="application/json">{texto}</script>') == []
-    assert time.perf_counter() - inicio < 10
+    html = f'<script id="__NEXT_DATA__" type="application/json">{texto}</script>'
+    assert segundos_de_cpu(lambda: _sin_resultados(html), 10) < 10
 
 
 def test_json_justo_por_encima_del_limite_se_ignora() -> None:
@@ -334,10 +339,12 @@ def test_json_justo_por_encima_del_limite_se_ignora() -> None:
 def test_anidamiento_de_diez_mil_niveles() -> None:
     profundo = '{"a":' * 10_000 + "1" + "}" * 10_000
     estado = "[" * 10_000 + "]" * 10_000
-    inicio = time.perf_counter()
-    assert _listado(f'<script type="application/json">{profundo}</script>') == []
-    assert _listado(f"<script>window.__INITIAL_STATE__ = {estado};</script>") == []
-    assert time.perf_counter() - inicio < 5
+
+    def comprobar() -> None:
+        _sin_resultados(f'<script type="application/json">{profundo}</script>')
+        _sin_resultados(f"<script>window.__INITIAL_STATE__ = {estado};</script>")
+
+    assert segundos_de_cpu(comprobar, 5) < 5
 
 
 def _anidado(niveles: int) -> dict[str, Any]:
@@ -356,9 +363,7 @@ def test_profundidad_maxima() -> None:
 def test_numero_de_nodos_limitado() -> None:
     relleno = [{"a": 1}] * 60_000
     html = _json({"relleno": relleno, "products": [{"name": "Faro", "url": "/p/f", "price": 1}]})
-    inicio = time.perf_counter()
-    assert _listado(html) == []
-    assert time.perf_counter() - inicio < 5
+    assert segundos_de_cpu(lambda: _sin_resultados(html), 5) < 5
 
 
 def test_entero_de_miles_de_cifras_no_rompe() -> None:
@@ -370,17 +375,13 @@ def test_entero_de_miles_de_cifras_no_rompe() -> None:
 def test_marcadores_repetidos_no_son_cuadraticos() -> None:
     hostil = "<script>" + "window.__INITIAL_STATE__ " * 200_000 + "</script>"
     hostil += "<script>" + "__PRELOADED_STATE__=" * 200_000 + "</script>"
-    inicio = time.perf_counter()
-    assert _listado(hostil) == []
-    assert time.perf_counter() - inicio < 5
+    assert segundos_de_cpu(lambda: _sin_resultados(hostil), 5) < 5
 
 
 def test_muchos_scripts_json() -> None:
     html = '<script type="application/json">{"a": 1}</script>' * 5_000
     html += _productos({"name": "Tarde", "url": "/p/t", "price": 1})
-    inicio = time.perf_counter()
-    assert _listado(html) == []
-    assert time.perf_counter() - inicio < 5
+    assert segundos_de_cpu(lambda: _sin_resultados(html), 5) < 5
 
 
 # --- Revisión: contenedores, otras webs y unidades menores ------------------------------------
@@ -482,27 +483,55 @@ def test_un_menu_largo_sin_precios_no_agota_los_candidatos() -> None:
     ],
 )
 def test_miles_de_objetos_que_no_son_fichas_no_tardan(objeto: dict[str, str]) -> None:
-    objetos = json.dumps([objeto] * 25_000)
-    html = "".join(f'<script type="application/json">{objetos}</script>' for _ in range(5))
-    inicio = time.perf_counter()
-    assert _listado(html) == []
-    assert time.perf_counter() - inicio < 0.8
+    def scripts(dato: dict[str, str]) -> str:
+        objetos = json.dumps([dato] * 25_000)
+        return "".join(f'<script type="application/json">{objetos}</script>' for _ in range(5))
+
+    # La referencia: los mismos valores con claves que no son ni título ni enlace, que se
+    # descartan con la primera comprobación. El tope fijo de 0,8 s de CPU no era estable: el
+    # mismo caso costaba 0,23 s solo y 0,64 en la suite completa (bug 6). Medido: de 0,9 a 1,7
+    # veces la referencia; analizando el título (con su HTML) antes de mirar el enlace, de 3,8
+    # a 9,3.
+    html = scripts(objeto)
+    neutro = scripts({f"x{n}": valor for n, valor in enumerate(objeto.values())})
+    _sin_resultados(html)
+    proporcion = proporcion_de_cpu(
+        lambda: _sin_resultados(html), lambda: _sin_resultados(neutro), 2.5
+    )
+    assert proporcion < 2.5
+
+
+def _cpu(html: str) -> float:
+    inicio = time.process_time()
+    _sin_resultados(html)
+    return time.process_time() - inicio
 
 
 @pytest.mark.parametrize("formato", ["itemlist", "embebido"])
 def test_miles_de_enlaces_validos_con_titulo_vacio_no_tardan(formato: str) -> None:
     # Cada uno pasa los filtros baratos y obliga a normalizar la URL y a analizar el título;
     # sin un cupo total de objetos evaluados, unos MB de esto tardaban varios segundos.
+    # Se compara el tiempo entre tamaños y no contra un tope fijo, que fallaba en la suite
+    # completa con la CPU más lenta o más cargada (bug 6). Con 4 veces más objetos, por debajo
+    # del cupo el tiempo crece lineal (unas 4 veces; un coste cuadrático, más de 8) y por
+    # encima casi no crece (unas 1,2 veces; sin cupo, 4).
     elemento = {"name": "<b></b>", "url": "/p/faro"}
     if formato == "itemlist":
-        dato: Any = [{"@type": "ItemList", "itemListElement": [elemento] * 200}] * 300
-        tipo = "application/ld+json"
+        lista = {"@type": "ItemList", "itemListElement": [elemento] * 200}
+        script = _json([lista] * 20, "application/ld+json")
     else:
-        dato, tipo = [elemento] * 25_000, "application/json"
-    html = _json(dato, tipo) * 2
-    inicio = time.perf_counter()
-    assert _listado(html) == []
-    assert time.perf_counter() - inicio < 1
+        script = _json([elemento] * 4_000)
+    assert 4 * 4_000 < MAX_EVALUADOS < 16 * 4_000
+    pequena, media, grande = (script * scripts for scripts in (1, 4, 16))
+    t_pequena = t_media = t_grande = math.inf
+    for _ in range(3):  # El mejor de hasta 3 intentos; para en cuanto cumple.
+        t_pequena = min(t_pequena, _cpu(pequena))
+        t_media = min(t_media, _cpu(media))
+        t_grande = min(t_grande, _cpu(grande))
+        if t_media < 6.5 * t_pequena and t_grande < 2 * t_media:
+            break
+    assert t_media < 6.5 * t_pequena
+    assert t_grande < 2 * t_media
 
 
 def test_un_selector_de_vehiculos_enorme_no_agota_el_cupo() -> None:

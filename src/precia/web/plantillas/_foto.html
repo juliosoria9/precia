@@ -1,0 +1,8 @@
+{#- Foto principal de un artículo: se enlaza desde la tienda (nunca se descarga), sin JS y sin
+    referrer. `foto_segura` es la última barrera; sin foto queda un hueco del mismo tamaño. -#}
+{%- macro foto(url, titulo, clase="foto-miniatura", lado=64) -%}
+  {%- set u = url | foto_segura -%}
+  {%- if u -%}<img class="{{ clase }}" src="{{ u }}" alt="{{ titulo | truncate(120) }}" width="{{ lado }}" height="{{ lado }}" loading="lazy" decoding="async" fetchpriority="low" referrerpolicy="no-referrer">
+  {%- else -%}<span class="{{ clase }} foto-vacia" aria-hidden="true"></span>
+  {%- endif -%}
+{%- endmacro -%}

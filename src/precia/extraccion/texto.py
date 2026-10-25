@@ -21,10 +21,31 @@ Si la página entera no cabe en el tope, antes de cortar se hace sitio:
    completa hasta `MAX_EJEMPLOS_LISTADO` y su contenedor, con la cadena de sus antepasados, tiene
    el sitio reservado: lo que se recorta es el resto de la página, sin romper el anidamiento
    (lo que se abre se cierra) y sin cambiar el orden del documento.
+3. **Prioridad del producto** (con `listado=False`, para una ficha). Se reserva igual el sitio
+   del bloque del producto principal: desde un `<h1>` visible se sube por los antepasados hasta
+   el primero con precio (clase o `itemprop` de precio, o cifras con moneda), sin pasar de
+   `MAX_REGION_FICHA` del tope. Si el siguiente antepasado ya no cabe, el precio puede ir en un
+   bloque hermano (el título en uno y la compra en otro de la misma columna): entonces se
+   reserva también, como segunda región, el bloque con precio más cercano dentro de ese
+   antepasado (bajando por él hasta uno que quepa en lo que queda del sitio), salvo que sea una
+   serie de ofertas (`MIN_RESULTADOS` o más hijos con precio y enlaces distintos: un carrusel
+   de relacionados). Los `<h1>` se prueban en el orden del documento, pero antes los afines al
+   `<title>` de la página (que comparten con él al menos un tercio de las palabras que comparte
+   el que más): las ventanas emergentes también traen su `<h1>` («Precios»). Los que tienen el
+   mismo texto (el primero puede ser el duplicado de la cabecera para móvil) van juntos: cuenta
+   el primero que llega a un precio subiendo y, si ninguno llega, el primero con un bloque de
+   precio cercano; si nada de eso, el bloque del primero. No se prioriza todo lo que tiene
+   precio: los productos relacionados y los carruseles también lo tienen, y no deben quitarle
+   sitio al producto principal.
 
 En una búsqueda real (desguacesdli.com) la cabecera, los menús y ~1200 filtros llenaban el tope
-antes de llegar a los productos, y la IA se inventaba los selectores. Para una ficha se usa
-`listado=False`: los productos relacionados no deben quitarle sitio al producto principal.
+antes de llegar a los productos, y la IA se inventaba los selectores. En fichas reales
+(todostuslibros.com, footlocker.es) la geolocalización y un megamenú en un `div` pasaban de
+30 000 caracteres: el `<h1>` y el precio quedaban detrás del corte y la IA proponía selectores
+de campos sin haberlos visto. En amazon.es el `<h1>` y el precio van en bloques hermanos de una
+columna de 80 000 caracteres y ganaba el `<h1>` de la vista rápida, con su «Precio» sin cifra.
+No se quitan `header`, `nav` ni `footer` por etiqueta: el
+megamenú no siempre va en ellos y la miga de pan (la categoría) suele ir en un `nav`.
 """
 
 import math
@@ -48,6 +69,12 @@ PROFUNDIDAD_FORMA = 3
 """Niveles de hijos que cuentan para reconocer los resultados de un listado como una serie."""
 MIN_AHORRO_SERIE = 0.1
 """Fracción del tope que tiene que ahorrar una serie para que se comprima."""
+MAX_REGION_FICHA = 0.6
+"""Fracción del tope que puede ocupar el bloque del producto de una ficha (sitio reservado)."""
+MAX_TEXTO_H1 = 300
+"""Caracteres del texto de un `<h1>` que cuentan para compararlo con el `<title>`."""
+MAX_NODOS_H1 = 20
+"""Nodos que se miran dentro de un `<h1>` para leer su texto (con `<h1>` anidados, lineal)."""
 _ATRIBUTOS_UTILES = frozenset(
     {"id", "class", "href", "src", "alt", "itemprop", "itemtype", "content", "action", "method"}
     | {"name", "type"}
@@ -58,6 +85,7 @@ _ESPACIOS = re.compile(r"\s+")
 _CIFRA = re.compile(r"\d")
 _MONEDA = re.compile(r"[€$£]|\b(?:EUR|USD|GBP)\b")
 _ENLACES_INUTILES = ("#", "?", "javascript:", "mailto:", "tel:")
+_PALABRA = re.compile(r"\w{3,}")
 
 
 def texto_visible(html: str) -> str:
@@ -69,8 +97,9 @@ def texto_visible(html: str) -> str:
 def resumen_para_ia(html: str, max_caracteres: int = 30_000, *, listado: bool = True) -> str:
     """HTML simplificado de `html`, de `max_caracteres` como mucho.
 
-    Si no cabe entero se comprimen las series repetidas y, con `listado`, se reserva el sitio
-    del listado de resultados (ver el docstring del módulo); lo que aún sobre se corta.
+    Si no cabe entero se comprimen las series repetidas y se reserva el sitio del listado de
+    resultados o, sin `listado`, el del producto principal (ver el docstring del módulo); lo
+    que aún sobre se corta.
     """
     raiz = analizar(html)
     entero = _serializar(raiz, _Plan(), max_caracteres)
@@ -85,7 +114,7 @@ def resumen_para_ia(html: str, max_caracteres: int = 30_000, *, listado: bool = 
 class _Parte:
     texto: str
     prioritaria: bool = False
-    """Del listado o de la cadena de sus antepasados: tiene el sitio reservado."""
+    """De la región (listado o producto) o de sus antepasados: tiene el sitio reservado."""
     cierre: int = 0
     """En una apertura, lo que ocupa su cierre (se reserva al abrir)."""
     apertura: int = -1
@@ -98,7 +127,7 @@ class _Cierre:
     prioritaria: bool
     apertura: int
     region: bool
-    """Cierra el contenedor del listado."""
+    """Cierra la región (el contenedor del listado o el bloque del producto)."""
 
 
 @dataclass(slots=True)
@@ -108,9 +137,11 @@ class _Plan:
     marcadores: dict[int, int] = field(default_factory=dict)
     """`id` del primer omitido de una serie → cuántos se omiten (el marcador va en su lugar)."""
     region: Nodo | None = None
-    """Contenedor del listado."""
+    """Contenedor del listado o, en una ficha, bloque del producto principal."""
+    precio: Nodo | None = None
+    """En una ficha, bloque con el precio cuando va fuera de `region` (segunda región)."""
     camino: set[int] = field(default_factory=set)
-    """`id` de los antepasados de `region`."""
+    """`id` de los antepasados de `region` y de `precio`."""
 
 
 def _serializar(raiz: Nodo, plan: _Plan, maximo: int | None) -> list[_Parte] | None:
@@ -136,7 +167,7 @@ def _serializar(raiz: Nodo, plan: _Plan, maximo: int | None) -> list[_Parte] | N
             pila.extend(reversed(actual.contenido))
             continue
         else:
-            es_region = actual is plan.region
+            es_region = actual is plan.region or actual is plan.precio
             parte = _Parte(_apertura(actual), dentro or es_region or id(actual) in plan.camino)
             if actual.etiqueta not in VACIOS:
                 parte.cierre = len(actual.etiqueta) + 3
@@ -213,10 +244,13 @@ class _Rasgos:
     moneda: bool
     texto: int
     """Caracteres de texto visible (aproximado)."""
+    ofertas: bool
+    """Serie de ofertas: `MIN_RESULTADOS` hijos o más con precio y enlaces distintos (un carrusel
+    o un listado), o un solo hijo con precio que lo es."""
 
 
 def _planificar(raiz: Nodo, maximo: int, *, listado: bool) -> _Plan:
-    """Qué series se comprimen y, con `listado`, qué contenedor tiene el sitio reservado."""
+    """Qué series se comprimen y qué región (listado o producto) tiene el sitio reservado."""
     visibles = _visibles(raiz)
     rasgos = _rasgos(visibles)
     # Para reconocer el listado basta la forma de unos pocos niveles (los resultados pueden
@@ -246,11 +280,13 @@ def _planificar(raiz: Nodo, maximo: int, *, listado: bool) -> _Plan:
             plan.region, grupo = series[mejor]
             del_listado = {id(n) for n in grupo}
             candidatas.append((grupo, MAX_EJEMPLOS_LISTADO))
-            # El contenedor y sus antepasados nunca se omiten, aunque sean de una serie.
-            antepasado: Nodo | None = plan.region
-            while antepasado is not None:
-                plan.camino.add(id(antepasado))
-                antepasado = antepasado.padre
+    else:
+        plan.region, plan.precio = _producto(visibles, rasgos, maximo)
+    # Las regiones y sus antepasados nunca se omiten, aunque sean de una serie.
+    for antepasado in (plan.region, plan.precio):
+        while antepasado is not None:
+            plan.camino.add(id(antepasado))
+            antepasado = antepasado.padre
     candidatas.extend(
         (g, MAX_EJEMPLOS_SERIE) for g in repetidos if not del_listado.intersection(map(id, g))
     )
@@ -272,6 +308,161 @@ def _planificar(raiz: Nodo, maximo: int, *, listado: bool) -> _Plan:
         plan.marcadores[id(omitidos[0])] = len(omitidos)
         total -= ahorro
     return plan
+
+
+def _producto(
+    visibles: list[Nodo], rasgos: dict[int, _Rasgos], maximo: int
+) -> tuple[Nodo | None, Nodo | None]:
+    """Bloque del producto principal de una ficha y, si el precio va fuera, el bloque del precio.
+
+    `(None, None)` si no tiene ningún `<h1>` visible. Los `<h1>` se prueban en el orden del
+    documento, pero antes los afines al `<title>` (`_afines`), y los que tienen el mismo texto
+    (el duplicado de la cabecera para móvil) juntos. De cada uno se sube hasta el primer
+    antepasado con precio sin pasar de `MAX_REGION_FICHA` del tope (`_subir`): de un grupo de
+    iguales gana el primero que llega así; si ninguno llega, el primero que encuentra un bloque
+    con precio cercano (`_precio_cercano`) en el antepasado que ya no cabía. Si ningún grupo da
+    nada, el bloque más grande del primer `<h1>`. Una subida que pisa la de otro `<h1>`, o una
+    búsqueda en un antepasado ya mirado, no se repite (lineal).
+    """
+    tope = MAX_REGION_FICHA * maximo
+    h1s = [n for n in visibles if n.etiqueta == "h1" and rasgos[id(n)].tamano <= tope]
+    grupos: dict[str, list[Nodo]] = {}
+    for h1, texto in _afines(h1s, _palabras_del_titulo(visibles)):
+        grupos.setdefault(texto, []).append(h1)
+    vistos: set[int] = set()
+    mirados: set[int] = set()
+    primero: Nodo | None = None
+    for grupo in grupos.values():
+        sin_precio: list[tuple[Nodo, Nodo]] = []
+        for h1 in grupo:
+            if id(h1) in vistos:
+                continue
+            bloque, grande = _subir(h1, rasgos, tope, vistos)
+            if rasgos[id(bloque)].precio:
+                return bloque, None
+            primero = primero or bloque
+            if grande is not None:
+                sin_precio.append((bloque, grande))
+        for bloque, grande in sin_precio:
+            if id(grande) not in mirados:
+                mirados.add(id(grande))
+                cupo = tope - rasgos[id(bloque)].tamano
+                if (precio := _precio_cercano(grande, bloque, rasgos, cupo, mirados)) is not None:
+                    return bloque, precio
+    return primero, None
+
+
+def _afines(h1s: list[Nodo], titulo: set[str]) -> list[tuple[Nodo, str]]:
+    """Los `<h1>` con su texto (`_texto_h1`), antes los afines al `<title>` y, dentro de cada
+    parte, en el orden del documento.
+
+    Un `<h1>` es afín si comparte con el `<title>` al menos un tercio de las palabras que
+    comparte el que más (y alguna): las ventanas emergentes («Precios») no comparten ninguna, y
+    un `<h1>` con el nombre de la tienda suele compartir muchas menos que el del producto. No se
+    ordena por parecido: el `<h1>` del producto puede tener menos palabras del `<title>` que una
+    vista rápida que lo repite entero («Resumen del producto: …»), y un `<h1>` corto con el
+    nombre de la tienda las tiene todas en él; el del producto suele ir antes que los dos.
+    """
+    textos = [(h1, _texto_h1(h1)) for h1 in h1s]
+    comunes = [len(titulo.intersection(_PALABRA.findall(t))) for _, t in textos]
+    umbral = max(1, math.ceil(max(comunes, default=0) / 3))
+    return [h for h, c in zip(textos, comunes, strict=True) if c >= umbral] + [
+        h for h, c in zip(textos, comunes, strict=True) if c < umbral
+    ]
+
+
+def _subir(
+    h1: Nodo, rasgos: dict[int, _Rasgos], tope: float, vistos: set[int]
+) -> tuple[Nodo, Nodo | None]:
+    """Desde `h1`, el primer antepasado con precio que no pasa de `tope` (o el más alto al que se
+    llega sin él) y, si se para porque el siguiente pasa de `tope`, ese siguiente.
+
+    Cada elemento por el que pasa se apunta en `vistos`, y no se sube por uno ya visto.
+    """
+    bloque = h1
+    vistos.add(id(bloque))
+    while not rasgos[id(bloque)].precio:
+        padre = bloque.padre
+        if (
+            padre is None
+            or padre.padre is None
+            or padre.etiqueta in _TRANSPARENTES
+            or id(padre) in vistos
+        ):
+            break
+        if rasgos[id(padre)].tamano > tope:
+            return bloque, padre
+        bloque = padre
+        vistos.add(id(bloque))
+    return bloque, None
+
+
+def _precio_cercano(
+    padre: Nodo, bloque: Nodo, rasgos: dict[int, _Rasgos], cupo: float, mirados: set[int]
+) -> Nodo | None:
+    """El hijo de `padre` con precio más cercano a `bloque` (a igual distancia, el de detrás)
+    o, si no cabe en `cupo`, su primer descendiente con precio que quepa; `None` si no hay.
+
+    Las series de ofertas (relacionados, carruseles) no cuentan: cuando el producto no muestra
+    precio («a consultar») no se les reserva el sitio. Al bajar se apunta cada elemento en
+    `mirados`: por uno ya mirado no se vuelve a bajar.
+    """
+    hermanos = [h for h in padre.hijos if id(h) in rasgos]
+    posicion = next(i for i, h in enumerate(hermanos) if h is bloque)
+    cercanos = [
+        (abs(i - posicion) * 2 + (i < posicion), h)
+        for i, h in enumerate(hermanos)
+        if h is not bloque and _con_precio(h, rasgos)
+    ]
+    if not cercanos:
+        return None
+    nodo = min(cercanos, key=lambda c: c[0])[1]
+    while rasgos[id(nodo)].tamano > cupo:
+        if id(nodo) in mirados:
+            return None
+        mirados.add(id(nodo))
+        hijo = next((h for h in nodo.hijos if id(h) in rasgos and _con_precio(h, rasgos)), None)
+        if hijo is None:
+            return None
+        nodo = hijo
+    return nodo
+
+
+def _con_precio(nodo: Nodo, rasgos: dict[int, _Rasgos]) -> bool:
+    """Tiene precio y no es una serie de ofertas."""
+    r = rasgos[id(nodo)]
+    return r.precio and not r.ofertas
+
+
+def _palabras_del_titulo(visibles: list[Nodo]) -> set[str]:
+    """Palabras (de 3 letras o más, en minúsculas) del primer `<title>` de la página."""
+    titulo = next((n for n in visibles if n.etiqueta == "title"), None)
+    if titulo is None:
+        return set()
+    texto = " ".join(t for t in titulo.contenido if isinstance(t, str))
+    return set(_PALABRA.findall(texto.lower()))
+
+
+def _texto_h1(h1: Nodo) -> str:
+    """Los primeros `MAX_TEXTO_H1` caracteres del texto de `h1`, en minúsculas y con los espacios
+    normalizados, sin mirar más de `MAX_NODOS_H1` nodos: con `<h1>` anidados, leer cada uno
+    entero sería cuadrático."""
+    trozos: list[str] = []
+    longitud = nodos = 0
+    pila = [iter(h1.contenido)]
+    while pila and longitud < MAX_TEXTO_H1 and nodos < MAX_NODOS_H1:
+        actual = next(pila[-1], None)
+        if actual is None:
+            pila.pop()
+            continue
+        nodos += 1
+        if isinstance(actual, str):
+            trozo = _ESPACIOS.sub(" ", actual[: 4 * MAX_TEXTO_H1]).strip()
+            trozos.append(trozo)
+            longitud += len(trozo)
+        elif not _omitir(actual):
+            pila.append(iter(actual.contenido))
+    return " ".join(t for t in trozos if t)[:MAX_TEXTO_H1].lower()
 
 
 def _puntuacion(grupo: list[Nodo], rasgos: dict[int, _Rasgos]) -> float:
@@ -334,6 +525,9 @@ def _rasgos(visibles: list[Nodo]) -> dict[int, _Rasgos]:
                 tamano += len(_texto(trozo))
                 cifra = cifra or _CIFRA.search(trozo) is not None
                 moneda = moneda or _MONEDA.search(trozo) is not None
+        con_precio = [r for r in hijos if r.precio]
+        enlaces = {r.enlace for r in con_precio if r.enlace is not None}
+        ofertas = len(enlaces) >= MIN_RESULTADOS or (len(con_precio) == 1 and con_precio[0].ofertas)
         hoja = formas.setdefault((etiqueta,), len(formas))
         if hijos:
             niveles = [hoja]
@@ -359,6 +553,7 @@ def _rasgos(visibles: list[Nodo]) -> dict[int, _Rasgos]:
             cifra,
             moneda,
             texto,
+            ofertas,
         )
     return rasgos
 

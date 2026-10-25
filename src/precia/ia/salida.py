@@ -54,6 +54,14 @@ class SalidaNoValidaConConsumo(SalidaNoValida):
         self.consumo = consumo
 
 
+class SalidaCortada(SalidaNoValidaConConsumo):
+    """La salida se cortó en el tope de tokens (`max_tokens` en Claude, `length` en Ollama).
+
+    Repetir la misma petición la volvería a cortar (R2-TOK): `SesionIA` la repite una vez con el
+    doble de tokens.
+    """
+
+
 class RechazoDelModelo(ErrorIA):
     """El modelo se niega a responder (`refusal`). No se reintenta; lleva su consumo."""
 

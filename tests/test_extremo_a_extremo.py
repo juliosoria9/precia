@@ -16,6 +16,7 @@ No se usa un servidor en 127.0.0.1 porque el validador y el listado solo admiten
 import asyncio
 import io
 import re
+import sqlite3
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -30,7 +31,7 @@ from precia.navegador.http import DescargadorHTTP, RespuestaCruda
 from precia.navegador.tipos import Descargador
 from precia.nucleo.config import Config
 from precia.nucleo.fuente_real import FuenteReal
-from precia.nucleo.modelos import Ajustes, EstadoPerfil
+from precia.nucleo.modelos import Ajustes, ConsultaBusqueda, EstadoPerfil, Modo
 from precia.web.app import crear_app
 from tests.asgi import ClienteASGI, Respuesta
 from tests.navegador.falsos import validar_con_dns_publico
@@ -104,9 +105,23 @@ class Montaje:
     proveedor: ProveedorSimulado | None
 
     def buscar(self, consulta: str = "texto=faro+golf&modo=clasico") -> Respuesta:
-        respuesta = self.web.get(f"/buscar?{consulta}", cabeceras={"HX-Request": "true"})
-        assert respuesta.estado == 200
-        return respuesta
+        return asyncio.run(self._buscar_hasta_el_final(consulta))
+
+    async def _buscar_hasta_el_final(self, consulta: str) -> Respuesta:
+        """C1: lanza la búsqueda (como el formulario, con htmx) y sondea su estado hasta que
+        termina, todo en un bucle: `asyncio.run` cancelaría la búsqueda al salir."""
+        respuesta = await self.web.aget(f"/buscar?{consulta}", {"HX-Request": "true"})
+        assert respuesta.estado == 200, respuesta.texto
+        id_busqueda = respuesta.cabeceras["hx-push-url"].split("?")[0].rsplit("/", 1)[-1]
+        for _ in range(500):
+            if "every 1s" not in respuesta.texto:
+                return respuesta
+            await asyncio.sleep(0.01)
+            respuesta = await self.web.aget(
+                f"/busquedas/{id_busqueda}/estado", {"HX-Request": "true"}
+            )
+            assert respuesta.estado == 200, respuesta.texto
+        raise AssertionError("La búsqueda no ha terminado")
 
     def alta(self) -> None:
         respuesta = self.web.post(
@@ -156,6 +171,8 @@ def montar(tmp_path: Path) -> Iterator[Any]:
             crear_descargadores=descargadores,
             validador=validar_con_dns_publico,
             reloj=lambda: AHORA,
+            # La tienda falsa vende faros de Golf: es su consulta de prueba (A1).
+            consultas_configuracion=("faro golf",),
             **opciones,
         )
         # Sin esperas de cortesía en el test (en la web el mínimo es 1 s).
@@ -220,12 +237,69 @@ def test_la_segunda_busqueda_sale_de_la_cache(montar: Any) -> None:
     assert "(caché)" in html
 
 
+def test_la_segunda_busqueda_no_vuelve_a_llamar_al_extractor(montar: Any) -> None:
+    # A3, con FuenteReal de verdad (que da al orquestador el TTL de la caché de páginas). Como
+    # en Oscaro: la IA solo busca «estado» y no lo encuentra. 1.ª búsqueda: 1 llamada (antes,
+    # una por ficha); 2.ª, con las páginas y el extractor en caché: ninguna (antes, otras 4).
+    m = montar(
+        TransporteTienda(paginas_sitio(jsonld=())),
+        guion={
+            "extractor": [{"estado": None} for _ in PRODUCTOS],
+            # La revisión de los resultados de Auto: todo es lo buscado.
+            "revision": [
+                {
+                    "clasificaciones": [
+                        {"indice": i, "clase": "misma_pieza", "motivo": ""}
+                        for i in range(len(PRODUCTOS))
+                    ]
+                }
+            ],
+        },
+    )
+    m.alta()
+    sin_estado = {k: v for k, v in CAMPOS_OK.items() if k != "estado"}
+    m.fuente.almacen.guardar_perfil(perfil(sel_campos=sin_estado))
+    consulta = ConsultaBusqueda("faro golf", campos=("precio", "estado"), modo=Modo.AUTO)
+    primera = asyncio.run(m.fuente.buscar(consulta))
+    # Auto revisa además los resultados con la IA (ajuste activado por defecto).
+    assert m.peticiones_ia == ["extractor", "revision"]
+    assert len([o for g in primera.grupos for o in g.ofertas]) == len(PRODUCTOS)
+    pedidas = len(m.transporte.pedidas)
+    segunda = asyncio.run(m.fuente.buscar(consulta))
+    assert len(m.transporte.pedidas) == pedidas
+    # La segunda búsqueda igual tampoco revisa con la IA: sale de la caché de revisiones.
+    assert m.peticiones_ia == ["extractor", "revision"]
+    assert (segunda.llamadas_ia, segunda.ia_desde_cache) == (0, 1)
+
+
+def test_repetir_la_busqueda_no_duplica_el_historico(montar: Any, tmp_path: Path) -> None:
+    # La 2.ª búsqueda sale de la caché de páginas: sus ofertas son las mismas y con la misma
+    # fecha de obtención, así que no añaden filas (antes pasaban de 4 a 8).
+    m = montar()
+    m.alta()
+    m.fuente.almacen.guardar_perfil(perfil())
+
+    def filas() -> int:
+        con = sqlite3.connect(tmp_path / "datos" / "precia.sqlite3")
+        try:
+            return int(con.execute("SELECT count(*) FROM precios").fetchone()[0])
+        finally:
+            con.close()
+
+    m.buscar()
+    antes = filas()
+    assert antes == len(PRODUCTOS)
+    m.buscar()
+    assert filas() == antes
+
+
 def test_auto_sin_perfil_lo_configura_pendiente_de_revision(montar: Any) -> None:
     m = montar(guion={"configurador": [LISTADO_OK, CAMPOS_OK]})
     m.alta()
     html = m.buscar("texto=faro+golf&modo=auto").texto
 
-    assert m.peticiones_ia == ["configurador", "configurador"]
+    # Auto revisa además los resultados con la IA (ajuste activado por defecto).
+    assert m.peticiones_ia == ["configurador", "configurador", "revision"]
     assert "Configurador" in html and "pendiente de revisión" in html
     for producto in PRODUCTOS:
         assert producto.titulo in html
@@ -248,11 +322,12 @@ def test_perfil_roto_lo_repara_la_ia(montar: Any) -> None:
     m.fuente.almacen.guardar_perfil(ROTO)
     html = m.buscar("texto=faro+golf&modo=auto").texto
 
-    assert m.peticiones_ia == ["reparador"]
+    # Auto revisa además los resultados con la IA (ajuste activado por defecto).
+    assert m.peticiones_ia == ["reparador", "revision"]
     assert "Reparador" in html and "v2" in html
     assert PRODUCTOS[0].titulo in html
     ficha = m.web.get(f"/tiendas/{DOMINIO}").texto
-    assert "v2" in ficha and "🤖 reparador" in ficha and "Pendiente de revisión" in ficha
+    assert "v2" in ficha and "reparador IA" in ficha and "Pendiente de revisión" in ficha
 
 
 def test_perfil_roto_en_clasico_no_llama_a_la_ia(montar: Any) -> None:
@@ -266,24 +341,25 @@ def test_perfil_roto_en_clasico_no_llama_a_la_ia(montar: Any) -> None:
     assert tienda is not None and tienda.estado is EstadoPerfil.ROTO
 
 
-def test_robots_que_prohibe_la_busqueda_omite_la_tienda_si_se_respeta(montar: Any) -> None:
-    transporte = TransporteTienda(paginas_sitio(), robots="User-agent: *\nDisallow: /buscar\n")
+def test_robots_que_lo_prohibe_todo_se_busca_igual_y_se_avisa(montar: Any) -> None:
+    # ADR-017, enmienda del 2026-10-25: ya no hay opción de respetarlo; solo queda el aviso.
+    transporte = TransporteTienda(paginas_sitio(), robots="User-agent: *\nDisallow: /\n")
     m = montar(transporte)
-    m.fuente.guardar_ajustes(replace(m.fuente.ajustes(), respetar_robots=True))
     m.alta()
     m.fuente.almacen.guardar_perfil(perfil())
     html = m.buscar().texto
-    assert "paso-omitido" in html and "robots.txt" in html
-    assert BUSQUEDA not in transporte.pedidas and transporte.fichas == []
+    assert "Lo prohíbe; se ignora por decisión del usuario (ADR-017)" in html
+    assert "paso-omitido" not in html
+    assert BUSQUEDA in transporte.pedidas and transporte.fichas
     tienda = m.fuente.tienda(DOMINIO)
     assert tienda is not None and not tienda.robots_permite
+    assert "robots.txt lo prohíbe · se ignora" in m.web.get("/").texto
 
 
-def test_por_defecto_se_ignora_el_robots_y_se_avisa(montar: Any) -> None:
+def test_robots_que_prohibe_la_busqueda_se_ignora_y_se_avisa(montar: Any) -> None:
     # ADR-017: decisión de Julio. Se busca igual, pero el progreso lo enseña.
     transporte = TransporteTienda(paginas_sitio(), robots="User-agent: *\nDisallow: /buscar\n")
     m = montar(transporte)
-    assert not m.fuente.ajustes().respetar_robots
     m.alta()
     m.fuente.almacen.guardar_perfil(perfil())
     html = m.buscar().texto
@@ -292,8 +368,10 @@ def test_por_defecto_se_ignora_el_robots_y_se_avisa(montar: Any) -> None:
     assert "/productos/" in html
 
 
-def test_un_robots_con_desafio_anti_bot_bloquea_aunque_se_ignore(montar: Any) -> None:
-    # Caso real (oscaro.es): el propio robots.txt devuelve el desafío de Cloudflare con un 403.
+def test_un_robots_con_desafio_anti_bot_no_corta_la_busqueda(montar: Any) -> None:
+    # Causas R3-B (notino.es, campaña ronda 3) y oscaro.es: la única petición era el robots.txt.
+    # El robots.txt se ignora (ADR-017): el desafío es «no hay robots.txt» y se busca; cada
+    # página detecta su propio bloqueo (y tiene su rescate con Chromium, ADR-023).
     transporte = TransporteTienda(
         paginas_sitio(), robots=CAPTCHA, estados={f"{TIENDA}/robots.txt": 403}
     )
@@ -301,8 +379,10 @@ def test_un_robots_con_desafio_anti_bot_bloquea_aunque_se_ignore(montar: Any) ->
     m.alta()
     m.fuente.almacen.guardar_perfil(perfil())
     html = m.buscar().texto
-    assert "Bloqueo (CAPTCHA o anti-bot): no se evade" in html
-    assert BUSQUEDA not in transporte.pedidas and transporte.fichas == []
+    assert "Bloqueo (CAPTCHA o anti-bot)" not in html
+    assert BUSQUEDA in transporte.pedidas and transporte.fichas
+    # No se ha leído nada que prohíba: no se enseña «lo prohíbe; se ignora».
+    assert "se ignora por decisión del usuario (ADR-017)" not in html
 
 
 def test_bloqueo_se_para_y_no_se_evade(montar: Any) -> None:

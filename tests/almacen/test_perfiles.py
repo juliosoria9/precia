@@ -38,7 +38,7 @@ def _perfil(version: int = 1, **cambios: Any) -> Perfil:
         sel_precio_listado=".precio .importe",
         sel_campos={"precio": "[itemprop=price] @content", "marca": ".ficha .marca"},
         necesita_js=False,
-        autor="🤖 configurador",
+        autor="configurador IA",
         revisado=False,
         creado=datetime(2026, 10, 6, 9, 5),
         nota="Validado en 3 fichas.",
@@ -70,7 +70,7 @@ def test_cada_guardado_es_una_version_nueva(con_tienda: Almacen) -> None:
     con_tienda.guardar_perfil(_perfil())
     # Aunque el llamante repita el número, nunca se sobrescribe una versión anterior.
     segunda = con_tienda.guardar_perfil(
-        _perfil(1, sel_precio_listado="[data-testid=precio-final]", autor="🤖 reparador")
+        _perfil(1, sel_precio_listado="[data-testid=precio-final]", autor="reparador IA")
     )
     assert segunda.version == 2
     assert [p.version for p in con_tienda.versiones(DOMINIO)] == [1, 2]
@@ -124,13 +124,13 @@ def test_selector_precio_listado_opcional(con_tienda: Almacen) -> None:
 def test_la_tienda_lleva_sus_versiones(con_tienda: Almacen) -> None:
     con_tienda.guardar_perfil(_perfil())
     con_tienda.marcar_revisado(DOMINIO, 1)
-    con_tienda.guardar_perfil(_perfil(2, autor="🤖 reparador", nota="Cambió el HTML."))
+    con_tienda.guardar_perfil(_perfil(2, autor="reparador IA", nota="Cambió el HTML."))
     tienda = con_tienda.tienda(DOMINIO)
     assert tienda is not None
     assert [v.numero for v in tienda.versiones] == [1, 2]
     v1, v2 = tienda.versiones
-    assert v1.autor == "🤖 configurador · revisado"
-    assert v2.autor == "🤖 reparador"
+    assert v1.autor == "configurador IA · revisado"
+    assert v2.autor == "reparador IA"
     assert v2.nota == "Cambió el HTML."
     assert v1.validado and v2.validado
     assert v1.fecha == datetime(2026, 10, 6, 9, 5)

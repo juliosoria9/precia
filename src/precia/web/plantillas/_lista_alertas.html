@@ -5,10 +5,10 @@
   <li>
     <span class="insignia {{ 'insignia-ok' if a.activa else 'insignia-tenue' }}">{{ "Activa" if a.activa else "Pausada" }}</span>
     <span><a href="/productos/{{ a.producto_id }}">{{ a.producto_nombre }}</a> por debajo de <strong>{{ a.umbral | euros }}</strong></span>
-    <span class="tenue">{{ "Telegram" if a.canal == "telegram" else "Email" }}{% if a.ultima_activacion %} · saltó el {{ a.ultima_activacion | fecha_corta }}{% endif %}</span>
+    <span class="tenue">{{ "Telegram" if a.canal == "telegram" else "Email" }}{% if not a.solo_exactas %}, incluye equivalentes y revisiones{% endif %}{% if a.ultima_activacion %}, saltó el {{ a.ultima_activacion | fecha_corta }}{% endif %}</span>
   </li>
   {% endfor %}
 </ul>
 {% else %}
-<p class="tenue">Todavía no hay alertas.</p>
+<p class="tenue">Todavía no hay alertas. Créalas desde la ficha de un producto, en «Histórico y alertas».</p>
 {% endif %}

@@ -14,6 +14,7 @@ from precia.ia.costes import calcular_coste
 from precia.ia.defensas import construir_mensajes
 from precia.ia.salida import (
     Consumo,
+    SalidaCortada,
     SalidaNoValidaConConsumo,
     esquema_para_api,
     interpretar,
@@ -112,9 +113,7 @@ class ProveedorOllama:
             entrada, salida, calcular_coste(self.nombre, self.modelo, entrada, salida)
         )
         if cuerpo.get("done_reason") == "length":
-            raise SalidaNoValidaConConsumo(
-                "Salida incompleta: se ha alcanzado el máximo de tokens", consumo
-            )
+            raise SalidaCortada("Salida incompleta: se ha alcanzado el máximo de tokens", consumo)
         try:
             resultado = interpretar(contenido, peticion.esquema)
         except SalidaNoValida as error:

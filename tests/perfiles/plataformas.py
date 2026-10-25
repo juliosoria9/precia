@@ -61,7 +61,7 @@ def perfil_api(tipo: str = TIPO_API_WOOCOMMERCE, **cambios: Any) -> Perfil:
         "sel_enlace": "",
         "sel_precio_listado": None,
         "sel_campos": {},
-        "autor": "🤖 configurador",
+        "autor": "configurador IA",
         "revisado": False,
         "tipo": tipo,
     }

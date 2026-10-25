@@ -12,9 +12,9 @@ from precia.navegador.tipos import Pagina
 
 
 class Navegador(Protocol):
-    """Descarga una página respetando robots, cortesía y caché; con `js`, usando Chromium.
+    """Descarga una página respetando la cortesía y la caché; con `js`, usando Chromium.
 
-    Lanza los errores de `navegador.tipos` (`Bloqueado`, `ProhibidoPorRobots`...).
+    Lanza los errores de `navegador.tipos` (`Bloqueado`, `ErrorDescarga`...).
     """
 
     async def obtener(self, url: str, *, js: bool = False) -> Pagina: ...

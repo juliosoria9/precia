@@ -1,13 +1,12 @@
 """Texto visible de una página y resumen de su estructura para el configurador de IA."""
 
-import time
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 from precia.extraccion.dom import analizar
 from precia.extraccion.texto import resumen_para_ia, texto_visible
+from tests.cronometro import proporcion_de_cpu
 
 HTML = """<!DOCTYPE html>
 <html lang="es"><head>
@@ -325,17 +324,170 @@ def test_las_secciones_de_un_maquetador_no_son_una_serie() -> None:
     assert "<p>5K1941005E</p>" in resumen
 
 
+def _megamenu(n: int) -> str:
+    # Un megamenú en un div (no en un nav) que no se repite: cada entrada tiene su clase.
+    return (
+        '<div class="megamenu">'
+        + "".join(
+            f'<div class="cat-{i}"><a href="/c/{i}">Categoría {i}</a> y subcategorías</div>'
+            for i in range(n)
+        )
+        + "</div>"
+    )
+
+
+def _notas(n: int) -> str:
+    return (
+        '<div class="notas">'
+        + "".join(f'<div class="nota-{i}">Nota {i} de la tienda</div>' for i in range(n))
+        + "</div>"
+    )
+
+
+_PRODUCTO = '<h1 class="titulo">Faro delantero</h1><p class="price">89,90 €</p>'
+
+
+def test_en_una_ficha_el_producto_entra_aunque_delante_haya_un_megamenu() -> None:
+    # Como en todostuslibros.com (campaña multi-sector, causa C5): la cabecera y el megamenú
+    # llenaban el tope y la IA no veía ni el h1 ni el precio de la ficha.
+    ficha = (
+        f'<body>{_megamenu(700)}<main><div class="ficha">{_PRODUCTO}</div></main>{_pie(500)}</body>'
+    )
+    resumen = resumen_para_ia(ficha, listado=False)
+    assert len(resumen) <= 30_000
+    assert _PRODUCTO in resumen
+    # En el orden del documento, con lo de delante recortado y el anidamiento bien cerrado.
+    assert resumen.startswith('<div class="megamenu"><div class="cat-0">')
+    assert resumen.index("Categoría 0") < resumen.index("<h1")
+    assert resumen.count("<div") == resumen.count("</div>")
+    assert resumen.count("<main") == resumen.count("</main>") == 1
+
+
+def test_en_una_ficha_cuenta_el_h1_que_llega_al_precio() -> None:
+    # Como en footlocker.es: el primer h1 es el de la cabecera para móvil y hasta el precio hay
+    # medio documento; el h1 que va con el precio es el segundo.
+    ficha = (
+        f'<body>{_megamenu(700)}<div class="pagina">'
+        f'<div class="movil"><h1>Faro delantero</h1></div>{_notas(600)}'
+        f'<div class="ficha">{_PRODUCTO}</div></div></body>'
+    )
+    resumen = resumen_para_ia(ficha, listado=False)
+    assert len(resumen) <= 30_000
+    assert _PRODUCTO in resumen
+
+
+def test_en_una_ficha_los_relacionados_con_precio_no_ganan_la_prioridad() -> None:
+    # Los productos relacionados también tienen precio: el sitio reservado es el del producto
+    # principal (el del h1), no el del carrusel.
+    relacionados = '<section class="vistos">' + "".join(map(_tarjeta, range(20))) + "</section>"
+    ficha = (
+        f"<body>{_megamenu(700)}{relacionados}"
+        f'<main><div class="ficha">{_PRODUCTO}</div></main></body>'
+    )
+    resumen = resumen_para_ia(ficha, listado=False)
+    assert len(resumen) <= 30_000
+    assert _PRODUCTO in resumen
+    assert "Faro modelo" not in resumen
+
+
+_COMPRA = f'<div class="compra">{_notas(450)}<p class="price">89,90 €</p></div>'
+"""Bloque de compra que pasa del sitio de la región: el precio va al final, tras mucho texto."""
+
+
+def test_en_una_ficha_el_precio_puede_ir_en_un_bloque_hermano_del_h1() -> None:
+    # Como en amazon.es (ronda 6): el h1 va en su bloque y el precio en otro de la misma
+    # columna, que en total pasa del sitio de la región. Antes la región era solo el bloque del
+    # h1 y el precio quedaba detrás del corte.
+    ficha = (
+        f'<body>{_megamenu(700)}<div class="centro"><div class="cabecera">'
+        f'<h1 class="titulo">Faro delantero</h1></div>{_COMPRA}{_notas(300)}</div></body>'
+    )
+    resumen = resumen_para_ia(ficha, listado=False)
+    assert len(resumen) <= 30_000
+    assert '<h1 class="titulo">Faro delantero</h1>' in resumen
+    assert '<p class="price">89,90 €</p>' in resumen
+    assert resumen.index("<h1") < resumen.index('<p class="price">')
+    assert resumen.count("<div") == resumen.count("</div>")
+
+
+def test_en_una_ficha_cuenta_antes_el_h1_que_se_parece_al_titulo_de_la_pagina() -> None:
+    # Como en amazon.es: antes del h1 del producto hay ventanas emergentes con su propio h1 y
+    # «precio» («Precios», «Desbloquear ahorros»). El h1 del producto es el que repite el
+    # `<title>` de la página.
+    ficha = (
+        "<html><head><title>Faro delantero Valeo : Tienda</title></head>"
+        f'<body>{_megamenu(700)}<div class="emergente"><h1>Precios</h1>'
+        '<p class="price">Consulta los precios</p></div><div class="centro">'
+        f'<div class="cabecera"><h1 class="titulo">Faro delantero Valeo</h1></div>{_COMPRA}</div>'
+        "</body></html>"
+    )
+    resumen = resumen_para_ia(ficha, listado=False)
+    assert len(resumen) <= 30_000
+    assert '<h1 class="titulo">Faro delantero Valeo</h1>' in resumen
+    assert '<p class="price">89,90 €</p>' in resumen
+
+
+def test_en_una_ficha_el_h1_que_llega_al_precio_gana_al_bloque_vecino_de_otro_h1() -> None:
+    # Como en footlocker.es, con una promo al lado: el h1 duplicado de la cabecera para móvil
+    # empata en parecido con el `<title>` y va antes, y su vecino tiene un importe («Envío
+    # gratis desde 49 €»). Cuenta el h1 que llega a su precio subiendo; el bloque vecino solo
+    # sirve si ninguno llega.
+    ficha = (
+        "<html><head><title>Faro delantero | Tienda</title></head>"
+        f'<body>{_megamenu(700)}<div class="pagina">'
+        '<div class="movil"><h1>Faro delantero</h1></div>'
+        '<div class="promo">Envío gratis desde 49 €</div>'
+        f'{_notas(600)}<div class="ficha">{_PRODUCTO}</div></div></body></html>'
+    )
+    resumen = resumen_para_ia(ficha, listado=False)
+    assert len(resumen) <= 30_000
+    assert _PRODUCTO in resumen
+
+
+def test_en_una_ficha_un_h1_corto_con_el_nombre_de_la_tienda_no_gana_al_del_producto() -> None:
+    # El h1 del pie («Desguaces Pepe») tiene todas sus palabras en el `<title>`; el del producto
+    # lleva además la referencia y los años, que no están. Cuenta lo que comparten con el
+    # `<title>`, no la fracción de las palabras de cada h1.
+    ficha = (
+        "<html><head><title>Faro delantero izquierdo Seat Ibiza | Desguaces Pepe</title></head>"
+        f'<body>{_megamenu(700)}<main><div class="ficha">'
+        "<h1>Faro delantero izquierdo Seat Ibiza 6J (2008-2012) ref. 6J1941005</h1>"
+        '<p>Referencia OEM: 6J1941005</p><span class="price">120,00 €</span></div></main>'
+        '<div class="pie"><h1>Desguaces Pepe</h1><p>Envío gratis desde 49 €</p></div>'
+        "</body></html>"
+    )
+    resumen = resumen_para_ia(ficha, listado=False)
+    assert len(resumen) <= 30_000
+    assert "ref. 6J1941005</h1>" in resumen
+    assert "<p>Referencia OEM: 6J1941005</p>" in resumen
+    assert '<span class="price">120,00 €</span>' in resumen
+
+
+def test_en_una_ficha_sin_precio_los_relacionados_no_son_el_bloque_del_precio() -> None:
+    # Pieza de desguace con «Precio a consultar»: el bloque del h1 no llega a ningún precio y el
+    # hermano con precio más cercano es el carrusel de relacionados (una serie de tarjetas con
+    # enlace y precio). No se le reserva sitio: la tabla con la referencia OEM, que va antes,
+    # tiene que entrar. Cada tarjeta lleva su clase, así que no se comprimen como una serie.
+    relacionados = '<section class="relacionados">' + "".join(
+        _tarjeta(n).replace('class="card"', f'class="card-{n}"') for n in range(105)
+    )
+    ficha = (
+        "<html><head><title>Faro delantero Golf V</title></head>"
+        f'<body>{_megamenu(250)}<main><div class="cabecera"><h1>Faro delantero Golf V</h1></div>'
+        f'<div class="detalle"><p class="consultar">Precio a consultar</p>'
+        f"{_tabla_de_atributos()}</div>{relacionados}</section></main></body></html>"
+    )
+    resumen = resumen_para_ia(ficha, listado=False)
+    assert len(resumen) <= 30_000
+    assert "<h1>Faro delantero Golf V</h1>" in resumen
+    assert "Precio a consultar" in resumen and "<p>5K1941005E</p>" in resumen
+
+
 def test_el_marcador_no_lo_puede_escribir_la_web() -> None:
     # Los comentarios de la página se quitan y el texto que imita el marcador queda escapado.
     falso = "3 elementos similares omitidos"
     html = f"<p><!-- {falso} --> &lt;!-- {falso} --&gt;</p>"
     assert resumen_para_ia(html) == f"<p> &lt;!-- {falso} --&gt;</p>"
-
-
-def _cronometrar[T](funcion: Callable[[str], T], html: str) -> tuple[T, float]:
-    inicio = time.perf_counter()
-    resultado = funcion(html)
-    return resultado, time.perf_counter() - inicio
 
 
 @pytest.mark.parametrize(
@@ -350,20 +502,52 @@ def _cronometrar[T](funcion: Callable[[str], T], html: str) -> tuple[T, float]:
 )
 def test_resumen_de_html_hostil_en_tiempo_lineal(hostil: str, comprime: bool) -> None:
     # Unos MB de hermanos repetidos o de anidamiento: el resumen no puede costar mucho más que
-    # construir el árbol (que es lineal), y eso que incluye construirlo.
+    # construir el árbol (que es lineal), y eso que incluye construirlo. Se mide el tiempo de
+    # CPU, el mejor de hasta 3 intentos de cada uno, alternados (bug 6).
     assert len(hostil) > 500_000
-    _, analisis = _cronometrar(analizar, hostil)
-    resumen, tiempo = _cronometrar(resumen_para_ia, hostil)
-    assert tiempo < 3 * analisis + 1
+    resumenes: list[str] = []
+    proporcion = proporcion_de_cpu(
+        lambda: resumenes.append(resumen_para_ia(hostil)), lambda: analizar(hostil), 4
+    )
+    assert proporcion < 4
+    resumen = resumenes[-1]
     assert len(resumen) <= 30_000
     assert (MARCADOR in resumen) is comprime
+
+
+_H1_ANIDADOS = "<h1><span>" * 400 + "faro" + "</span></h1>" * 400
+
+
+@pytest.mark.parametrize(
+    "hostil",
+    [
+        '<div class="n"><a href="/p">x</a><b>1,00 €</b>' * 15_000,
+        # El analizador anida los h1 sin cerrar: cada uno tendría que bajar por toda la cadena
+        # para leer su texto y compararlo con el `<title>`.
+        "<title>faro</title>" + _H1_ANIDADOS * 70,
+    ],
+    ids=["anidamiento", "h1-anidados"],
+)
+def test_resumen_de_una_ficha_hostil_en_tiempo_lineal(hostil: str) -> None:
+    # Lo mismo para una ficha (`listado=False`): buscar el bloque del producto (subir desde
+    # cada h1, el bloque del precio, el parecido con el `<title>`) tampoco puede ser cuadrático.
+    assert len(hostil) > 500_000
+    resumenes: list[str] = []
+    proporcion = proporcion_de_cpu(
+        lambda: resumenes.append(resumen_para_ia(hostil, listado=False)),
+        lambda: analizar(hostil),
+        4,
+    )
+    assert proporcion < 4
+    assert len(resumenes[-1]) <= 30_000
 
 
 # --- Páginas reales (prueba de generalidad del 2026-10-20) ------------------------------------
 
 
 def test_resumen_de_desguacesdli_contiene_los_productos() -> None:
-    # Bricks + WooCommerce: ~1200 filtros del buscador delante de los 12 resultados. Antes el
+    # Bricks + WooCommerce: ~1200 filtros del buscador delante de 12 destacados de su catálogo
+    # (/recambios?s=faro redirige a /recambios/ y no hay ningún faro, bug 10). Antes el
     # resumen se llenaba con la cabecera y los filtros y la IA se inventaba los selectores.
     resumen = resumen_para_ia(_real("dli_busqueda_faro_chromium.html"))
     assert len(resumen) <= 30_000
@@ -387,3 +571,42 @@ def test_resumen_de_webscraper_conserva_la_estructura_del_listado() -> None:
     ) in resumen
     assert '<h4 class="price float-end card-title pull-right"' in resumen
     assert '<span itemprop="price">$416.99</span>' in resumen
+
+
+def test_resumen_de_una_ficha_real_con_megamenu_contiene_el_producto() -> None:
+    # todostuslibros.com (campaña multi-sector, ronda 1, causa C5): geolocalización y megamenú
+    # ocupan más de 30 000 caracteres; el h1 y el precio vigente iban detrás del corte y la
+    # validación fallaba con «no se encuentra un precio anclado» en las 3 fichas.
+    resumen = resumen_para_ia(_real("todostuslibros_ficha_megamenu.html"), listado=False)
+    assert len(resumen) <= 30_000
+    assert '<h1 class="title">La puerta de no retorno</h1>' in resumen
+    assert '<strong class="js-main-book-price-final">20,00' in resumen
+    assert resumen.count("<div") == resumen.count("</div>")
+
+
+def test_resumen_de_zalando_con_streaming_de_react_contiene_los_productos() -> None:
+    # Búsqueda «filtro» de Zalando (ronda 2, causa R2-C9): el contenido llega en segmentos
+    # `<div hidden id="S:N">` que el `<script>` `$RC`/`$RS` cuelga en su sitio. Antes el resumen
+    # tenía 101 caracteres y la IA solo veía el título.
+    html = _real("zalando_busqueda_streaming_react.html")
+    assert len(texto_visible(html)) > 300
+    resumen = resumen_para_ia(html)
+    assert resumen.count("<article") == 3
+    assert "chloe-gafas-con-filtro-de-luz-azul" in resumen
+    assert "350,00 €" in resumen and "14,39 €" in resumen
+
+
+def test_resumen_de_una_ficha_de_amazon_contiene_el_titulo_y_el_precio() -> None:
+    # amazon.es (campaña, ronda 6): la cabecera (menú de accesibilidad y ~50 <option> de
+    # categorías) llenaba el tope; el h1 del producto no llegaba a ningún precio sin pasar del
+    # sitio de la región (el precio va en otro bloque de la columna central) y ganaba el h1 de la
+    # vista rápida del final, con su «Precio» sin cifra. La IA proponía #pqv-price.
+    resumen = resumen_para_ia(
+        _real("amazon_ficha_titulo_lejos_del_precio_chromium.html"), listado=False
+    )
+    assert len(resumen) <= 30_000
+    assert '<span id="productTitle"' in resumen
+    assert "BRITA ON TAP V-MF filtro agua de recambio" in resumen
+    assert 'id="corePriceDisplay_desktop_feature_div"' in resumen
+    assert '<span class="a-price-whole">22' in resumen
+    assert resumen.count("<div") == resumen.count("</div>")

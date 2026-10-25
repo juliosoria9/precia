@@ -1,12 +1,12 @@
 """Histórico de precios y alertas."""
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
 
 from precia.almacen.sqlite import Almacen, DatoNoValido, ProductoNoEncontrado
-from precia.nucleo.modelos import PuntoHistorico, SerieHistorico
+from precia.nucleo.modelos import Coincidencia, PuntoHistorico, SerieHistorico
 
 PRODUCTO = "oem-1k0698451j"
 NOMBRE = "Pastillas de freno delanteras Bosch"
@@ -45,12 +45,77 @@ def test_una_serie_por_tienda_con_el_ultimo_precio_del_dia(almacen: Almacen) -> 
     ]
 
 
+def test_la_serie_solo_lleva_la_referencia_exacta(almacen: Almacen) -> None:
+    # Revisión: con B5, las equivalentes y las revisiones entran en el producto `oem-<ref>`. Si
+    # cuentan en la serie, el punto del día es el de la última ficha descargada, y la gráfica
+    # salta de 45 € a 120 € sin que cambie ningún precio.
+    def guardar(precio: str, fecha: datetime, url: str, coincidencia: Coincidencia) -> None:
+        almacen.guardar_precio(
+            PRODUCTO,
+            NOMBRE,
+            "1K0698451J",
+            "t.example",
+            url,
+            Decimal(precio),
+            fecha,
+            coincidencia=coincidencia,
+        )
+
+    exacta, otra = "https://t.example/p/1", "https://t.example/p/2"
+    guardar("120.00", datetime(2026, 10, 20, 10, 0, 5), exacta, Coincidencia.EXACTA)
+    guardar("45.00", datetime(2026, 10, 20, 10, 0, 9), otra, Coincidencia.EQUIVALENTE)
+    guardar("45.00", datetime(2026, 10, 21, 10, 0, 5), otra, Coincidencia.EQUIVALENTE)
+    guardar("99.00", datetime(2026, 10, 21, 10, 0, 7), otra, Coincidencia.REVISION)
+    guardar("120.00", datetime(2026, 10, 21, 10, 0, 1), exacta, Coincidencia.EXACTA)
+    guardar("50.00", datetime(2026, 10, 22, 10, 0, 0), otra, Coincidencia.EQUIVALENTE)
+    (serie,) = almacen.historico(PRODUCTO)
+    assert serie.puntos == (
+        PuntoHistorico(date(2026, 10, 20), Decimal("120.00")),
+        PuntoHistorico(date(2026, 10, 21), Decimal("120.00")),
+    )
+
+
 def test_mismo_instante_gana_el_ultimo_guardado(almacen: Almacen) -> None:
     instante = datetime(2026, 10, 1, 9, 0)
     _guardar(almacen, "a.example", "10.00", instante)
     _guardar(almacen, "a.example", "11.00", instante)
     (serie,) = almacen.historico(PRODUCTO)
     assert serie.puntos == (PuntoHistorico(date(2026, 10, 1), Decimal("11.00")),)
+
+
+def test_la_misma_oferta_con_la_misma_fecha_no_se_duplica(almacen: Almacen) -> None:
+    # Una ficha servida desde la caché llega con la fecha en que se descargó (A3): guardarla en
+    # cada búsqueda repetida no puede llenar el histórico de filas iguales.
+    instante = datetime(2026, 10, 1, 9, 0)
+    _guardar(almacen, "a.example", "10.00", instante)
+    _guardar(almacen, "a.example", "10.00", instante)
+    (fila,) = almacen._consultar("SELECT count(*) AS n FROM precios")
+    assert fila["n"] == 1
+
+
+VERANO, INVIERNO = timezone(timedelta(hours=2)), timezone(timedelta(hours=1))
+
+
+def test_la_misma_descarga_con_otro_desfase_horario_no_se_duplica(almacen: Almacen) -> None:
+    # Revisión: con el cambio de hora, la misma ficha de la caché daba otro texto ISO
+    # («01:00+02:00» y «00:00+01:00» son el mismo instante) y se insertaba otra fila.
+    _guardar(almacen, "a.example", "10.00", datetime(2026, 10, 25, 1, 0, tzinfo=VERANO))
+    _guardar(almacen, "a.example", "10.00", datetime(2026, 10, 25, 0, 0, tzinfo=INVIERNO))
+    (fila,) = almacen._consultar("SELECT count(*) AS n FROM precios")
+    assert fila["n"] == 1
+
+
+def test_la_ultima_visita_se_compara_como_instante(almacen: Almacen) -> None:
+    # En la hora repetida, «02:10+01:00» es posterior a «02:30+02:00» aunque como texto vaya
+    # antes: la última visita es la segunda.
+    for url, precio, visita in (
+        (URL_A, "10.00", datetime(2026, 10, 25, 2, 30, tzinfo=VERANO)),
+        (URL_B, "12.00", datetime(2026, 10, 25, 2, 10, tzinfo=INVIERNO)),
+    ):
+        almacen.guardar_precio(
+            PRODUCTO, NOMBRE, "1K0698451J", "a.example", url, Decimal(precio), visita
+        )
+    assert [o.url for o in almacen.ultimas_ofertas(PRODUCTO)] == [URL_B]
 
 
 def test_los_decimales_no_pierden_precision(almacen: Almacen) -> None:
@@ -138,3 +203,12 @@ def test_alerta_valida_umbral_y_canal(almacen: Almacen, umbral: str, canal: str)
     with pytest.raises(DatoNoValido):
         almacen.crear_alerta(PRODUCTO, Decimal(umbral), canal)
     assert almacen.alertas() == []
+
+
+def test_alerta_guarda_solo_exactas(almacen: Almacen) -> None:
+    # B5: por defecto, una alerta solo cuenta las ofertas con la referencia exacta.
+    _guardar(almacen, "a.example", "38.90", datetime(2026, 10, 1))
+    assert almacen.crear_alerta(PRODUCTO, Decimal("35"), "correo").solo_exactas is True
+    amplia = almacen.crear_alerta(PRODUCTO, Decimal("30"), "correo", solo_exactas=False)
+    assert amplia.solo_exactas is False
+    assert [a.solo_exactas for a in almacen.alertas()] == [True, False]

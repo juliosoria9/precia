@@ -1,0 +1,56 @@
+{#- C1: una búsqueda en segundo plano. Mientras sigue, se sondea cada segundo (`v`: si no ha
+    cambiado, el servidor responde 204 y no se repinta). Sin tarea: ya no está (caducó o se
+    reinició PrecIA), sin sondeo. -#}
+{%- set t = tarea -%}
+{% if not t %}
+<div id="busqueda" class="busqueda">
+  <p class="mensaje mensaje-aviso" role="status">Esta búsqueda ya no está: se guarda una hora y se pierde al reiniciar PrecIA. Vuelve a buscar.</p>
+</div>
+{% else %}
+<div id="busqueda" class="busqueda"{% if t.activa %} hx-get="/busquedas/{{ t.id }}/estado?v={{ t.version }}" hx-trigger="every 1s" hx-swap="outerHTML"{% endif %}>
+  <div class="busqueda-cabecera tarjeta">
+    {%- set total = t.tiendas | length %}
+    <p class="busqueda-estado" aria-live="polite">
+      {%- if t.estado.value == "en_cola" %}En cola: empieza cuando termine alguna de las búsquedas en marcha.
+      {%- elif t.estado.value == "en_curso" %}Buscando: {{ t.terminadas }} de {{ total }} tiendas terminadas.
+      {%- elif t.estado.value == "terminada" %}Terminada: {{ t.terminadas }} de {{ total }} tiendas terminadas.
+      {%- elif t.estado.value == "cancelada" %}Cancelada: {{ t.terminadas }} de {{ total }} tiendas habían terminado.
+      {%- else %}{{ t.error }}{% endif -%}
+    </p>
+    <ul class="estado-tiendas">
+      {% for dominio, e in t.tiendas.items() %}
+      <li>
+        <span class="estado-tienda-nombre">{{ dominio }}</span>
+        <span class="insignia estado-{{ e.value }}">{{ ETIQUETAS_ESTADO[e] }}</span>
+        {%- set segundos = t.segundos(dominio) %}
+        {%- if e.value in ("descargando", "configurando") and (t.detalles.get(dominio) or segundos is not none) %}
+        {#- A10: en qué está y cuánto lleva (se actualiza con cada cambio de la tienda). -#}
+        <span class="estado-tienda-detalle tenue">{{ t.detalles.get(dominio, "") }}{% if t.detalles.get(dominio) and segundos is not none %} · {% endif %}{% if segundos is not none %}{{ segundos }} s{% endif %}</span>
+        {%- endif %}
+        {% if e.value in ("en_espera", "bloqueada") %}
+        {#- A1: su configuración falló hace poco y se ha saltado. A8: sigue bloqueada tras el proxy
+            y Chromium y se recuerda un rato sin pedirle nada. -#}
+        <form class="en-linea" method="post" action="/tiendas/{{ dominio | urlencode }}/reintentar">
+          <input type="hidden" name="confirmar" value="1">
+          <button class="boton boton-secundario boton-pequeno" type="submit">Reintentar</button>
+        </form>
+        {% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+    <div class="busqueda-acciones">
+      {% if t.activa %}
+      <form method="post" action="/busquedas/{{ t.id }}/cancelar"
+            hx-post="/busquedas/{{ t.id }}/cancelar" hx-target="#busqueda" hx-swap="outerHTML">
+        <input type="hidden" name="confirmar" value="1">
+        <button class="boton boton-secundario" type="submit">Cancelar</button>
+      </form>
+      {% else %}
+      {#- Un enlace normal: lanza otra búsqueda con la misma consulta. -#}
+      <a class="boton boton-secundario" href="/buscar?{{ parametros_de_consulta(t.consulta) }}">Actualizar precios</a>
+      {% endif %}
+    </div>
+  </div>
+  {% if t.resultado %}{% with resultado = t.resultado %}{% include "_resultados.html" %}{% endwith %}{% endif %}
+</div>
+{% endif %}

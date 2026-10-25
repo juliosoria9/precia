@@ -1,4 +1,4 @@
-"""🤖 Configurador de tiendas sin buscador (ADR-018, nota 16), de extremo a extremo y sin red.
+"""IA · Configurador de tiendas sin buscador (ADR-018, nota 16), de extremo a extremo y sin red.
 
 Orden: API de la plataforma → plantilla de búsqueda del usuario (A1) → buscador descubierto →
 catálogo por sitemap (B) → listado del usuario (A2) → `ConfiguracionFallida` que pide la URL de
@@ -14,9 +14,11 @@ from typing import Any
 import pytest
 
 from precia.almacen.sqlite import Almacen
+from precia.fuentes.sitemap import MAX_FICHEROS_SITEMAP
 from precia.ia.simulado import Guion
 from precia.navegador.tipos import Bloqueado
 from precia.nucleo.modelos import CLAVES_CAMPOS
+from precia.perfiles.catalogo import MAX_SITEMAPS_PROBADOS
 from precia.perfiles.configurador import COMPONENTE, configurar
 from precia.perfiles.descubrimiento import ESQUEMA_PLANTILLAS, ORIGEN_USUARIO
 from precia.perfiles.tipos import (
@@ -188,7 +190,7 @@ def test_b_sitemap_declarado_en_robots_sin_ia() -> None:
         sel_precio_listado=None,
         sel_campos={},
         necesita_js=False,
-        autor="🤖 configurador",
+        autor="configurador IA",
         revisado=False,
         creado=INSTANTE,
         nota=perfil.nota,
@@ -214,7 +216,7 @@ def test_b_sin_datos_estructurados_una_llamada_a_la_ia_para_la_ficha() -> None:
     perfil, peticiones = ejecutar(navegador, [SIN_PROPUESTA, CAMPOS_OK], catalogo=catalogo)
     assert perfil.tipo == TIPO_SITEMAP
     assert perfil.sel_campos == CAMPOS_OK
-    assert perfil.nota.startswith("Catálogo por sitemap (4 URL), 🤖 selectores de la ficha. ")
+    assert perfil.nota.startswith("Catálogo por sitemap (4 URL), selectores de la ficha por IA. ")
     assert len(peticiones) == 2
     ficha = peticiones[1]
     assert "precio" in ficha.esquema["properties"]
@@ -491,3 +493,115 @@ def test_sin_buscador_ni_entrada_pide_la_url_de_entrada() -> None:
     motivo, _ = fallo(NavegadorFalso(sin_buscador()), [SIN_PROPUESTA])
     assert "búsqueda" in motivo
     assert "URL de entrada" in motivo
+
+
+def test_b_guarda_los_hijos_que_no_caben_en_el_tope(tmp_path: Path) -> None:
+    # R2-C14b: los hijos del índice que no se leyeron quedan en el almacén para que una búsqueda
+    # descargue después los que nombran la consulta.
+    almacen = Almacen(tmp_path / "precia.db", reloj=lambda: INSTANTE)
+    almacen.alta_tienda(DOMINIO, "Recambios Prueba")
+    navegador = con_sitemap(sin_buscador(jsonld=(0, 1, 2, 3)))
+    extra = [f"{TIENDA}/sitemaps/product-sitemap{n}.xml" for n in range(2, 14)]
+    navegador.paginas[INDICE] = xml_indice([DE_PRODUCTOS, *extra])
+    ejecutar(navegador, [SIN_PROPUESTA], catalogo=almacen)
+    info = almacen.catalogo(DOMINIO)
+    assert info is not None and info.parcial
+    leidos = MAX_FICHEROS_SITEMAP - 2  # El índice y el de productos ya cuentan.
+    assert almacen.hijos_pendientes(DOMINIO) == extra[leidos:]
+
+
+# --- B: causa R3-C de la campaña, si un sitemap no da fichas con precio se prueba otro ---------
+
+INFORMATIVAS = f"{TIENDA}/_includes/sitemap.xml"
+COMIDA = f"{TIENDA}/crs/cdn-static/sitemap-food/index.xml"
+HTML_INFORMATIVA = (
+    "<html><head><title>Calidad y origen</title></head><body><h1>Más información</h1>"
+    "<p>Conoce cómo elegimos los productos de nuestra marca.</p></body></html>"
+)
+
+
+def _informativas(sitio: dict[str, str]) -> list[str]:
+    """El `_includes/sitemap.xml` real de Carrefour (ronda 3, recortado: 3 páginas informativas),
+    servido en la tienda falsa con sus páginas sin precio. Devuelve sus URL."""
+    texto = (REALES / "carrefour_sitemap_includes_informativas.xml").read_bytes().decode("utf-8")
+    texto = texto.replace("https://www.carrefour.es", TIENDA)
+    sitio[INFORMATIVAS] = texto
+    urls = re.findall(r"<loc>([^<]+)</loc>", texto)
+    for url in urls:
+        sitio[url] = HTML_INFORMATIVA
+    return urls
+
+
+def test_b_si_las_fichas_del_primer_sitemap_no_tienen_precio_prueba_el_siguiente() -> None:
+    # Carrefour: declara primero `_includes/sitemap.xml` (páginas informativas) y el catálogo del
+    # supermercado (`sitemap-food`) después; se validaba el primero y, sin precio, se fallaba.
+    sitio = sin_buscador(jsonld=(0, 1, 2, 3))
+    informativas = _informativas(sitio)
+    sitio[COMIDA] = xml_urlset(FICHAS)
+    navegador = NavegadorFalso(sitio, declarados=(INFORMATIVAS, COMIDA))
+    catalogo = CatalogoFalso()
+    perfil, peticiones = ejecutar(
+        navegador, [SIN_PROPUESTA, {**NULOS, "precio": "span.no-existe"}], catalogo=catalogo
+    )
+    assert perfil.tipo == TIPO_SITEMAP
+    assert perfil.url_busqueda == COMIDA
+    assert perfil.sel_campos == {}
+    assert perfil.nota.startswith("Catálogo por sitemap (4 URL), sin IA. Válido:")
+    ((dominio, sitemap, entradas, _),) = catalogo.guardados
+    assert (dominio, sitemap) == (DOMINIO, COMIDA)
+    assert [url for url, _, _ in entradas] == FICHAS
+    assert navegador.grandes[:2] == [INFORMATIVAS, COMIDA]
+    assert set(informativas[:2]) <= set(navegador.urls)
+    # Las páginas informativas no parecen un producto: la IA no se gasta en ellas (R5-F) y el
+    # segundo sitemap vale sin IA, así que solo hay la propuesta de plantillas del buscador.
+    assert len(peticiones) == 1
+
+
+def test_b_si_las_fichas_del_primer_sitemap_dan_404_prueba_el_siguiente_sin_ia() -> None:
+    # El Corte Inglés: el sitemap de entradas de teatro da fichas 404; el de productos va detrás.
+    sitio = sin_buscador(jsonld=(0, 1, 2, 3))
+    entradas = f"{TIENDA}/entradas/sitemaps/sitemap.xml"
+    variantes = f"{TIENDA}/sgfm/statics-front/contents/sitemap-variants/sitemap.xml.gz"
+    teatro = [f"{TIENDA}/entradas/teatro/entradas-faro-golf-{c}/" for c in ("bilbao", "madrid")]
+    sitio[entradas] = xml_urlset(teatro)
+    sitio[variantes] = xml_urlset(FICHAS)
+    navegador = NavegadorFalso(sitio, declarados=(entradas, variantes))
+    catalogo = CatalogoFalso()
+    perfil, peticiones = ejecutar(navegador, [SIN_PROPUESTA], catalogo=catalogo)
+    assert perfil.url_busqueda == variantes
+    assert [s for _, s, _, _ in catalogo.guardados] == [variantes]
+    assert set(teatro) <= set(navegador.urls)
+    # Ninguna ficha del primero se abrió: no se gasta la IA en él.
+    assert len(peticiones) == 1
+
+
+def test_b_un_primer_sitemap_valido_no_descarga_el_segundo() -> None:
+    sitio = sin_buscador(jsonld=(0, 1, 2, 3))
+    segundo = f"{TIENDA}/sitemaps/sitemap-otro.xml"
+    sitio[DE_PRODUCTOS] = xml_urlset(FICHAS)
+    sitio[segundo] = xml_urlset(FICHAS)
+    navegador = NavegadorFalso(sitio, declarados=(DE_PRODUCTOS, segundo))
+    perfil, _ = ejecutar(navegador, [SIN_PROPUESTA], catalogo=CatalogoFalso())
+    assert perfil.url_busqueda == DE_PRODUCTOS
+    assert navegador.grandes == [DE_PRODUCTOS]
+
+
+def test_b_como_mucho_max_sitemaps_probados_y_el_motivo_junta_los_de_todos() -> None:
+    sitio = sin_buscador()
+    declarados = tuple(
+        f"{TIENDA}/seccion{n}/sitemap-{n}.xml" for n in range(MAX_SITEMAPS_PROBADOS + 2)
+    )
+    for n, declarado in enumerate(declarados):
+        sitio[declarado] = xml_urlset(
+            [f"{TIENDA}/seccion{n}/faro-golf-{c}" for c in ("rojo", "azul", "negro")]
+        )
+    navegador = NavegadorFalso(sitio, declarados=declarados)
+    catalogo = CatalogoFalso()
+    motivo, peticiones = fallo(navegador, [SIN_PROPUESTA], catalogo=catalogo)
+    assert catalogo.guardados == []
+    probados = declarados[:MAX_SITEMAPS_PROBADOS]
+    assert [g for g in navegador.grandes if g in declarados] == list(probados)
+    assert f"{MAX_SITEMAPS_PROBADOS} sitemaps" in motivo
+    assert all(p in motivo for p in probados)
+    assert "URL de entrada" in motivo
+    assert len(peticiones) == 1

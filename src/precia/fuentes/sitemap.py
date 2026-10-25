@@ -21,13 +21,14 @@ Las URL que se leen aquí todavía no son de fiar: antes de descargarlas pasan p
 mismo dominio (`de_la_tienda`, `extraccion.listado.url_de_la_tienda`) y por `validar_url`.
 """
 
+import heapq
 import re
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import parse_qsl, unquote, urlsplit
 
-from precia.emparejado.referencias import referencias_en
+from precia.emparejado.referencias import es_id_numerico, referencias_en
 from precia.emparejado.texto import normalizar_titulo
 from precia.extraccion.listado import MAX_URL, dominio_normalizado, url_de_la_tienda
 from precia.fuentes.plataformas import Plataforma, origen_de
@@ -59,9 +60,13 @@ MIN_PALABRA = 3
 """Letras de una palabra que cuenta (como `perfiles.descubrimiento.MIN_PALABRA`)."""
 MIN_PALABRAS_SLUG = 2
 """Palabras que necesita el slug de una URL para que `con_palabras` la cuente."""
-MIN_DIGITOS_REFERENCIA = 8
-"""Un número suelto de la ruta con menos cifras es un id («/123-faro.html», «/p/123456»); con
-8 o más se conserva, porque puede ser una referencia numérica (Bosch «0986494104») o un EAN."""
+MAX_HIJOS_BUSQUEDA = 2
+"""Sitemaps hijos sin leer que se descargan como mucho en una búsqueda (`hijos_de_la_consulta`)."""
+MIN_PALABRA_HIJO = 4
+"""Letras de una palabra de la consulta (o del nombre de un sitemap) que casa por prefijo."""
+MAX_CONSULTA_HIJOS = 500
+MAX_PALABRAS_HIJO = 12
+
 
 TipoSitemap = Literal["indice", "urlset"]
 
@@ -122,12 +127,12 @@ _RUTAS_PLATAFORMA: dict[Plataforma, tuple[str, ...]] = {
     Plataforma.MAGENTO: ("/sitemap/sitemap.xml",),
 }
 
-# Palabras del nombre de un sitemap hijo. Las que no son de producto ganan: `product_cat`,
+# Palabras del nombre de un sitemap. Las que no son de producto ganan: `product_cat`,
 # `product_tag` y `product_brand` (WooCommerce) son categorías, etiquetas y marcas.
 _DE_PRODUCTO = frozenset(
     {
-        "product", "products", "producto", "productos", "produit", "produits",
-        "item", "items", "articulo", "articulos", "catalog", "catalogo", "catalogue",
+        "product", "products", "producto", "productos", "produit", "produits", "item", "items",
+        "article", "articles", "articulo", "articulos", "catalog", "catalogo", "catalogue",
     }
 )  # fmt: skip
 _NO_DE_PRODUCTO = frozenset(
@@ -139,9 +144,33 @@ _NO_DE_PRODUCTO = frozenset(
         "video", "videos", "author", "authors", "autor", "autores", "user", "users",
         "usuario", "usuarios", "brand", "brands", "marca", "marcas", "manufacturer",
         "manufacturers", "fabricante", "fabricantes", "supplier", "suppliers", "proveedor",
-        "proveedores",
+        "proveedores", "subcategory", "subcategories", "subcategoria", "subcategorias",
+        "subcollection", "subcollections", "subcoleccion", "subcolecciones",
     }
 )  # fmt: skip
+# Sitemaps que pueden enlazar alguna ficha, pero sobre todo páginas sin un producto concreto
+# (landings, temáticas, comparativas, promociones, contenidos, palabras clave SEO como el
+# `keyword.xml` de Brico Dépôt, R2-C10): no se excluyen, van al final.
+_SECUNDARIAS = frozenset(
+    {
+        "landing", "landings", "tematica", "tematicas", "comparativa", "comparativas",
+        "comparative", "comparatives", "comparador", "comparadores", "promotion", "promotions",
+        "promocion", "promociones", "content", "contents", "contenido", "contenidos", "outlet",
+        "oferta", "ofertas", "offers", "friday", "blackfriday", "keyword", "keywords", "seo",
+    }
+)  # fmt: skip
+# Nombres compuestos (`_compuesta`): las palabras de producto de 6 letras o más, que pueden ir
+# dentro de otra (`productdetailspages`); los finales de un sitemap de páginas o imágenes
+# (`brandpages`, `productimages`), y las palabras que dicen que son fichas.
+_DE_PRODUCTO_LARGAS = frozenset(p for p in _DE_PRODUCTO if len(p) >= 6)
+_FINALES_DE_PAGINA = ("pages", "page", "posts", "images", "imagenes", "videos")
+_DE_FICHA = ("detail", "detalle", "ficha")
+# La familia de categorías, que excluye también dentro de una palabra compuesta (causa R4-C:
+# `filteredcategoriesurl` de Hawkers). Solo esta: «images» o «pages» pegadas no excluyen.
+_CATEGORIAS_EN_COMPUESTA = ("categor", "taxonom")
+PRIORIDAD_PRODUCTO = 0
+PRIORIDAD_NEUTRO = 1
+PRIORIDAD_SECUNDARIO = 2
 # Palabras de la ruta que no dicen nada del producto.
 _EXTENSIONES = frozenset({"html", "htm", "shtml", "php", "asp", "aspx", "jsp", "do", "xml"})
 _GENERICAS = frozenset({"index", "default", "home", "inicio"})
@@ -363,7 +392,10 @@ def candidatos(base: str, declarados: Sequence[str], plataforma: Plataforma | No
     """URL de sitemap que probar en la tienda de `base`, en orden y sin repetir.
 
     Primero los declarados en robots.txt (como mucho `MAX_DECLARADOS`, absolutos y solo del
-    mismo dominio que la tienda, con o sin `www.`), después las rutas habituales y las de la
+    mismo dominio que la tienda, con o sin `www.`, o de un subdominio suyo: `url_de_sitemap`),
+    ordenados por `prioridad` (Coolmod declara
+    primero un `/sitemap.xml` de categorías y después `sitemap_products.xml`) y sin los que no
+    son de producto (categorías, marcas, blog); después las rutas habituales y las de la
     plataforma. Ninguna está comprobada: el configurador se queda con las que existan.
     """
     origen = origen_de(base)
@@ -371,10 +403,7 @@ def candidatos(base: str, declarados: Sequence[str], plataforma: Plataforma | No
     if origen is None or dominio is None:
         return []
     raiz = origen + "/"
-    urls: list[str] = []
-    for declarado in declarados[:MAX_DECLARADOS]:
-        if _absoluta(declarado) and (url := url_de_la_tienda(declarado, raiz, dominio)):
-            urls.append(url)
+    urls = _por_prioridad(declarados_de_la_tienda(base, declarados))
     rutas = _RUTAS_FIJAS + (_RUTAS_PLATAFORMA.get(plataforma, ()) if plataforma else ())
     for ruta in rutas:
         if url := url_de_la_tienda(origen + ruta, raiz, dominio):
@@ -382,23 +411,184 @@ def candidatos(base: str, declarados: Sequence[str], plataforma: Plataforma | No
     return list(dict.fromkeys(urls))
 
 
-def de_producto(indice: Sitemap) -> list[str]:
-    """Los sitemaps de producto de un índice, por su nombre (como mucho `MAX_FICHEROS_SITEMAP`).
+def declarados_de_la_tienda(base: str, declarados: Sequence[str]) -> list[str]:
+    """Los declarados en robots.txt que `candidatos` probaría, normalizados y en su orden.
 
-    Los de páginas, entradas, categorías, etiquetas, marcas, autores o imágenes no cuentan. Si
-    ninguno se distingue como de producto (PrestaShop: `1_es_0_sitemap.xml`), se devuelven todos
-    los demás. Un `urlset` no tiene sitemaps hijos: `[]`.
+    Como mucho `MAX_DECLARADOS`, absolutos y de la tienda de `base` o de un subdominio suyo
+    (`url_de_sitemap`). El catálogo los distingue así de las rutas habituales y de la plataforma
+    (causa R4-D).
     """
+    return [url for d in declarados[:MAX_DECLARADOS] if (url := url_de_sitemap(d, base))]
+
+
+def url_de_sitemap(url: str, base: str) -> str | None:
+    """`url` normalizada si es un fichero sitemap de la tienda de `base`, o `None`.
+
+    Vale lo que admite `url_de_la_tienda` (mismo dominio, con o sin `www.`) y, además, un
+    subdominio estricto del dominio de la tienda tal y como se dio (causa R4-B: Xtralife declara
+    `https://static.xtralife.com/sitemap.xml`; el protocolo sitemaps permite que el robots.txt
+    de un host declare un sitemap en otro). Con las mismas condiciones: absoluta, `http(s)`, sin
+    usuario ni contraseña y en el puerto por defecto. Sin lista de sufijos públicos, la tienda
+    `compraonline.alcampo.es` solo cubre `*.compraonline.alcampo.es`: nunca otro dominio.
+
+    Solo para el fichero sitemap (descargarlo y seguir sus redirecciones o los hijos de un
+    índice): las URL que lleva dentro pasan por el filtro estricto (`de_la_tienda`).
+    """
+    origen = origen_de(base)
+    dominio = _dominio_de(origen)
+    if origen is None or dominio is None or not _absoluta(url):
+        return None
+    raiz = origen + "/"
+    if propia := url_de_la_tienda(url, raiz, dominio):
+        return propia
+    subdominio = _dominio_de(url.strip())
+    if subdominio is None or not subdominio.endswith("." + dominio):
+        return None
+    return url_de_la_tienda(url, raiz, subdominio)
+
+
+def sitemaps_de_la_tienda(urls: Iterable[str], base: str) -> list[str]:
+    """Las `urls` que son ficheros sitemap de la tienda de `base` (`url_de_sitemap`), sin
+    repetir: los hijos de un índice, que pueden estar en el mismo subdominio (causa R4-B)."""
+    return list(dict.fromkeys(propia for url in urls if (propia := url_de_sitemap(url, base))))
+
+
+def prioridad(url: str) -> int | None:
+    """Orden en que se lee un sitemap por su nombre, o `None` si no es de producto.
+
+    `PRIORIDAD_PRODUCTO` (`product-sitemap.xml`, `sitemap_articles.xml`), `PRIORIDAD_NEUTRO`
+    (no dice nada: `1_es_0_sitemap.xml`, `sitemap-portatiles-es.xml`) o `PRIORIDAD_SECUNDARIO`
+    (landings, temáticas, comparativas, promociones). Los de páginas, entradas, categorías,
+    etiquetas, marcas, autores o imágenes no son de producto; los de categorías, tampoco cuando
+    la palabra va pegada a otras (`filteredcategoriesurl`, causa R4-C).
+
+    Las palabras de exclusión y las de producto cuentan en toda la ruta (`/blog/sitemap.xml`,
+    `/articulos/sitemap_index.xml`); las secundarias, solo en el nombre del fichero y en los
+    valores de la query: una carpeta `contents`, `statics` o `seo` es la ruta del CMS o del CDN y
+    no dice qué hay dentro (El Corte Inglés tiene sus productos en
+    `…/contents/sitemap-variants/sitemap.xml.gz`, causa R3-C).
+    """
+    palabras = _palabras_nombre(url)
+    if palabras & _NO_DE_PRODUCTO or any(
+        familia in p for p in palabras for familia in _CATEGORIAS_EN_COMPUESTA
+    ):
+        return None
+    if palabras & _DE_PRODUCTO:
+        return PRIORIDAD_PRODUCTO
+    if any(_compuesta(p) == PRIORIDAD_PRODUCTO for p in palabras - _SECUNDARIAS):
+        return PRIORIDAD_PRODUCTO
+    del_nombre = _palabras_nombre(url, solo_nombre=True)
+    if del_nombre & _SECUNDARIAS or any(
+        _compuesta(p) == PRIORIDAD_SECUNDARIO for p in del_nombre - _SECUNDARIAS
+    ):
+        return PRIORIDAD_SECUNDARIO
+    return PRIORIDAD_NEUTRO
+
+
+def _compuesta(palabra: str) -> int | None:
+    """Clase de una palabra compuesta del nombre de un sitemap, o `None` si no dice nada.
+
+    MediaMarkt junta las palabras: `productdetailspages`, `brandpages`, `productimages`. Solo con
+    reglas acotadas, porque una palabra corta dentro de otra no dice nada («video» en
+    «videojuegos», «post» en «postprocesado», «tag» en «vintage», «product» en «reproductores»):
+    es de producto si empieza o acaba por una palabra de producto larga (`_DE_PRODUCTO_LARGAS`) y
+    no acaba en una de páginas o imágenes (`_FINALES_DE_PAGINA`), salvo que diga que son fichas
+    (`productdetailspages`); y secundaria si acaba en una de páginas o imágenes con al menos 3
+    letras delante. Nunca excluye.
+    """
+    pagina = any(
+        palabra.endswith(final) and len(palabra) - len(final) >= MIN_PALABRA
+        for final in _FINALES_DE_PAGINA
+    )
+    producto = any(
+        palabra.startswith(larga) or palabra.endswith(larga) for larga in _DE_PRODUCTO_LARGAS
+    )
+    if producto and (not pagina or any(ficha in palabra for ficha in _DE_FICHA)):
+        return PRIORIDAD_PRODUCTO
+    return PRIORIDAD_SECUNDARIO if pagina else None
+
+
+def es_listado(url: str) -> bool:
+    """`url` es una página de marca, categoría, etiqueta, blog… y no la ficha de un producto.
+
+    Lo es si un tramo entero de la ruta es una palabra de las que no son de producto (las mismas
+    que en el nombre de un sitemap: `/es/brand/jvc/auriculares-bluetooth` de MediaMarkt) y
+    ningún tramo es de producto (Shopify pone las fichas en `/collections/x/products/y`). Una
+    palabra dentro del slug no cuenta. El catálogo local deja estas páginas para el final.
+
+    Se llama una vez por URL que casa con la búsqueda (pueden ser decenas de miles): la ruta se
+    corta a mano, sin `urlsplit`, y solo se normalizan los tramos que no son una palabra ASCII.
+    """
+    ruta = url[:MAX_URL].partition("://")[2].partition("#")[0].partition("?")[0].partition("/")[2]
+    if "%" in ruta:
+        ruta = unquote(ruta)
+    tramos = {
+        tramo.lower() if tramo.isascii() and tramo.isalnum() else normalizar_titulo(tramo)
+        for tramo in ruta.split("/")
+    }
+    return bool(tramos & _NO_DE_PRODUCTO) and not tramos & _DE_PRODUCTO
+
+
+def de_producto(indice: Sitemap) -> list[str]:
+    """Los sitemaps hijos de un índice que se siguen, por `prioridad` (como mucho
+    `MAX_FICHEROS_SITEMAP`).
+
+    Primero los de producto, después los neutros y al final los secundarios, cada grupo en el
+    orden del índice; los que no son de producto no cuentan. Los neutros no se descartan aunque
+    haya alguno de producto: en PcComponentes solo dos feeds de categoría casan por accidente
+    con «articulos» y «productos», y los cientos restantes son las fichas. Un `urlset` no tiene
+    sitemaps hijos: `[]`.
+    """
+    return hijos_de_producto(indice)[:MAX_FICHEROS_SITEMAP]
+
+
+def hijos_de_producto(indice: Sitemap) -> list[str]:
+    """Todos los sitemaps hijos de un índice que se siguen, por `prioridad` y sin tope."""
     if indice.tipo != "indice":
         return []
-    productos: list[str] = []
-    neutros: list[str] = []
-    for url in dict.fromkeys(entrada.url for entrada in indice.entradas):
-        palabras = _palabras_nombre(url)
-        if palabras & _NO_DE_PRODUCTO:
-            continue
-        (productos if palabras & _DE_PRODUCTO else neutros).append(url)
-    return (productos or neutros)[:MAX_FICHEROS_SITEMAP]
+    return _por_prioridad(dict.fromkeys(entrada.url for entrada in indice.entradas))
+
+
+def hijos_de_la_consulta(hijos: Iterable[str], consulta: str, *, maximo: int) -> list[str]:
+    """Los `maximo` sitemaps de `hijos` cuyo nombre nombra la consulta, el mejor primero (R2-C14b).
+
+    Para los hijos de un índice que no se leyeron al hacer el catálogo (tope de ficheros): en
+    PcComponentes, `sitemap-portatiles-es.xml` con «portátil 16gb». Cuentan las palabras de la
+    consulta de `MIN_PALABRA_HIJO` letras o más que no son solo cifras, normalizadas, y casan por
+    prefijo en cualquier sentido («portatil» con «portatiles» y «portátiles» con «portatil»).
+    Van primero los que nombran más palabras de la consulta; a igualdad, los que tienen menos
+    palabras ajenas a ella (`sitemap-portatiles-es` antes que `sitemap-neveras-portatiles-es`); y
+    después, en el orden de `hijos`. Los que no son de producto (`prioridad`) no cuentan.
+    """
+    if maximo <= 0:
+        return []
+    texto = normalizar_titulo(consulta[:MAX_CONSULTA_HIJOS])
+    palabras = tuple(
+        p for p in dict.fromkeys(texto.split()) if len(p) >= MIN_PALABRA_HIJO and not p.isdigit()
+    )[:MAX_PALABRAS_HIJO]
+    if not palabras:
+        return []
+    puntuados: list[tuple[int, int, int, str]] = []
+    for orden, hijo in enumerate(dict.fromkeys(hijos)):
+        suyas = _palabras_nombre(hijo)
+        casan = [s for s in suyas if any(_casan(s, p) for p in palabras)]
+        if casan and prioridad(hijo) is not None:
+            nombradas = sum(any(_casan(s, p) for s in casan) for p in palabras)
+            puntuados.append((-nombradas, len(suyas) - len(casan), orden, hijo))
+    return [hijo for *_, hijo in heapq.nsmallest(maximo, puntuados)]
+
+
+def _casan(suya: str, palabra: str) -> bool:
+    """Una palabra del nombre de un sitemap y una de la consulta casan por prefijo."""
+    if len(suya) < MIN_PALABRA_HIJO:
+        return False
+    return suya.startswith(palabra) or palabra.startswith(suya)
+
+
+def _por_prioridad(urls: Iterable[str]) -> list[str]:
+    """Las `urls` que son de producto, ordenadas por `prioridad` (estable)."""
+    con_prioridad = [(p, url) for url in urls if (p := prioridad(url)) is not None]
+    return [url for _, url in sorted(con_prioridad, key=lambda par: par[0])]
 
 
 def de_la_tienda(urls: Iterable[str], base: str) -> list[str]:
@@ -441,16 +631,20 @@ def _absoluta(url: str) -> bool:
     return partes.scheme.lower() in ("http", "https") and bool(partes.netloc)
 
 
-def _palabras_nombre(url: str) -> set[str]:
+def _palabras_nombre(url: str, *, solo_nombre: bool = False) -> set[str]:
     """Palabras de la ruta y de los valores de la consulta de un sitemap hijo, sin cifras finales
     (`product-sitemap2.xml` → {product, sitemap, xml}). Los nombres de los parámetros no cuentan:
-    en `xmlsitemap.php?type=products&page=2` (BigCommerce), `page` es la paginación."""
+    en `xmlsitemap.php?type=products&page=2` (BigCommerce), `page` es la paginación. Con
+    `solo_nombre`, de la ruta solo cuenta el último tramo (el nombre del fichero), sin carpetas."""
     try:
         partes = urlsplit(url[:MAX_URL])
     except ValueError:
         return set()
     valores = " ".join(valor for _, valor in parse_qsl(partes.query, keep_blank_values=True))
-    texto = normalizar_titulo(f"{unquote(partes.path)} {valores}")
+    ruta = unquote(partes.path)
+    if solo_nombre:
+        ruta = ruta.rstrip("/").rpartition("/")[2]
+    texto = normalizar_titulo(f"{ruta} {valores}")
     return {palabra.rstrip("0123456789") for palabra in texto.split()} - {""}
 
 
@@ -462,8 +656,8 @@ def palabras_url(url: str) -> str:
 
     Normaliza como `emparejado.texto.normalizar_titulo` (minúsculas, sin acentos ni signos),
     decodifica los `%XX`, quita las extensiones (`.html`), los números de id (menos de
-    `MIN_DIGITOS_REFERENCIA` cifras, en un tramo propio o delante del slug: `_sin_ids`) y las
-    repeticiones, y añade las referencias OEM escritas por
+    `emparejado.referencias.MIN_DIGITOS_REFERENCIA` cifras, en un tramo propio o delante del
+    slug: `_sin_ids`) y las repeticiones, y añade las referencias OEM escritas por
     grupos («1k0-941-005» → `1k0941005`). Las referencias alfanuméricas del slug se conservan.
     Como mucho `MAX_PALABRAS_URL` caracteres, sin cortar palabras.
     """
@@ -475,7 +669,7 @@ def palabras_url(url: str) -> str:
             palabras[palabra] = None
     for referencia in sorted(referencias_en(texto)):
         referencia = referencia.lower()
-        if not _es_id(referencia):
+        if not es_id_numerico(referencia):
             palabras.setdefault(referencia, None)
     return _recortar(" ".join(palabras), MAX_PALABRAS_URL)
 
@@ -486,7 +680,9 @@ def con_palabras(urls: Iterable[str]) -> float:
     Distingue las tiendas con slugs legibles (`/producto/faro-golf/`) de las que solo ponen ids
     (`/p/123456`, `/catalog/product/view/id/4521/`): en estas, el catálogo por sitemap no sirve
     para buscar. El slug es el último tramo de la ruta con alguna palabra que no sea un número,
-    una extensión ni un nombre genérico (`index.html` → el tramo anterior).
+    una extensión ni un nombre genérico (`index.html` → el tramo anterior). Antes se quitan los
+    marcadores cortos de tipo de página del final de la ruta (`/<slug>/<EAN>/p` → el slug), pero
+    no los de en medio: en `/ropa-hombre/p/123456` el producto sigue sin nombre.
     """
     total = 0
     legibles = 0
@@ -518,10 +714,6 @@ def _ruta(url: str) -> str:
     return ruta[ruta.rfind("/") + 1 :][:MAX_RUTA_PALABRAS]
 
 
-def _es_id(palabra: str) -> bool:
-    return palabra.isdigit() and len(palabra) < MIN_DIGITOS_REFERENCIA
-
-
 def _sin_ids(palabras: list[str]) -> list[str]:
     """Las palabras de un tramo de la ruta sin extensiones ni ids.
 
@@ -531,13 +723,16 @@ def _sin_ids(palabras: list[str]) -> list[str]:
     """
     palabras = [p for p in palabras if p not in _EXTENSIONES]
     inicio = 0
-    while inicio < len(palabras) and _es_id(palabras[inicio]):
+    while inicio < len(palabras) and es_id_numerico(palabras[inicio]):
         inicio += 1
     return palabras[inicio:]
 
 
 def _palabras_slug(url: str) -> list[str]:
-    for tramo in reversed(_ruta(url).split("/")):
+    tramos = _ruta(url).split("/")
+    while tramos and (not tramos[-1] or _es_marcador(tramos[-1])):
+        tramos.pop()
+    for tramo in reversed(tramos):
         palabras = [
             p
             for p in normalizar_titulo(tramo).split()
@@ -546,6 +741,13 @@ def _palabras_slug(url: str) -> list[str]:
         if palabras:
             return palabras
     return []
+
+
+def _es_marcador(tramo: str) -> bool:
+    """Si `tramo` es un marcador de tipo de página («p», «dp», «pd»): sin contar las extensiones,
+    solo palabras que no son números y miden menos de `MIN_PALABRA` letras."""
+    palabras = [p for p in normalizar_titulo(tramo).split() if p not in _EXTENSIONES]
+    return bool(palabras) and all(not p.isdigit() and len(p) < MIN_PALABRA for p in palabras)
 
 
 def _recortar(texto: str, maximo: int) -> str:

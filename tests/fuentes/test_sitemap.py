@@ -4,7 +4,6 @@ Los sitemaps son de una web no confiable: el lector es lineal, rechaza DTD y ent
 topes y nunca lanza una excepción. Los casos hostiles se cronometran.
 """
 
-import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import TypeVar
@@ -24,17 +23,29 @@ from precia.fuentes.sitemap import (
     MAX_FICHEROS_SITEMAP,
     MAX_PALABRAS_URL,
     MAX_RUTA_PALABRAS,
+    PRIORIDAD_NEUTRO,
+    PRIORIDAD_PRODUCTO,
+    PRIORIDAD_SECUNDARIO,
     EntradaSitemap,
     Sitemap,
     candidatos,
     con_palabras,
     de_la_tienda,
     de_producto,
+    es_listado,
+    hijos_de_la_consulta,
+    hijos_de_producto,
     leer_sitemap,
     palabras_url,
+    prioridad,
+    sitemaps_de_la_tienda,
+    url_de_sitemap,
 )
+from precia.navegador.robots import analizar_robots
+from tests.cronometro import segundos_de_cpu
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "fuentes" / "sitemaps"
+REALES = Path(__file__).parent.parent / "fixtures" / "reales"
 NS = 'xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"'
 T = TypeVar("T")
 
@@ -373,11 +384,15 @@ def test_texto_mas_largo_que_el_tope_se_lee_recortado() -> None:
 # --- leer_sitemap: casos hostiles cronometrados -----------------------------------------------
 
 
-def _cronometrar(texto: str, maximo_s: float = 5) -> Sitemap:
-    inicio = time.perf_counter()
-    sitemap = leer_sitemap(texto)
-    assert time.perf_counter() - inicio < maximo_s
-    return sitemap
+def _cronometrar(texto: str, maximo_s: float = 8) -> Sitemap:
+    """Lee el sitemap con un tope de `maximo_s` segundos de CPU (mejor de 3 intentos, bug 6).
+
+    Leer 20 MB cuesta hasta 1,8 s de CPU en la suite completa: el tope deja más de 4 veces eso,
+    y un coste cuadrático sobre 20 MB no acabaría.
+    """
+    leidos: list[Sitemap] = []
+    assert segundos_de_cpu(lambda: leidos.append(leer_sitemap(texto)), maximo_s) < maximo_s
+    return leidos[-1]
 
 
 def test_hostil_20_mb_de_etiquetas_dentro_de_una_url() -> None:
@@ -544,11 +559,126 @@ def test_candidatos_de_una_base_no_valida(base: str) -> None:
     assert candidatos(base, ["https://tienda.es/sitemap.xml"], Plataforma.MAGENTO) == []
 
 
+def _declarados(fixture: str) -> tuple[str, ...]:
+    texto = (REALES / fixture).read_bytes().decode("utf-8")
+    return analizar_robots(texto, "precia").sitemaps
+
+
+def test_candidatos_de_coolmod_el_de_productos_primero() -> None:
+    # Robots.txt real de Coolmod (ronda 1 de la campaña, recortado): declara primero
+    # `/sitemap.xml`, que solo trae categorías, y su `sitemap_products.xml` nunca se leía.
+    t = "https://www.coolmod.com"
+    assert candidatos(f"{t}/", _declarados("coolmod_robots_sitemaps.txt"), None) == [
+        f"{t}/sitemap_products.xml",
+        f"{t}/sitemap.xml",
+        f"{t}/sitemap2.xml",
+        f"{t}/sitemap_contents.xml",
+        f"{t}/sitemap_promotions.xml",
+        f"{t}/sitemap_index.xml",
+        f"{t}/wp-sitemap.xml",
+    ]
+
+
+def test_candidatos_de_pccomponentes_el_de_articulos_primero() -> None:
+    t = "https://www.pccomponentes.com"
+    assert candidatos(f"{t}/", _declarados("pccomponentes_robots_sitemaps.txt"), None) == [
+        f"{t}/sitemap/sitemap_articles.xml",
+        f"{t}/sitemap/sitemap.xml",
+        f"{t}/sitemap.xml",
+        f"{t}/sitemap_index.xml",
+        f"{t}/wp-sitemap.xml",
+    ]
+
+
 def test_candidatos_como_mucho_max_declarados() -> None:
     declarados = [f"https://tienda.es/s{i}.xml" for i in range(MAX_DECLARADOS * 50)]
     resultado = candidatos("https://tienda.es", declarados, None)
     assert resultado[:MAX_DECLARADOS] == declarados[:MAX_DECLARADOS]
     assert len(resultado) == MAX_DECLARADOS + 3
+
+
+# --- Sitemap declarado en un subdominio de la tienda (causa R4-B de la campaña) ---------------
+
+
+def test_candidatos_de_xtralife_el_declarado_en_su_subdominio_static() -> None:
+    # Robots.txt real de Xtralife (ronda 4, recortado): su único `Sitemap:` está en
+    # `static.xtralife.com`. Se descartaba y solo quedaban las rutas habituales, que dan 403.
+    t = "https://www.xtralife.com"
+    declarados = _declarados("xtralife_robots_sitemap_subdominio.txt")
+    assert declarados == ("https://static.xtralife.com/sitemap.xml",)
+    assert candidatos(f"{t}/", declarados, None) == [
+        "https://static.xtralife.com/sitemap.xml",
+        f"{t}/sitemap.xml",
+        f"{t}/sitemap_index.xml",
+        f"{t}/wp-sitemap.xml",
+    ]
+
+
+@pytest.mark.parametrize(
+    "declarado",
+    [
+        "https://evil-xtralife.com/sitemap.xml",
+        "https://xtralife.com.attacker.net/sitemap.xml",
+        "https://xtralife.com.evil.net/sitemap.xml",
+        "https://otra-tienda.es/sitemap.xml",
+        "https://usuario@static.xtralife.com/sitemap.xml",
+        "https://usuario:clave@static.xtralife.com/sitemap.xml",
+        "https://static.xtralife.com:8443/sitemap.xml",
+        "ftp://static.xtralife.com/sitemap.xml",
+        "//static.xtralife.com/sitemap.xml",
+        "https://xtralife.com@evil.net/sitemap.xml",
+    ],
+)
+def test_candidatos_no_admite_otros_dominios_aunque_se_parezcan(declarado: str) -> None:
+    t = "https://www.xtralife.com"
+    assert candidatos(t, [declarado], None) == [
+        f"{t}/sitemap.xml",
+        f"{t}/sitemap_index.xml",
+        f"{t}/wp-sitemap.xml",
+    ]
+
+
+def test_un_subdominio_solo_vale_debajo_del_dominio_tal_cual_se_dio() -> None:
+    # Sin lista de sufijos públicos (sería una dependencia nueva): la tienda
+    # `compraonline.alcampo.es` solo cubre `*.compraonline.alcampo.es`, nunca `static.alcampo.es`.
+    base = "https://compraonline.alcampo.es"
+    assert url_de_sitemap("https://static.alcampo.es/sitemap.xml", base) is None
+    assert (
+        url_de_sitemap("https://static.compraonline.alcampo.es/sitemap.xml", base)
+        == "https://static.compraonline.alcampo.es/sitemap.xml"
+    )
+    # Con `www.` en la tienda o en el subdominio, igual que en `url_de_la_tienda`.
+    assert (
+        url_de_sitemap("https://www.static.xtralife.com/s.xml#x", "https://www.xtralife.com")
+        == "https://www.static.xtralife.com/s.xml"
+    )
+    assert url_de_sitemap("https://xtralife.com/s.xml", "https://www.xtralife.com") == (
+        "https://xtralife.com/s.xml"
+    )
+    assert url_de_sitemap("/relativo.xml", "https://www.xtralife.com") is None
+
+
+def test_el_subdominio_solo_vale_para_ficheros_sitemap_no_para_fichas() -> None:
+    base = "https://www.xtralife.com"
+    urls = [
+        "https://static.xtralife.com/sitemap-productos.xml",
+        "https://www.xtralife.com/sitemap-juegos.xml",
+        "https://evil-xtralife.com/sitemap.xml",
+        "https://static.xtralife.com.evil.net/sitemap.xml",
+    ]
+    assert sitemaps_de_la_tienda(urls, base) == urls[:2]
+    # El filtro de las URL que se guardan en el catálogo sigue siendo el estricto.
+    assert de_la_tienda(urls, base) == [urls[1]]
+
+
+def test_candidatos_con_el_sitemap_en_el_mismo_host_no_cambian() -> None:
+    # Regresión: una tienda de recambios que declara su sitemap en su propio host.
+    t = "https://www.recambios-prueba.es"
+    assert candidatos(t, [f"{t}/sitemap_index.xml"], None) == [
+        f"{t}/sitemap_index.xml",
+        f"{t}/sitemap.xml",
+        f"{t}/wp-sitemap.xml",
+    ]
 
 
 # --- de_producto -----------------------------------------------------------------------------
@@ -606,11 +736,77 @@ def test_de_producto_sin_distinguir_da_todos() -> None:
         ("https://t.es/sitemap.php?tipo=productos&pagina=1", True),
         ("https://t.es/xmlsitemap.php?type=pages&page=1", False),
         ("https://t.es/xmlsitemap.php?type=categories&page=1", False),
+        # PcComponentes declara así su índice de fichas (causa C3 de la campaña multi-sector).
+        ("https://t.es/sitemap/sitemap_articles.xml", True),
+        ("https://t.es/sitemap-cdl-subcolecciones.xml.gz", False),
     ],
 )
 def test_de_producto_por_el_nombre(url: str, de_productos: bool) -> None:
+    # El de producto va delante del neutro; uno que no es de producto no se sigue.
     neutro = "https://t.es/sitemap-1.xml"
-    assert de_producto(_indice(url, neutro)) == ([url] if de_productos else [neutro])
+    assert de_producto(_indice(neutro, url)) == ([url, neutro] if de_productos else [neutro])
+
+
+def test_de_producto_no_descarta_los_neutros_si_hay_alguno_de_producto() -> None:
+    # Índice de artículos de PcComponentes (ronda 1 de la campaña): cientos de feeds de categoría
+    # y solo dos que casan por accidente con «articulos» y «productos». Antes se perdían todos
+    # los demás y el catálogo se quedaba en 477 URL de limpieza.
+    feed = "https://www.pccomponentes.com/async-feed/sitemap-{}-es.xml"
+    portatiles, limpieza, monitores, sanitarios = (
+        feed.format(nombre)
+        for nombre in (
+            "portatiles",
+            "articulos-de-limpieza",
+            "monitores",
+            "esterilizadores-y-productos-sanitarios",
+        )
+    )
+    indice = _indice(portatiles, limpieza, monitores, sanitarios)
+    assert de_producto(indice) == [limpieza, sanitarios, portatiles, monitores]
+
+
+def test_de_producto_deja_al_final_landings_promociones_y_comparativas() -> None:
+    # Nombres reales de Casa del Libro, PcComponentes y Coolmod (ronda 1): las landings,
+    # temáticas, comparativas, promociones y contenidos no se excluyen (pueden enlazar fichas),
+    # pero van detrás de los neutros; las subcolecciones son colecciones.
+    t = "https://www.tienda.es"
+    landings = f"{t}/sitemap-cdl-landings.xml.gz"
+    tematicas = f"{t}/sitemap-cdl-libros-tematicas.xml"
+    novedades = f"{t}/sitemap-novedades.xml"
+    comparativas = f"{t}/sitemap/comparatives.xml"
+    black_friday = f"{t}/async-feed/black-friday-sitemap-es.xml"
+    subcolecciones = f"{t}/sitemap-cdl-subcolecciones.xml.gz"
+    papeleria = f"{t}/sitemap-cdl-papeleria.xml.gz"
+    promociones = f"{t}/sitemap_promotions.xml"
+    contenidos = f"{t}/sitemap_contents.xml"
+    indice = _indice(
+        landings,
+        tematicas,
+        novedades,
+        comparativas,
+        black_friday,
+        subcolecciones,
+        papeleria,
+        promociones,
+        contenidos,
+    )
+    assert de_producto(indice) == [
+        novedades,
+        papeleria,
+        landings,
+        tematicas,
+        comparativas,
+        black_friday,
+        promociones,
+        contenidos,
+    ]
+
+
+def test_de_producto_el_tope_es_compartido_entre_producto_y_neutros() -> None:
+    productos = [f"https://t.es/product-sitemap{i}.xml" for i in range(3)]
+    neutros = [f"https://t.es/sitemap-{i}.xml" for i in range(MAX_FICHEROS_SITEMAP * 2)]
+    resultado = de_producto(_indice(*neutros, *productos))
+    assert resultado == productos + neutros[: MAX_FICHEROS_SITEMAP - 3]
 
 
 def test_de_producto_sin_ninguno_de_productos_ni_neutro() -> None:
@@ -626,6 +822,158 @@ def test_de_producto_sin_duplicados_y_con_el_tope_de_ficheros() -> None:
     urls = [f"https://t.es/product-sitemap{i}.xml" for i in range(MAX_FICHEROS_SITEMAP * 3)]
     resultado = de_producto(_indice(urls[0], *urls))
     assert resultado == urls[:MAX_FICHEROS_SITEMAP]
+
+
+def test_hijos_de_producto_da_todos_sin_el_tope() -> None:
+    urls = [f"https://t.es/product-sitemap{i}.xml" for i in range(MAX_FICHEROS_SITEMAP * 3)]
+    neutro = "https://t.es/sitemap-1.xml"
+    indice = _indice(neutro, "https://t.es/page-sitemap.xml", urls[0], *urls)
+    assert hijos_de_producto(indice) == [*urls, neutro]
+    assert de_producto(indice) == hijos_de_producto(indice)[:MAX_FICHEROS_SITEMAP]
+    assert hijos_de_producto(_fixture("yoast_productos.xml")) == []
+
+
+# --- prioridad: nombres compuestos (R2-C14b) ---------------------------------------------------
+
+
+def _reales(nombre: str) -> Sitemap:
+    return leer_sitemap((REALES / nombre).read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize(
+    ("url", "esperada"),
+    [
+        # MediaMarkt: el índice general solo tiene nombres compuestos. Las fichas son
+        # `productdetailspages`; las páginas de marca, campañas, contenidos, listados e imágenes,
+        # secundarias (la coincidencia parcial nunca excluye).
+        ("https://t.es/sitemaps/sitemap-productdetailspages-000.xml", PRIORIDAD_PRODUCTO),
+        ("https://t.es/sitemaps/sitemap-brandpages.xml", PRIORIDAD_SECUNDARIO),
+        ("https://t.es/sitemaps/sitemap-campaignpages.xml", PRIORIDAD_SECUNDARIO),
+        ("https://t.es/sitemaps/sitemap-contentpages.xml", PRIORIDAD_SECUNDARIO),
+        ("https://t.es/sitemaps/sitemap-marketpages.xml", PRIORIDAD_SECUNDARIO),
+        ("https://t.es/sitemaps/sitemap-productlistpages.xml", PRIORIDAD_SECUNDARIO),
+        ("https://t.es/sitemaps/sitemap-productlistfacetpages.xml", PRIORIDAD_SECUNDARIO),
+        ("https://t.es/sitemaps/sitemap-productimages-000.xml", PRIORIDAD_SECUNDARIO),
+        ("https://t.es/sitemaps/sitemap-searchlistpages.xml", PRIORIDAD_SECUNDARIO),
+        ("https://t.es/wpproducts-sitemap.xml", PRIORIDAD_PRODUCTO),
+        # Negativos: una palabra corta dentro de otra no dice nada (PcComponentes).
+        ("https://t.es/async-feed/sitemap-mundo-videojuegos-es.xml", PRIORIDAD_NEUTRO),
+        ("https://t.es/async-feed/sitemap-videoconsolas-ps5-es.xml", PRIORIDAD_NEUTRO),
+        ("https://t.es/async-feed/sitemap-dispositivos-postprocesado-3d-es.xml", PRIORIDAD_NEUTRO),
+        ("https://t.es/async-feed/sitemap-juguetes-educativos-es.xml", PRIORIDAD_NEUTRO),
+        ("https://t.es/async-feed/sitemap-portatiles-es.xml", PRIORIDAD_NEUTRO),
+        ("https://t.es/sitemap-vintage.xml", PRIORIDAD_NEUTRO),
+        # «product» va dentro de «reproductores», pero no al principio ni al final: no cuenta.
+        ("https://t.es/async-feed/sitemap-reproductores-dvd-divx-es.xml", PRIORIDAD_NEUTRO),
+        ("https://t.es/async-feed/sitemap-reproductores-mp3-mp4-es.xml", PRIORIDAD_NEUTRO),
+        # Las palabras enteras siguen como antes: la exclusión gana.
+        ("https://t.es/product_cat-sitemap.xml", None),
+        ("https://t.es/sitemap-brand-pages.xml", None),
+    ],
+)
+def test_prioridad_de_los_nombres_compuestos(url: str, esperada: int | None) -> None:
+    assert prioridad(url) == esperada
+
+
+def test_de_producto_en_el_indice_real_de_mediamarkt() -> None:
+    # R2-C14b: todos sus hijos salían neutros y se leían primero las páginas de marca, campañas,
+    # contenidos y mercados; de las fichas, solo unas pocas.
+    indice = _reales("mediamarkt_sitemap_indice.xml")
+    ficha = "https://www.mediamarkt.es/sitemaps/sitemap-productdetailspages-{:03d}.xml"
+    assert de_producto(indice) == [ficha.format(n) for n in range(MAX_FICHEROS_SITEMAP)]
+
+
+@pytest.mark.parametrize(
+    ("url", "esperada"),
+    [
+        # Causa R4-C (Hawkers): «categories» va pegado dentro de la palabra compuesta. El
+        # sitemap de categorías filtradas salía neutro y sus listados entraban en el catálogo.
+        (
+            "https://www.hawkersco.com/sitemap-customsitemap-filteredcategoriesurl"
+            "-HawkersWorldwide-aggregated.xml",
+            None,
+        ),
+        ("https://t.es/sitemap-productcategories.xml", None),
+        ("https://t.es/sitemap-subcategorias-es.xml", None),
+        ("https://t.es/sitemap-producttaxonomy.xml", None),
+        # Solo la familia de categorías excluye dentro de una compuesta: imágenes, páginas y
+        # marcas pegadas siguen siendo secundarias (MediaMarkt) y las fichas, de producto.
+        ("https://t.es/sitemaps/sitemap-productimages-000.xml", PRIORIDAD_SECUNDARIO),
+        ("https://t.es/sitemaps/sitemap-brandpages.xml", PRIORIDAD_SECUNDARIO),
+        ("https://t.es/sitemaps/sitemap-productdetailspages-000.xml", PRIORIDAD_PRODUCTO),
+    ],
+)
+def test_prioridad_excluye_las_categorias_dentro_de_una_compuesta(
+    url: str, esperada: int | None
+) -> None:
+    assert prioridad(url) == esperada
+
+
+def test_de_producto_en_el_indice_real_de_hawkers() -> None:
+    # R4-C: de los tres hijos solo se sigue el de productos; los dos de categorías, no.
+    indice = _reales("hawkers_sitemap_indice.xml")
+    assert hijos_de_producto(indice) == ["https://www.hawkersco.com/sitemap_1.xml"]
+
+
+def test_de_producto_de_woocommerce_y_prestashop_no_cambia() -> None:
+    # Recambios (caso de referencia): mismos hijos y mismo orden que antes de R2-C14b.
+    t = "https://t.es"
+    indice = _indice(
+        f"{t}/post-sitemap.xml",
+        f"{t}/product_cat-sitemap.xml",
+        f"{t}/product-sitemap.xml",
+        f"{t}/1_index_sitemap.xml",
+        f"{t}/product_brand-sitemap.xml",
+        f"{t}/product-sitemap2.xml",
+        f"{t}/1_es_0_sitemap.xml",
+    )
+    assert de_producto(indice) == [
+        f"{t}/product-sitemap.xml",
+        f"{t}/product-sitemap2.xml",
+        f"{t}/1_index_sitemap.xml",
+        f"{t}/1_es_0_sitemap.xml",
+    ]
+
+
+# --- hijos_de_la_consulta (R2-C14b) ------------------------------------------------------------
+
+
+def test_hijos_de_la_consulta_en_el_indice_real_de_pccomponentes() -> None:
+    # 424 feeds por categoría: el catálogo leía los 10 primeros (placas base, procesadores, RAM…)
+    # y «portátil 16gb» solo encontraba módulos de RAM. El feed de portátiles va primero: el que
+    # tiene menos palabras ajenas a la consulta; detrás, a igualdad, en el orden del índice.
+    hijos = hijos_de_producto(_reales("pccomponentes_sitemap_indice_articulos.xml"))
+    feed = "https://www.pccomponentes.com/async-feed/sitemap-{}-es.xml"
+    assert feed.format("portatiles") not in de_producto(
+        _reales("pccomponentes_sitemap_indice_articulos.xml")
+    )
+    assert hijos_de_la_consulta(hijos, "Portátil 16GB", maximo=2) == [
+        feed.format("portatiles"),
+        feed.format("accesorios-portatiles"),
+    ]
+    assert hijos_de_la_consulta(hijos, "portátiles", maximo=1) == [feed.format("portatiles")]
+    assert hijos_de_la_consulta(hijos, "ratón inalámbrico", maximo=3) == [feed.format("ratones")]
+
+
+def test_hijos_de_la_consulta_sin_ninguno_que_case() -> None:
+    hijos = hijos_de_producto(_reales("pccomponentes_sitemap_indice_articulos.xml"))
+    assert hijos_de_la_consulta(hijos, "zapatillas running", maximo=2) == []
+    # Palabras de menos de 4 letras o solo cifras no cuentan: «pc» y «3d» casan con todo.
+    assert hijos_de_la_consulta(hijos, "pc 3d es", maximo=2) == []
+    assert hijos_de_la_consulta(hijos, "", maximo=2) == []
+    assert hijos_de_la_consulta(hijos, "portátil", maximo=0) == []
+
+
+def test_hijos_de_la_consulta_no_da_los_que_no_son_de_producto() -> None:
+    hijos = ["https://t.es/sitemap-categorias-faros.xml", "https://t.es/sitemap-faros.xml"]
+    assert hijos_de_la_consulta(hijos, "faro golf", maximo=2) == ["https://t.es/sitemap-faros.xml"]
+
+
+def test_hijos_de_la_consulta_con_miles_de_hijos_es_rapido() -> None:
+    hijos = [f"https://t.es/async-feed/sitemap-categoria-{n}-es.xml" for n in range(5_000)]
+    consulta = "x" * 5_000 + " portatil"
+    assert hijos_de_la_consulta(hijos, consulta, maximo=2) == []
+    assert segundos_de_cpu(lambda: hijos_de_la_consulta(hijos, consulta, maximo=2), 1) < 1
 
 
 # --- de_la_tienda ------------------------------------------------------------------------------
@@ -723,15 +1071,18 @@ def test_palabras_url_como_mucho_max_caracteres_sin_cortar_palabras() -> None:
 
 
 def test_palabras_url_hostil() -> None:
-    inicio = time.perf_counter()
-    for url in (
+    urls = (
         "https://tienda.es/" + "a-" * 1_000_000,
         "https://tienda.es/" + "%" * 1_000_000,
         "https://tienda.es/" + "1 " * 1_000_000,
         "https://tienda.es/" + "%C3%A1" * 300_000,
-    ):
-        assert len(palabras_url(url)) <= MAX_PALABRAS_URL
-    assert time.perf_counter() - inicio < 2
+    )
+
+    def comprobar() -> None:
+        for url in urls:
+            assert len(palabras_url(url)) <= MAX_PALABRAS_URL
+
+    assert segundos_de_cpu(comprobar, 2) < 2
 
 
 def test_palabras_url_y_con_palabras_miran_una_ruta_acotada(
@@ -776,6 +1127,46 @@ def test_ruta_larga_conserva_el_slug_del_final() -> None:
     assert con_palabras([url]) == 1.0
 
 
+# --- es_listado ---------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # Las páginas de marca del sitemap de MediaMarkt (ronda 2 de la campaña, R2-C14a).
+        "https://www.mediamarkt.es/es/brand/jvc/auriculares-bluetooth",
+        "https://www.mediamarkt.es/es/brand/cellular-line/auriculares/auriculares-bluetooth",
+        "https://tienda.es/marca/valeo/faro-golf",
+        "https://tienda.es/categoria/faros/",
+        "https://tienda.es/Categor%C3%ADas/faros",
+        "https://tienda.es/blog/como-cambiar-un-faro",
+        "https://tienda.es/tag/faro",
+        "https://tienda.es/brand",
+    ],
+)
+def test_es_listado_con_un_tramo_de_marca_categoria_o_blog(url: str) -> None:
+    assert es_listado(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.mediamarkt.es/es/product/_-jvc-ha-a3t-bu-negro-auriculares-de-boton-"
+        "bluetooth-jvc-intraurales-106699129.html",
+        "https://tienda.es/p/faro-golf",
+        # Solo cuenta el tramo entero: «marca» o «blog» dentro del slug no lo hacen listado.
+        "https://tienda.es/p/marcador-laser-blog-marca",
+        "https://tienda.es/marcas-de-faros-golf",
+        # Shopify pone las fichas dentro de la colección: el tramo de producto gana.
+        "https://tienda.es/collections/faros/products/faro-golf",
+        "https://tienda.es/",
+        "no es una url",
+    ],
+)
+def test_no_es_listado(url: str) -> None:
+    assert not es_listado(url)
+
+
 # --- con_palabras -----------------------------------------------------------------------------
 
 
@@ -800,3 +1191,103 @@ def test_con_palabras_vacio() -> None:
 def test_con_palabras_de_los_sitemaps_reales() -> None:
     assert con_palabras(_urls(_fixture("magento_sitemap.xml"))) == pytest.approx(2 / 4)
     assert con_palabras(_urls(_fixture("yoast_productos.xml"))) == pytest.approx(3 / 4)
+
+
+def test_con_palabras_salta_el_marcador_corto_del_final() -> None:
+    # Campaña multi-sector (causa R4-A): Carrefour pone sus fichas en `/<slug>/<EAN>/p`. El tramo
+    # final «p» se tomaba como slug, el sitemap de productos daba 0 % legible y se descartaba.
+    assert con_palabras(_urls(_reales("carrefour_sitemap_productos_ean_p.xml"))) == 1.0
+    assert con_palabras(["https://t.es/faro-izquierdo-golf/8435437104533/p/"]) == 1.0
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # El marcador corto solo se salta al final de la ruta: en medio, lo que va antes es una
+        # categoría y la ficha sigue identificada solo por un número.
+        "https://t.es/p/123456",
+        "https://t.es/es/p/123456",
+        "https://t.es/categoria-larga/p/123456",
+        "https://t.es/ropa-hombre/p/123456",
+        "https://t.es/x/frenos-delanteros/id/4521",
+        # Quitado el marcador, queda una sola palabra.
+        "https://t.es/tienda/p",
+    ],
+)
+def test_con_palabras_sin_slug_legible_aunque_haya_marcador(url: str) -> None:
+    assert con_palabras([url]) == 0.0
+
+
+def test_los_sitemaps_de_landings_seo_van_detras() -> None:
+    # Campaña multi-sector (causa R2-C10): Brico Dépôt declara primero `keyword.xml` (landings SEO
+    # `/v/…` con un `ItemList`) y detrás sus sitemaps de verdad; el catálogo se quedaba con las
+    # landings.
+    t = "https://www.bricodepot.es"
+    landings = f"{t}/v/nc/sitemap/keyword.xml"
+    for url in (landings, f"{t}/keywords-sitemap.xml", f"{t}/sitemap-seo.xml"):
+        assert prioridad(url) == PRIORIDAD_SECUNDARIO
+    assert prioridad(f"{t}/sitemap-seo-products.xml") == PRIORIDAD_PRODUCTO
+    declarados = [
+        landings,
+        f"{t}/media/sitemap/sitemap_es.xml",
+        f"{t}/media/sitemap/sitemap_ib.xml",
+    ]
+    assert candidatos(f"{t}/", declarados, None)[:3] == [*declarados[1:], landings]
+
+
+# --- Causa R3-C de la campaña: las carpetas no hacen secundario un sitemap ---------------------
+
+
+def test_candidatos_de_el_corte_ingles_la_carpeta_contents_no_hunde_el_de_productos() -> None:
+    # Robots.txt real de El Corte Inglés (ronda 3, recortado). Su sitemap de productos está en
+    # `…/contents/sitemap-variants/sitemap.xml.gz`: la carpeta «contents» (la del CMS) lo hacía
+    # secundario y se leía antes el de entradas de teatro, cuyas fichas dan 404.
+    t = "https://www.elcorteingles.es"
+    declarados = _declarados("elcorteingles_robots_sitemaps.txt")
+    assert len(declarados) == 5
+    assert candidatos(f"{t}/", declarados, None) == [
+        *declarados,
+        f"{t}/sitemap.xml",
+        f"{t}/sitemap_index.xml",
+        f"{t}/wp-sitemap.xml",
+    ]
+
+
+def test_candidatos_de_carrefour_en_el_orden_del_robots() -> None:
+    # Robots.txt real de Carrefour (ronda 3, recortado): los cuatro son neutros y manda el orden
+    # declarado; que el primero (`_includes`, páginas informativas) falle lo resuelve el
+    # configurador probando el siguiente.
+    t = "https://www.carrefour.es"
+    declarados = _declarados("carrefour_robots_sitemaps.txt")
+    assert len(declarados) == 4
+    assert all(prioridad(d) == PRIORIDAD_NEUTRO for d in declarados)
+    assert candidatos(f"{t}/", declarados, None)[:4] == list(declarados)
+
+
+@pytest.mark.parametrize(
+    ("url", "esperada"),
+    [
+        # Las palabras secundarias de una carpeta no cuentan: es la ruta del CMS o del CDN.
+        (
+            "https://t.es/sgfm/statics-front/eci/contents/sitemap-variants/sitemap.xml.gz",
+            PRIORIDAD_NEUTRO,
+        ),
+        ("https://t.es/contenidos/sitemap-index.xml", PRIORIDAD_NEUTRO),
+        ("https://t.es/seo/sitemap.xml", PRIORIDAD_NEUTRO),
+        ("https://t.es/landings/feeds/sitemap-1.xml", PRIORIDAD_NEUTRO),
+        ("https://t.es/brandpages/sitemap.xml", PRIORIDAD_NEUTRO),
+        # En el nombre del fichero o en los valores de la query, sí.
+        ("https://t.es/sitemap_contents.xml", PRIORIDAD_SECUNDARIO),
+        ("https://t.es/contents/sitemap-contents.xml", PRIORIDAD_SECUNDARIO),
+        ("https://t.es/xmlsitemap.php?type=landings&page=2", PRIORIDAD_SECUNDARIO),
+        ("https://t.es/sitemaps/sitemap-brandpages.xml", PRIORIDAD_SECUNDARIO),
+        # Las de producto y las de exclusión siguen contando en toda la ruta.
+        ("https://www.tiendanimal.es/articulos/sitemap_index.xml", PRIORIDAD_PRODUCTO),
+        ("https://t.es/catalog/sitemap.xml", PRIORIDAD_PRODUCTO),
+        ("https://t.es/contents/products/sitemap.xml", PRIORIDAD_PRODUCTO),
+        ("https://t.es/blog/sitemap.xml", None),
+        ("https://t.es/seo/blog/sitemap.xml", None),
+    ],
+)
+def test_prioridad_las_secundarias_solo_en_el_nombre(url: str, esperada: int | None) -> None:
+    assert prioridad(url) == esperada

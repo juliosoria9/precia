@@ -5,11 +5,10 @@ llevar marcadores que cambien el host en cada búsqueda. El anti-SSRF (`validar_
 además al descargar; aquí se comprueba lo que no depende del DNS.
 """
 
-import time
-
 import pytest
 
 from precia.perfiles.entrada import MAX_ENTRADA, EntradaNoValida, normalizar_entrada
+from tests.cronometro import segundos_de_cpu
 
 DOMINIO = "tienda.es"
 
@@ -315,17 +314,18 @@ def test_llaves_desconocidas(texto: str) -> None:
     ids=["consultas", "llaves", "barras", "subdominios", "arrobas", "cirilico", "corta"],
 )
 def test_entradas_gigantes_no_tardan(texto: str) -> None:
-    inicio = time.perf_counter()
-    with pytest.raises(EntradaNoValida):
-        normalizar_entrada(DOMINIO, texto)
-    assert time.perf_counter() - inicio < 1
+
+    def rechazar() -> None:
+        with pytest.raises(EntradaNoValida):
+            normalizar_entrada(DOMINIO, texto)
+
+    assert segundos_de_cpu(rechazar, 1) < 1
 
 
 def test_espacios_alrededor_gigantes_no_tardan() -> None:
-    inicio = time.perf_counter()
     texto = " " * 5_000_000 + "https://tienda.es/listado" + "\n" * 5_000_000
     assert normalizar_entrada(DOMINIO, texto) == "https://tienda.es/listado"
-    assert time.perf_counter() - inicio < 1
+    assert segundos_de_cpu(lambda: normalizar_entrada(DOMINIO, texto), 1) < 1
 
 
 def test_el_mensaje_no_repite_la_entrada() -> None:

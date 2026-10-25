@@ -7,6 +7,7 @@
 """
 
 import asyncio
+import json
 from collections.abc import Sequence
 from typing import Any
 
@@ -327,3 +328,39 @@ def test_las_fichas_no_cambian_un_perfil_html() -> None:
 def test_tipos() -> None:
     assert perfil_listado().tipo == TIPO_LISTADO
     assert perfil_sitemap().tipo == TIPO_SITEMAP
+
+
+def _landing(numero: int) -> str:
+    """Landing de marca o SEO: solo un JSON-LD `ItemList` de dos productos de otras URL."""
+    elementos = [
+        {
+            "@type": "ListItem",
+            "position": n,
+            "item": {
+                "@type": "Product",
+                "name": f"Faro {numero}-{n}",
+                "url": f"{TIENDA}/otro-{numero}-{n}.html",
+                "offers": {"price": f"{40 + n}.00", "priceCurrency": "EUR"},
+            },
+        }
+        for n in (1, 2)
+    ]
+    bloque = json.dumps({"@type": "ItemList", "itemListElement": elementos})
+    return (
+        f'<html><head><script type="application/ld+json">{bloque}</script></head>'
+        f"<body><h1>Faros {numero}</h1><p>41,00 €</p><p>42,00 €</p></body></html>"
+    )
+
+
+def test_sitemap_de_landings_con_itemlist_no_vale() -> None:
+    # Campaña multi-sector (causa R2-C10): con el sitemap de landings SEO de Brico Dépôt, las tres
+    # «fichas» eran listados con un `ItemList`; se contaban con el precio del primer producto y el
+    # perfil salía válido (3/3).
+    sitio = paginas_sitio(busqueda=None, jsonld=(0, 1, 2))
+    for numero, url in enumerate(FICHAS[:3], 1):
+        sitio[url] = _landing(numero)
+    informe = ejecutar(perfil_sitemap(), NavegadorFalso(sitio), fichas=FICHAS)
+    assert not informe.valido
+    assert informe.fichas_ok == 0
+    esperado = f"Ficha 1 ({FICHAS[0]}): es un listado (ItemList con 2 productos), no una ficha."
+    assert esperado in informe.problemas

@@ -48,7 +48,7 @@ class Perfil:
     """En la ficha de producto: clave de campo (ver `nucleo.modelos.CAMPOS`) → selector."""
     necesita_js: bool
     autor: str
-    """`manual`, `🤖 configurador` o `🤖 reparador`."""
+    """`manual`, `configurador IA` o `reparador IA`."""
     revisado: bool
     """Memoria §4: un perfil generado por la IA no se fija hasta que lo revisa una persona."""
     creado: datetime
@@ -83,6 +83,14 @@ class InformeValidacion:
     campos_encontrados: dict[str, int] = field(default_factory=dict)
     """Campo → en cuántas fichas se encontró."""
     problemas: tuple[str, ...] = ()
+    campos_repetidos: tuple[str, ...] = ()
+    """Claves de `sel_campos` que en todas las fichas leen lo mismo que otro campo de más
+    prioridad (R2-CAMPOS). No restan validez: quien guarda el perfil las quita
+    (`validador.sin_campos_repetidos`)."""
+    campos_sin_forma: tuple[str, ...] = ()
+    """Claves de `sel_campos` que en ninguna ficha leen un valor con la forma de su campo (R3-E:
+    «100% algodón» como referencia). Tampoco restan validez y también las quita
+    `validador.sin_campos_repetidos`."""
 
 
 class ErrorPerfil(Exception):

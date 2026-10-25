@@ -1,0 +1,5 @@
+#Sitemaps
+Sitemap: https://www.carrefour.es/_includes/sitemap.xml
+Sitemap: https://www.carrefour.es/tecno/dyn/MEDIA/siteindex.xml
+Sitemap: https://www.carrefour.es/crs/cdn-static/sitemap-food/index.xml
+Sitemap: https://www.carrefour.es/crs/cdn-static/sitemap-bodega/index.xml

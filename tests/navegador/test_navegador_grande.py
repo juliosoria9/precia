@@ -21,7 +21,6 @@ from precia.navegador.tipos import (
     Descargador,
     ErrorDescarga,
     Pagina,
-    ProhibidoPorRobots,
     URLNoPermitida,
 )
 from tests.navegador.falsos import (
@@ -60,7 +59,6 @@ class Montaje:
         paginas: dict[str, Pagina | Exception],
         *,
         robots: Pagina | None = None,
-        respetar_robots: bool = True,
         cache: Path | None = None,
         http: Descargador | None = None,
     ) -> None:
@@ -78,7 +76,6 @@ class Montaje:
             limitador=LimitadorDominio(1.0, reloj=self.reloj, dormir=self.reloj.dormir),
             cache=self.cache,
             validador=validar_con_dns_publico,
-            respetar_robots=respetar_robots,
         )
 
     def grande(self, url: str, *, js: bool = False, usar_cache: bool = True) -> Pagina:
@@ -134,24 +131,17 @@ def test_grande_normaliza_la_url() -> None:
     assert m.http.grandes == [(SITEMAP, MAX_BYTES_SITEMAP)]
 
 
-def test_grande_respeta_robots_si_se_pide() -> None:
-    m = Montaje({PRIVADO: xml(PRIVADO)}, respetar_robots=True)
-    with pytest.raises(ProhibidoPorRobots):
-        m.grande(PRIVADO)
-    assert m.http.pedidas == []
-
-
-def test_grande_con_robots_ignorado_se_descarga_y_se_anota() -> None:
-    m = Montaje({PRIVADO: xml(PRIVADO)}, respetar_robots=False)
+def test_grande_con_robots_que_lo_prohibe_se_descarga_y_se_anota() -> None:
+    m = Montaje({PRIVADO: xml(PRIVADO)})
     m.grande(PRIVADO)
     assert m.http.grandes == [(PRIVADO, MAX_BYTES_SITEMAP)]
     assert m.navegador.robots_ignorado("www.recambios-ejemplo.example")
 
 
-def test_grande_redireccion_a_ruta_prohibida() -> None:
+def test_grande_redireccion_a_ruta_prohibida_se_usa_y_se_anota() -> None:
     m = Montaje({SITEMAP: xml(SITEMAP, url_final=PRIVADO)})
-    with pytest.raises(ProhibidoPorRobots):
-        m.grande(SITEMAP)
+    assert m.grande(SITEMAP).url_final == PRIVADO
+    assert m.navegador.robots_ignorado("www.recambios-ejemplo.example")
 
 
 def test_grande_respeta_el_turno_y_el_crawl_delay() -> None:
@@ -162,7 +152,8 @@ def test_grande_respeta_el_turno_y_el_crawl_delay() -> None:
         await m.navegador.obtener(PRODUCTOS, grande=True)
 
     asyncio.run(dos())
-    assert m.reloj.esperas == [pytest.approx(3.0)]
+    # El primero espera tras el robots.txt, que también va en su turno (ADR-017).
+    assert m.reloj.esperas == [pytest.approx(3.0), pytest.approx(3.0)]
 
 
 def test_sitemap_con_el_desafio_de_cloudflare_es_bloqueado(tmp_path: Path) -> None:
@@ -180,15 +171,13 @@ def test_sitemap_con_limite_de_peticiones_es_bloqueado() -> None:
         m.grande(SITEMAP)
 
 
-def test_robots_con_desafio_bloquea_tambien_el_sitemap() -> None:
-    m = Montaje(
-        {SITEMAP: xml(SITEMAP)},
-        robots=pagina(ROBOTS, desafio(), estado=403),
-        respetar_robots=False,
-    )
-    with pytest.raises(Bloqueado):
-        m.grande(SITEMAP)
-    assert m.http.pedidas == []
+def test_robots_con_desafio_deja_descargar_el_sitemap() -> None:
+    # R3-B: el robots.txt se ignora (ADR-017); un desafío en él es «no hay robots.txt». Si el
+    # sitemap también fuera un desafío, saldría `Bloqueado` de su propia descarga (una petición).
+    m = Montaje({SITEMAP: xml(SITEMAP)}, robots=pagina(ROBOTS, desafio(), estado=403))
+    assert m.grande(SITEMAP).html == XML
+    assert m.http.grandes == [(SITEMAP, MAX_BYTES_SITEMAP)] and m.chromium.pedidas == []
+    assert not m.navegador.robots_ignorado("www.recambios-ejemplo.example")
 
 
 def test_grande_con_un_descargador_sin_descarga_grande() -> None:
@@ -254,15 +243,11 @@ def test_sitemaps_valida_la_url() -> None:
     assert m.robots_http.pedidas == []
 
 
-def test_sitemaps_se_leen_aunque_se_ignore_el_robots() -> None:
-    m = Montaje({}, respetar_robots=False)
-    assert asyncio.run(m.navegador.sitemaps(TIENDA)) == (SITEMAP, PRIVADO)
-
-
-def test_sitemaps_con_robots_bloqueado() -> None:
+def test_sitemaps_con_robots_bloqueado_no_hay_ninguno() -> None:
+    # R3-B: el catálogo sigue con las rutas habituales (`obtener(grande=True)`).
     m = Montaje({}, robots=pagina(ROBOTS, desafio(), estado=403))
-    with pytest.raises(Bloqueado):
-        asyncio.run(m.navegador.sitemaps(TIENDA))
+    assert asyncio.run(m.navegador.sitemaps(TIENDA)) == ()
+    assert m.http.pedidas == [] and m.chromium.pedidas == []
 
 
 def test_sitemap_bloqueado_nunca_va_por_chromium() -> None:
@@ -281,3 +266,37 @@ def test_sitemap_de_tienda_rescatada_va_por_http() -> None:
     m.grande(SITEMAP)
     assert m.http.grandes == [(SITEMAP, MAX_BYTES_SITEMAP)]
     assert m.chromium.pedidas == [ficha]
+
+
+# --- Clase del bloqueo: rechazo seco o desafío (causa R4-D de la campaña) ------------------------
+
+
+def nginx_403() -> str:
+    # La respuesta de Kenay a /sitemap.xml: 403 text/html de 548 bytes (la de nginx, reconstruida).
+    reales = Path(__file__).parent.parent / "fixtures" / "reales"
+    return (reales / "kenay_sitemap_403_nginx.html").read_text(encoding="utf-8")
+
+
+def test_sitemap_con_un_403_seco_es_un_bloqueo_seco() -> None:
+    m = Montaje({SITEMAP: pagina(SITEMAP, nginx_403(), estado=403)})
+    with pytest.raises(Bloqueado) as error:
+        m.grande(SITEMAP)
+    assert error.value.seco
+
+
+def test_sitemap_con_un_desafio_no_es_un_bloqueo_seco() -> None:
+    m = Montaje({SITEMAP: pagina(SITEMAP, desafio(), estado=403)})
+    with pytest.raises(Bloqueado) as error:
+        m.grande(SITEMAP)
+    assert not error.value.seco
+
+
+def test_el_limite_de_peticiones_no_es_un_bloqueo_seco() -> None:
+    m = Montaje({SITEMAP: pagina(SITEMAP, nginx_403(), estado=429)})
+    with pytest.raises(Bloqueado) as error:
+        m.grande(SITEMAP)
+    assert not error.value.seco
+
+
+def test_un_bloqueado_por_defecto_no_es_seco() -> None:
+    assert not Bloqueado(SITEMAP, "Cloudflare").seco

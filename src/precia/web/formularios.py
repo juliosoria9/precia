@@ -8,7 +8,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from decimal import Decimal
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode
 
 from precia.nucleo.modelos import CLAVES_CAMPOS, ConsultaBusqueda, Modo
 from precia.perfiles.entrada import MAX_ENTRADA
@@ -98,6 +98,22 @@ def consulta_desde_parametros(parametros: Parametros) -> ConsultaBusqueda:
         filtro=filtro,
     )
     return replace(consulta, campos=campos) if campos else consulta
+
+
+def parametros_de_consulta(consulta: ConsultaBusqueda) -> str:
+    """La consulta como parámetros de URL: la inversa de `consulta_desde_parametros` (C1).
+
+    Va en la URL de una búsqueda en segundo plano (`/busquedas/{id}?...`) y en «Actualizar
+    precios», para que el formulario salga relleno aunque la tarea ya no esté.
+    """
+    pares: list[tuple[str, str]] = [("texto", consulta.texto), ("modo", consulta.modo.value)]
+    pares.extend(("campos", c) for c in consulta.campos)
+    pares.extend(("tiendas", t) for t in consulta.tiendas)
+    if consulta.descubrir:
+        pares.append(("descubrir", "on"))
+    if consulta.filtro:
+        pares.append(("filtro", consulta.filtro))
+    return urlencode(pares)
 
 
 def datos_de_alta(formulario: Parametros) -> tuple[str, str]:

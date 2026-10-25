@@ -27,7 +27,8 @@ from precia.navegador.http import (
     RespuestaCruda,
     TransporteURLLib,
 )
-from precia.navegador.tipos import ErrorDescarga, URLNoPermitida
+from precia.navegador.tipos import DemasiadoGrande, ErrorDescarga, Pagina, URLNoPermitida
+from tests.cronometro import segundos_de_cpu
 from tests.navegador.falsos import Reloj, validar_con_dns_publico
 from tests.navegador.test_http import UA, Cuerpo, TransporteFalso, descargador, respuesta
 
@@ -193,10 +194,12 @@ def test_demasiados_miembros_se_rechazan() -> None:
 def test_miles_de_miembros_vacios_cortan_pronto() -> None:
     # Hostil: 1 MB de miembros vacíos (20 bytes cada uno) son 50 000 descompresores.
     cuerpo = gz(b"") * 50_000
-    inicio = time.perf_counter()
-    with pytest.raises(ErrorDescarga, match="comprimido"):
-        bajar(SITEMAP_GZ, respuesta(cuerpo, tipo="application/gzip"))
-    assert time.perf_counter() - inicio < 1.0
+
+    def cortar() -> None:
+        with pytest.raises(ErrorDescarga, match="comprimido"):
+            bajar(SITEMAP_GZ, respuesta(cuerpo, tipo="application/gzip"))
+
+    assert segundos_de_cpu(cortar, 1.0) < 1.0
 
 
 def test_cabecera_gzip_con_nombre_gigante_respeta_el_tope_comprimido() -> None:
@@ -233,25 +236,28 @@ def test_bomba_de_10_mb_que_serian_10_gb_se_para_en_el_tope() -> None:
     transporte = TransporteFalso({SITEMAP_GZ: [respuesta(bomba, tipo="application/gzip")]})
     d = descargador(transporte)
     tracemalloc.start()
-    inicio = time.perf_counter()
+    # Tiempo de CPU (bug 6), de un solo intento: el transporte falso da la respuesta una vez.
+    inicio = time.process_time()
     try:
         with pytest.raises(ErrorDescarga, match="grande"):
             asyncio.run(d.descargar_grande(SITEMAP_GZ))
-        duracion = time.perf_counter() - inicio
+        cpu = time.process_time() - inicio
         _, pico = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
-    assert duracion < 5.0
+    assert cpu < 5.0
     # Lo comprimido (10 MB) más, como mucho, el tope descomprimido y un trozo: nunca los 10 GB.
     assert pico < 2 * len(bomba) + MAX_BYTES_SITEMAP + 16 * 1024 * 1024
 
 
 def test_bomba_pequena_en_una_descarga_normal_se_para_en_5_mib() -> None:
     bomba = bomba_gzip(1 * GIB)  # unos 1 MB comprimidos
-    inicio = time.perf_counter()
-    with pytest.raises(ErrorDescarga, match="grande"):
-        bajar(SITEMAP_GZ, respuesta(bomba, tipo="application/gzip"))
-    assert time.perf_counter() - inicio < 2.0
+
+    def parar() -> None:
+        with pytest.raises(ErrorDescarga, match="grande"):
+            bajar(SITEMAP_GZ, respuesta(bomba, tipo="application/gzip"))
+
+    assert segundos_de_cpu(parar, 2.0) < 2.0
 
 
 def test_la_bomba_de_10_mb_no_pasa_ni_el_tope_comprimido_normal() -> None:
@@ -381,11 +387,15 @@ def test_muchos_miembros_y_una_cola_larga_no_se_copia_en_cada_miembro() -> None:
     # Hostil: 64 miembros pequeños y 20 MiB de ceros detrás. Mirar «¿solo queda relleno?» en cada
     # miembro copiaría la cola 64 veces.
     cuerpo = gz(b"<a/>") * MAX_MIEMBROS_GZIP + b"\x00" * (MAX_BYTES_SITEMAP - 4096)
-    transporte = TransporteFalso({SITEMAP_GZ: [respuesta(cuerpo, tipo="application/gzip")]})
-    inicio = time.perf_counter()
-    pagina = asyncio.run(descargador(transporte).descargar_grande(SITEMAP_GZ))
-    assert time.perf_counter() - inicio < 0.5
-    assert pagina.html == "<a/>" * MAX_MIEMBROS_GZIP
+    paginas: list[Pagina] = []
+
+    def descargar() -> None:
+        # Un transporte nuevo en cada intento: el falso da cada respuesta una sola vez.
+        transporte = TransporteFalso({SITEMAP_GZ: [respuesta(cuerpo, tipo="application/gzip")]})
+        paginas.append(asyncio.run(descargador(transporte).descargar_grande(SITEMAP_GZ)))
+
+    assert segundos_de_cpu(descargar, 0.5) < 0.5
+    assert paginas[-1].html == "<a/>" * MAX_MIEMBROS_GZIP
 
 
 # --- Contra un servidor local (127.0.0.1), con el transporte real -------------------------------
@@ -527,3 +537,20 @@ def test_sin_descomprimir_sigue_rechazando_lo_comprimido_sin_pedirlo() -> None:
     assert not cruda.descomprimida
     with pytest.raises(ErrorDescarga, match="sin pedirlo"):
         bajar(f"{TIENDA}/ficha", cruda)
+
+
+# --- El tope de tamaño es su propio error (A5 del plan de velocidad) ----------------------------
+
+
+def test_el_tope_de_tamano_es_demasiado_grande() -> None:
+    # El catálogo deja de leer un índice cuyos hijos no caben: tiene que distinguir este fallo.
+    assert issubclass(DemasiadoGrande, ErrorDescarga)
+    cuerpo = Cuerpo(b"x" * (MAX_BYTES_SITEMAP + 1))
+    with pytest.raises(DemasiadoGrande):
+        bajar(SITEMAP, RespuestaCruda(200, {"content-type": "text/xml"}, cuerpo), grande=True)
+    cabeceras = {"content-type": "application/xml", "content-length": str(MAX_BYTES_SITEMAP + 1)}
+    with pytest.raises(DemasiadoGrande):
+        bajar(SITEMAP, RespuestaCruda(200, cabeceras, Cuerpo(b"x")), grande=True)
+    comprimido = gz(b"<urlset>" + b"a" * 2000 + b"</urlset>")
+    with pytest.raises(DemasiadoGrande):
+        bajar(SITEMAP_GZ, respuesta(comprimido, tipo="application/gzip"), max_bytes=1000)

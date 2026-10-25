@@ -7,9 +7,10 @@ de mentira. La búsqueda completa contra una tienda falsa está en `tests/test_e
 import asyncio
 from collections.abc import Iterator
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -28,15 +29,19 @@ from precia.nucleo.fuente_datos import (
     TiendaYaExiste,
     URLEntradaNoValida,
 )
-from precia.nucleo.fuente_real import FuenteReal, proveedor_desde_ajustes
+from precia.nucleo.fuente_real import MARGEN_CANCELADO_S, FuenteReal, proveedor_desde_ajustes
 from precia.nucleo.modelos import (
     Ajustes,
     ConsultaBusqueda,
     EstadoPerfil,
+    EstadoTienda,
     LlamadaIA,
     Modo,
 )
+from precia.nucleo.orquestador import PLAZO_TIENDA_S
+from precia.perfiles.tipos import ConfiguracionFallida
 from tests.navegador.falsos import DescargadorFalso, validar_con_dns_publico
+from tests.nucleo.falsos import SeguimientoFalso
 from tests.perfiles.sitio import DOMINIO, perfil
 
 AHORA = datetime(2026, 10, 19, 12, 0, tzinfo=UTC)
@@ -81,6 +86,24 @@ def fuente(tmp_path: Path, fabrica: Fabrica) -> Iterator[FuenteReal]:
     )
     yield real
     asyncio.run(real.cerrar())
+
+
+def test_cerrar_espera_a_las_llamadas_de_ia_en_vuelo_antes_de_cerrar_la_base(
+    fuente: FuenteReal,
+) -> None:
+    # Revisión: una llamada de IA de una búsqueda cancelada al apagar se registra cuando
+    # termina; si la base ya estaba cerrada, el gasto del mes se quedaba corto.
+    vistas: list[int] = []
+
+    async def escenario() -> None:
+        llamada: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        llamada.add_done_callback(lambda _: vistas.append(len(fuente.tiendas())))
+        fuente._ia_en_vuelo.anotar(llamada)
+        asyncio.get_running_loop().call_later(0.01, llamada.set_result, None)
+        await fuente.cerrar()
+
+    asyncio.run(escenario())
+    assert vistas == [0]
 
 
 def test_cumple_el_protocolo_y_no_es_demo(fuente: FuenteReal) -> None:
@@ -326,7 +349,7 @@ def test_la_entrada_se_comprueba_con_el_dominio_de_la_tienda(fuente: FuenteReal)
 def _con_perfil(fuente: FuenteReal, **cambios: object) -> None:
     asyncio.run(fuente.alta_tienda(DOMINIO, "Recambios Prueba"))
     almacen = fuente.almacen
-    almacen.guardar_perfil(perfil(revisado=False, autor="🤖 configurador", **cambios))
+    almacen.guardar_perfil(perfil(revisado=False, autor="configurador IA", **cambios))
     almacen.actualizar_tienda(DOMINIO, estado=EstadoPerfil.PENDIENTE_REVISION)
 
 
@@ -340,7 +363,7 @@ def test_revisar_el_perfil_pendiente_lo_fija(fuente: FuenteReal) -> None:
 
 def test_revisar_un_perfil_del_reparador_lo_deja_reparado(fuente: FuenteReal) -> None:
     _con_perfil(fuente)
-    fuente.almacen.guardar_perfil(perfil(revisado=False, autor="🤖 reparador"))
+    fuente.almacen.guardar_perfil(perfil(revisado=False, autor="reparador IA"))
     assert fuente.revisar_perfil(DOMINIO, 2).estado is EstadoPerfil.REPARADO
 
 
@@ -386,6 +409,22 @@ def test_producto_historico_y_alertas_desde_el_almacen(fuente: FuenteReal) -> No
     assert fuente.alertas() == [alerta]
     with pytest.raises(LookupError):
         fuente.crear_alerta("oem-x", Decimal("80"), "email")
+
+
+def test_crear_alerta_pasa_solo_exactas(fuente: FuenteReal) -> None:
+    # B5: por defecto solo cuentan las exactas; la persona puede incluir equivalentes.
+    fuente.almacen.guardar_precio(
+        "oem-1k0698151",
+        "Pastillas",
+        "1K0698151",
+        DOMINIO,
+        f"https://www.{DOMINIO}/p",
+        Decimal("30"),
+        AHORA,
+    )
+    assert fuente.crear_alerta("oem-1k0698151", Decimal("25"), "email").solo_exactas is True
+    fuente.crear_alerta("oem-1k0698151", Decimal("20"), "email", solo_exactas=False)
+    assert [a.solo_exactas for a in fuente.alertas()] == [True, False]
 
 
 def test_resumen_de_ia_del_mes_con_nombres_legibles(fuente: FuenteReal) -> None:
@@ -458,6 +497,9 @@ def test_cambiar_los_ajustes_no_cierra_el_navegador_de_una_busqueda_en_vuelo(
     )
     real.almacen.alta_tienda(DOMINIO, "Recambios")
     real.almacen.guardar_perfil(perfil())
+    # Sin intervalo de cortesía: las dos búsquedas comparten la fila de la tienda y cada turno
+    # esperaría 1 s de verdad.
+    real.guardar_ajustes(replace(real.ajustes(), retardo_dominio_s=0.0))
 
     async def escenario() -> None:
         primera = asyncio.create_task(real.buscar(ConsultaBusqueda("faro", modo=Modo.CLASICO)))
@@ -468,9 +510,13 @@ def test_cambiar_los_ajustes_no_cierra_el_navegador_de_una_busqueda_en_vuelo(
         segunda = asyncio.create_task(real.buscar(ConsultaBusqueda("faro", modo=Modo.CLASICO)))
         await asyncio.wait_for(_esperar(descargadores, 2), 2)
         descargadores[1].soltar.set()
-        await asyncio.wait_for(segunda, 2)
+        # La segunda espera en la fila de la tienda (heredada): la primera tiene una petición en
+        # vuelo, y ni su robots.txt puede coincidir con ella (ADR-017).
+        await asyncio.sleep(0.05)
+        assert not segunda.done()
         assert not viejo.cerrado, "se cerró el navegador que usaba la primera búsqueda"
         viejo.soltar.set()
+        await asyncio.wait_for(segunda, 2)
         await asyncio.wait_for(primera, 2)
         assert not viejo.usado_cerrado
         # Al terminar la búsqueda que lo usaba, el navegador viejo sí se cierra.
@@ -484,3 +530,224 @@ def test_cambiar_los_ajustes_no_cierra_el_navegador_de_una_busqueda_en_vuelo(
 async def _esperar(descargadores: list[DescargadorEnEspera], cuantos: int) -> None:
     while len(descargadores) < cuantos:
         await asyncio.sleep(0)
+
+
+# --- Configuraciones fallidas (A1) --------------------------------------------------------------
+
+
+class Configurador:
+    """Sustituye a `configurar`: apunta la consulta de prueba y falla."""
+
+    def __init__(self) -> None:
+        self.consultas: list[str] = []
+
+    async def __call__(
+        self, dominio: str, navegador: Any, sesion: Any, consulta: str, **_: Any
+    ) -> Any:
+        self.consultas.append(consulta)
+        raise ConfiguracionFallida(f"No se ha podido configurar {dominio}.")
+
+
+def _con_ia(tmp_path: Path, **opciones: Any) -> FuenteReal:
+    return FuenteReal(
+        configuracion(tmp_path),
+        crear_descargadores=Fabrica(),
+        crear_proveedor=lambda _: (ProveedorSimulado({}), ""),
+        validador=validar_con_dns_publico,
+        reloj=lambda: AHORA,
+        **opciones,
+    )
+
+
+def test_fuente_real_usa_las_consultas_genericas_por_defecto(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    espia = Configurador()
+    monkeypatch.setattr("precia.nucleo.orquestador.configurar", espia)
+    real = _con_ia(tmp_path)
+    try:
+        asyncio.run(real.alta_tienda(DOMINIO, "Prueba"))
+        asyncio.run(real.buscar(ConsultaBusqueda("1K0698151", modo=Modo.AUTO)))
+    finally:
+        asyncio.run(real.cerrar())
+    assert espia.consultas == ["filtro"]
+
+
+def test_fuente_real_pasa_sus_consultas_de_configuracion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    espia = Configurador()
+    monkeypatch.setattr("precia.nucleo.orquestador.configurar", espia)
+    real = _con_ia(tmp_path, consultas_configuracion=("pastillas",))
+    try:
+        asyncio.run(real.alta_tienda(DOMINIO, "Prueba"))
+        asyncio.run(real.buscar(ConsultaBusqueda("1K0698151", modo=Modo.AUTO)))
+    finally:
+        asyncio.run(real.cerrar())
+    assert espia.consultas == ["pastillas"]
+
+
+def test_reintentar_configuracion_quita_la_espera(fuente: FuenteReal) -> None:
+    asyncio.run(fuente.alta_tienda(DOMINIO, "Prueba"))
+    fuente.almacen.registrar_fallo_configuracion(
+        DOMINIO, "x", AHORA, intentos=2, reintentar_desde=AHORA + timedelta(days=1)
+    )
+    tienda = fuente.reintentar_configuracion("WWW." + DOMINIO)
+    assert tienda.fallo is not None
+    assert (tienda.fallo.intentos, tienda.fallo.reintentar_desde) == (2, None)
+    assert fuente.tienda(DOMINIO) == tienda
+
+
+def test_reintentar_olvida_el_bloqueo_recordado(fuente: FuenteReal) -> None:
+    # A8: el mismo botón «Reintentar» vale para una tienda bloqueada que se recuerda en memoria.
+    asyncio.run(fuente.alta_tienda(DOMINIO, "Prueba"))
+
+    async def escenario() -> None:
+        navegador = await fuente._tomar_navegador(fuente.almacen.leer_ajustes())
+        await fuente._soltar_navegador(navegador)
+        navegador._bloqueadas[DOMINIO] = ("anti-bot", float("inf"))
+        fuente.reintentar_configuracion("WWW." + DOMINIO)
+        assert DOMINIO not in navegador._bloqueadas
+
+    asyncio.run(escenario())
+
+
+@pytest.mark.parametrize("dominio", ["no-existe.es", "", "localhost"])
+def test_reintentar_tienda_inexistente(fuente: FuenteReal, dominio: str) -> None:
+    with pytest.raises(TiendaNoExiste):
+        fuente.reintentar_configuracion(dominio)
+
+
+# --- Búsqueda en segundo plano (C1) -------------------------------------------------------------
+
+
+def test_la_fuente_real_pasa_el_seguimiento(fuente: FuenteReal) -> None:
+    fuente.almacen.alta_tienda(DOMINIO, "Recambios")
+    fuente.almacen.guardar_perfil(perfil())
+    seg = SeguimientoFalso()
+    asyncio.run(fuente.buscar(ConsultaBusqueda("faro", modo=Modo.CLASICO), seguimiento=seg))
+    assert seg.de(DOMINIO) == [EstadoTienda.DESCARGANDO, EstadoTienda.HECHA]
+    assert len(seg.parciales) == 1 and seg.parciales[0].provisional
+
+
+def _real_en_espera(tmp_path: Path, descargadores: list[DescargadorEnEspera]) -> FuenteReal:
+    def crear(_: Ajustes) -> tuple[Descargador, Descargador | None]:
+        descargadores.append(DescargadorEnEspera())
+        return descargadores[-1], None
+
+    real = FuenteReal(
+        configuracion(tmp_path),
+        crear_descargadores=crear,
+        crear_proveedor=lambda _: (None, "sin IA en el test"),
+        validador=validar_con_dns_publico,
+        reloj=lambda: AHORA,
+    )
+    real.almacen.alta_tienda(DOMINIO, "Recambios")
+    real.almacen.guardar_perfil(perfil())
+    return real
+
+
+def test_el_margen_tras_cancelar_sigue_al_cambiar_los_ajustes(tmp_path: Path) -> None:
+    # Revisión: el margen vivía en el limitador del navegador y unos ajustes nuevos crean otro
+    # navegador: la descarga cancelada seguía en su hilo y la siguiente salía en el acto.
+    real = _real_en_espera(tmp_path, [])
+    tienda = f"www.{DOMINIO}"
+
+    async def escenario() -> None:
+        viejo = await real._tomar_navegador(real.ajustes())
+
+        async def descarga() -> None:
+            async with viejo._limitador.turno(tienda):
+                await asyncio.sleep(100)
+
+        tarea = asyncio.create_task(descarga())
+        await asyncio.sleep(0.01)
+        tarea.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tarea
+        await real._soltar_navegador(viejo)
+        real.guardar_ajustes(replace(real.ajustes(), user_agent="Otro/1.0"))
+        nuevo = await real._tomar_navegador(real.ajustes())
+        assert nuevo is not viejo
+
+        async def entrar() -> None:
+            async with nuevo._limitador.turno(tienda):
+                pass
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(entrar(), 0.05)
+        await real._soltar_navegador(nuevo)
+        await real.cerrar()
+
+    asyncio.run(escenario())
+
+
+def test_la_fuente_real_pasa_el_plazo_y_el_margen_de_cortesia(tmp_path: Path) -> None:
+    descargadores: list[DescargadorEnEspera] = []
+    real = _real_en_espera(tmp_path, descargadores)
+    assert real.plazo_tienda_s == PLAZO_TIENDA_S
+    real.plazo_tienda_s = 0.05
+    seg = SeguimientoFalso()
+
+    async def escenario() -> None:
+        consulta = ConsultaBusqueda("faro", modo=Modo.CLASICO)
+        await asyncio.wait_for(real.buscar(consulta, seguimiento=seg), 2)
+        navegador = real._navegador
+        assert navegador is not None
+        assert navegador._limitador._margen_cancelado_s == MARGEN_CANCELADO_S
+        await real.cerrar()
+
+    asyncio.run(escenario())
+    assert seg.de(DOMINIO) == [EstadoTienda.DESCARGANDO, EstadoTienda.PLAZO]
+    # A7: el timeout de un sitemap (10 s, el triple) más una lectura de urllib puede seguir en
+    # su hilo tras cancelar.
+    assert MARGEN_CANCELADO_S == 40.0
+
+
+def test_cancelar_una_busqueda_suelta_el_navegador(tmp_path: Path) -> None:
+    descargadores: list[DescargadorEnEspera] = []
+    real = _real_en_espera(tmp_path, descargadores)
+
+    async def escenario() -> None:
+        tarea = asyncio.create_task(real.buscar(ConsultaBusqueda("faro", modo=Modo.CLASICO)))
+        await asyncio.wait_for(_esperar(descargadores, 1), 2)
+        await asyncio.wait_for(descargadores[0].en_vuelo.wait(), 2)
+        tarea.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tarea
+        assert real._usos == {}
+        await real.cerrar()
+        assert descargadores[0].cerrado
+
+    asyncio.run(escenario())
+
+
+class ConfiguradorLento(Configurador):
+    """Tarda un poco en fallar: la otra búsqueda llega mientras configura."""
+
+    async def __call__(
+        self, dominio: str, navegador: Any, sesion: Any, consulta: str, **_: Any
+    ) -> Any:
+        await asyncio.sleep(0.01)
+        return await super().__call__(dominio, navegador, sesion, consulta)
+
+
+def test_dos_busquedas_a_la_vez_comparten_el_turno_de_configurar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # B6: cada búsqueda tiene su orquestador, pero los turnos de perfil son de la fuente.
+    espia = ConfiguradorLento()
+    monkeypatch.setattr("precia.nucleo.orquestador.configurar", espia)
+    real = _con_ia(tmp_path)
+
+    async def escenario() -> None:
+        await real.alta_tienda(DOMINIO, "Prueba")
+        await asyncio.gather(
+            real.buscar(ConsultaBusqueda("faro", modo=Modo.AUTO)),
+            real.buscar(ConsultaBusqueda("freno", modo=Modo.AUTO)),
+        )
+        await real.cerrar()
+
+    asyncio.run(escenario())
+    # La segunda espera su turno, ve el fallo de la primera y deja la tienda en espera (A1).
+    assert espia.consultas == ["filtro"]

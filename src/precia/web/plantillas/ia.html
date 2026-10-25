@@ -4,7 +4,7 @@
 {% set r = resumen %}
 <section class="cabecera">
   <h1>Registro de IA</h1>
-  <p class="sub">Todas las llamadas que hace PrecIA al modelo, con su coste. El modelo <strong>no ejecuta nada</strong>: solo devuelve JSON, que se valida contra un esquema y se comprueba contra la página (anclaje).</p>
+  <p class="sub">Todas las llamadas que hace PrecIA al modelo, con su coste. El modelo no ejecuta nada: solo devuelve JSON, que PrecIA valida contra un esquema y comprueba contra la página (anclaje).</p>
 </section>
 
 <div class="kpis">
@@ -47,7 +47,7 @@
           <td class="num">{{ c.tokens_entrada | miles }} / {{ c.tokens_salida | miles }}</td>
           <td class="num">{{ c.coste_usd | dolares }}</td>
           <td class="num">{{ (c.duracion_ms / 1000) | decimal }} s</td>
-          <td>{% if c.resultado.startswith("Válida") %}<span class="insignia insignia-ok">✓</span>{% else %}<span class="insignia insignia-aviso">!</span>{% endif %} {{ c.resultado }}</td>
+          <td><span class="resultado-ia {{ 'resultado-ok' if c.resultado.startswith('Válida') else 'resultado-aviso' }}" aria-hidden="true"></span>{{ c.resultado }}</td>
         </tr>
         {% endfor %}
       </tbody>

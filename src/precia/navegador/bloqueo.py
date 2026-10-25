@@ -159,8 +159,22 @@ def detectar_bloqueo(pagina: Pagina) -> str | None:
     if pagina.estado in _ESTADOS_DESAFIO and habla_de_desafio:
         return f"La tienda bloquea el acceso automático (HTTP {pagina.estado})."
     if _rechazo_seco(pagina):
-        return f"La tienda rechaza el acceso automático (HTTP {pagina.estado})."
+        return _motivo_seco(pagina.estado)
     return None
+
+
+def es_rechazo_seco(pagina: Pagina, motivo: str) -> bool:
+    """Si `motivo` (de `detectar_bloqueo(pagina)`) es un rechazo seco y no un desafío.
+
+    Un rechazo seco no trae proveedor, widget de CAPTCHA ni frase de desafío: solo el código
+    (401/403/405/451) en una página pequeña. Nunca lo es el límite de peticiones (429), que
+    `detectar_bloqueo` resuelve antes (causa R4-D).
+    """
+    return motivo == _motivo_seco(pagina.estado)
+
+
+def _motivo_seco(estado: int) -> str:
+    return f"La tienda rechaza el acceso automático (HTTP {estado})."
 
 
 def _proveedor(contenido: str, titulo: str, estado: int) -> str | None:

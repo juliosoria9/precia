@@ -1,8 +1,10 @@
 """Extractor de respaldo con IA: esquema por campos, limpieza de valores y límites."""
 
 import asyncio
+import hashlib
 import json
 import re
+from collections.abc import Mapping
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -11,10 +13,10 @@ import pytest
 
 from precia.extraccion.tipos import ExtractorIA
 from precia.ia.claude import ProveedorClaude
-from precia.ia.extractor import MAX_CARACTERES_VALOR, ExtractorRespaldoIA
+from precia.ia.extractor import MAX_CARACTERES_VALOR, VERSION, ExtractorRespaldoIA
 from precia.ia.servicio import ServicioIA
 from precia.ia.simulado import Guion, ProveedorSimulado
-from precia.ia.tipos import PresupuestoAgotado, SalidaNoValida
+from precia.ia.tipos import IANoDisponible, PresupuestoAgotado, SalidaNoValida
 from tests.ia.falsos import EsperaFalsa, RegistroFalso, TransporteFalso, respuesta_json
 
 FICHA = (Path(__file__).parent.parent / "fixtures" / "ia" / "ficha_desguace.txt").read_text(
@@ -22,12 +24,38 @@ FICHA = (Path(__file__).parent.parent / "fixtures" / "ia" / "ficha_desguace.txt"
 )
 
 
-def montar(guion: list[Guion], *, tope: int = 10) -> tuple[ExtractorRespaldoIA, ProveedorSimulado]:
-    proveedor = ProveedorSimulado({"extractor": guion})
+Clave = tuple[str, tuple[str, ...], str]
+
+
+class CacheEnMemoria:
+    """`ia.tipos.CacheExtracciones` en un diccionario."""
+
+    def __init__(self) -> None:
+        self.datos: dict[Clave, dict[str, str]] = {}
+
+    def leer(
+        self, texto_sha256: str, campos: tuple[str, ...], modelo: str
+    ) -> dict[str, str] | None:
+        return self.datos.get((texto_sha256, campos, modelo))
+
+    def guardar(
+        self, texto_sha256: str, campos: tuple[str, ...], modelo: str, valores: Mapping[str, str]
+    ) -> None:
+        self.datos[(texto_sha256, campos, modelo)] = dict(valores)
+
+
+def montar(
+    guion: list[Guion],
+    *,
+    tope: int = 10,
+    cache: CacheEnMemoria | None = None,
+    modelo: str = "simulado",
+) -> tuple[ExtractorRespaldoIA, ProveedorSimulado]:
+    proveedor = ProveedorSimulado({"extractor": guion}, modelo=modelo)
     servicio = ServicioIA(
         proveedor, RegistroFalso(), presupuesto_mes_usd=Decimal(5), tope_llamadas=tope
     )
-    return ExtractorRespaldoIA(servicio.nueva_busqueda()), proveedor
+    return ExtractorRespaldoIA(servicio.nueva_busqueda(), cache=cache), proveedor
 
 
 def extraer(extractor: ExtractorRespaldoIA, campos: tuple[str, ...]) -> dict[str, str]:
@@ -103,6 +131,75 @@ def test_respeta_los_limites_de_la_sesion() -> None:
     extractor, proveedor = montar([{"precio": "1"}], tope=0)
     with pytest.raises(PresupuestoAgotado):
         extraer(extractor, ("precio",))
+    assert proveedor.peticiones == []
+
+
+# --- Caché del extractor (A3) ---------------------------------------------------------------
+
+
+def test_la_misma_pagina_y_campos_no_llama_a_la_ia_dos_veces() -> None:
+    cache = CacheEnMemoria()
+    extractor, proveedor = montar([{"estado": "Usado"}], cache=cache)
+    assert extraer(extractor, ("estado",)) == {"estado": "Usado"}
+    assert extraer(extractor, ("estado",)) == {"estado": "Usado"}
+    assert len(proveedor.peticiones) == 1
+    assert extractor.desde_cache == 1
+    sha = hashlib.sha256(FICHA.encode("utf-8")).hexdigest()
+    assert list(cache.datos) == [(sha, ("estado",), f"simulado/simulado#v{VERSION}")]
+
+
+def test_una_respuesta_vacia_tambien_se_guarda() -> None:
+    # El caso de Oscaro: la IA no encuentra «estado»; la siguiente vez no se le vuelve a pedir.
+    cache = CacheEnMemoria()
+    extractor, proveedor = montar([{"estado": None}], cache=cache)
+    assert extraer(extractor, ("estado",)) == {}
+    assert extraer(extractor, ("estado",)) == {}
+    assert len(proveedor.peticiones) == 1
+
+
+def test_un_acierto_no_gasta_del_tope() -> None:
+    extractor, _ = montar([{"estado": "Usado"}], tope=1, cache=CacheEnMemoria())
+    extraer(extractor, ("estado",))
+    assert extraer(extractor, ("estado",)) == {"estado": "Usado"}
+    with pytest.raises(PresupuestoAgotado):
+        extraer(extractor, ("marca",))
+
+
+def test_otro_modelo_u_otros_campos_no_aciertan() -> None:
+    cache = CacheEnMemoria()
+    uno, _ = montar([{"estado": "Usado", "marca": "SEAT"}], cache=cache)
+    extraer(uno, ("marca", "estado"))
+    # El orden de los campos no importa...
+    otra_vez, proveedor = montar([], cache=cache)
+    assert extraer(otra_vez, ("estado", "marca")) == {"estado": "Usado", "marca": "SEAT"}
+    assert proveedor.peticiones == []
+    # ...el conjunto y el modelo, sí.
+    otros, proveedor = montar([{"estado": "Usado"}], cache=cache)
+    extraer(otros, ("estado",))
+    otro_modelo, proveedor_2 = montar(
+        [{"estado": "Usado", "marca": "SEAT"}], cache=cache, modelo="m2"
+    )
+    extraer(otro_modelo, ("estado", "marca"))
+    assert len(proveedor.peticiones) == len(proveedor_2.peticiones) == 1
+
+
+def test_un_error_de_la_ia_no_se_guarda() -> None:
+    cache = CacheEnMemoria()
+    extractor, _ = montar([IANoDisponible("sin red")], cache=cache)
+    with pytest.raises(IANoDisponible):
+        extraer(extractor, ("estado",))
+    assert cache.datos == {}
+
+
+def test_un_acierto_se_filtra_a_los_campos_pedidos() -> None:
+    cache = CacheEnMemoria()
+    sha = hashlib.sha256(FICHA.encode("utf-8")).hexdigest()
+    cache.datos[(sha, ("estado",), f"simulado/simulado#v{VERSION}")] = {
+        "estado": "Usado",
+        "precio": "1 €",
+    }
+    extractor, proveedor = montar([], cache=cache)
+    assert extraer(extractor, ("estado",)) == {"estado": "Usado"}
     assert proveedor.peticiones == []
 
 

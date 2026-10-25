@@ -6,7 +6,7 @@ de un `ServicioIA` de verdad (tope de llamadas, reintento ante salida no válida
 """
 
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -287,7 +287,7 @@ class NavegadorFalso:
     declarados: tuple[str, ...] = ()
     """Líneas `Sitemap:` de su robots.txt, tal cual (`sitemaps()`; nota 16 §B)."""
     error_robots: Exception | None = None
-    """Lo que lanza `sitemaps()` (un `Bloqueado` si el robots.txt es un desafío anti-bot)."""
+    """Lo que lanza `sitemaps()` (un `Bloqueado` si el robots.txt es un desafío y se respeta)."""
     grandes: list[str] = field(default_factory=list)
     """URL pedidas con `grande=True` (sitemaps)."""
     robots: list[str] = field(default_factory=list)
@@ -427,6 +427,8 @@ class CatalogoFalso:
     guardados: list[tuple[str, str, list[tuple[str, str, str | None]], bool]] = field(
         default_factory=list
     )
+    idiomas: list[tuple[str, ...]] = field(default_factory=list)
+    """El `idioma` de cada catálogo guardado, en el mismo orden que `guardados` (R5-C)."""
 
     def guardar_catalogo(
         self,
@@ -435,7 +437,10 @@ class CatalogoFalso:
         entradas: Iterable[tuple[str, str, str | None]],
         *,
         parcial: bool,
+        pendientes: Iterable[str] = (),
+        idioma: Sequence[str] = (),
     ) -> InfoCatalogo:
         lista = list(entradas)
         self.guardados.append((dominio, sitemap, lista, parcial))
-        return InfoCatalogo(dominio, sitemap, INSTANTE, len(lista), parcial)
+        self.idiomas.append(tuple(idioma))
+        return InfoCatalogo(dominio, sitemap, INSTANTE, len(lista), parcial, tuple(idioma))

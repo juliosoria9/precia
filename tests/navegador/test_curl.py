@@ -20,7 +20,7 @@ import pytest
 from precia.navegador.con_proxy import conexion_cortada
 from precia.navegador.curl import ACCEPT_LANGUAGE_NAVEGADOR, TransporteCurl
 from precia.navegador.http import MAXIMO_BYTES, DescargadorHTTP, TransporteNavegador
-from precia.navegador.tipos import ErrorDescarga, URLNoPermitida
+from precia.navegador.tipos import DemasiadoGrande, ErrorDescarga, URLNoPermitida
 from precia.navegador.url import IP, ip_publica
 from tests.navegador.servidores_curl import (
     respuesta_http,
@@ -458,12 +458,16 @@ def test_handshake_tls_a_goteo_respeta_el_tiempo_total(curl: TransporteCurl) -> 
 
 
 def test_el_tiempo_incluye_el_dns() -> None:
-    lento = TransporteCurl(ip_permitida=es_loopback, resolver=ResolverFalso(espera_s=0.6))
+    # Si el DNS no contara, tardaría la espera del DNS más el timeout entero. El tope queda a
+    # mitad de camino entre lo bueno (el timeout) y lo malo (timeout + DNS): antes eran 1,5 s
+    # con 1 + 0,6, y lo malo (1,6 s) apenas se distinguía de lo bueno con la máquina cargada.
+    timeout, dns = 2.0, 1.2
+    lento = TransporteCurl(ip_permitida=es_loopback, resolver=ResolverFalso(espera_s=dns))
     try:
         with servidor_goteo(b"HTTP/1.1 200 OK\r\nX-Relleno: ") as servidor:
             inicio = time.monotonic()
-            _falla_a_tiempo(lento, f"http://tienda.example:{servidor.puerto}/")
-            assert time.monotonic() - inicio < 1.5
+            _falla_a_tiempo(lento, f"http://tienda.example:{servidor.puerto}/", timeout)
+            assert time.monotonic() - inicio < timeout + dns / 2
     finally:
         lento.cerrar()
 
@@ -668,3 +672,12 @@ def test_menos_de_un_milisegundo_de_plazo_cuenta_como_agotado() -> None:
     with pytest.raises(ErrorDescarga, match="tiempo"):
         _restante(time.monotonic() + 0.0005)
     assert _restante(time.monotonic() + 1) > 0.5
+
+
+def test_el_tope_es_demasiado_grande(curl: TransporteCurl) -> None:
+    # A5 del plan de velocidad: el catálogo distingue el tope de tamaño de los demás fallos.
+    with servidor_crudo(respuesta_http(b"y" * 5000)) as servidor, pytest.raises(DemasiadoGrande):
+        pedir(curl, f"http://tienda.example:{servidor.puerto}/", max_bytes=1000)
+    grande = respuesta_http(b"x" * 1000, Content_Length=str(10 << 20))
+    with servidor_crudo(grande) as servidor, pytest.raises(DemasiadoGrande):
+        pedir(curl, f"http://tienda.example:{servidor.puerto}/", max_bytes=1 << 20)

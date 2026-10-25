@@ -32,6 +32,7 @@ from precia.nucleo.modelos import (
     EstadoPaso,
     EstadoPerfil,
     EstadoProxy,
+    EstadoTienda,
     GrupoProducto,
     LlamadaIA,
     Modo,
@@ -43,6 +44,7 @@ from precia.nucleo.modelos import (
     ResultadoBusqueda,
     ResultadoEvaluacion,
     ResumenIA,
+    Seguimiento,
     SerieHistorico,
     Tienda,
     ValorCampo,
@@ -71,7 +73,7 @@ TIENDAS: tuple[Tienda, ...] = (
             VersionPerfil(
                 1,
                 datetime(2026, 10, 5, 11, 20),
-                "🤖 configurador · revisado por Julio",
+                "configurador IA · revisado por Julio",
                 "https://recambiosnorte.example/buscar?q={consulta}",
                 _SELECTORES_V1,
                 True,
@@ -91,7 +93,7 @@ TIENDAS: tuple[Tienda, ...] = (
             VersionPerfil(
                 1,
                 datetime(2026, 10, 6, 9, 5),
-                "🤖 configurador · revisado por Julio",
+                "configurador IA · revisado por Julio",
                 "https://piezasya.example/search?text={consulta}",
                 {**_SELECTORES_V1, "precio": ".price-box .price"},
                 True,
@@ -99,7 +101,7 @@ TIENDAS: tuple[Tienda, ...] = (
             VersionPerfil(
                 2,
                 datetime(2026, 10, 12, 18, 40),
-                "🤖 reparador · revisado por Julio",
+                "reparador IA · revisado por Julio",
                 "https://piezasya.example/search?text={consulta}",
                 {**_SELECTORES_V1, "precio": "[data-testid=precio-final]"},
                 True,
@@ -119,7 +121,7 @@ TIENDAS: tuple[Tienda, ...] = (
             VersionPerfil(
                 1,
                 datetime(2026, 10, 18, 20, 15),
-                "🤖 configurador",
+                "configurador IA",
                 "https://desguacesur.example/piezas?ref={consulta}",
                 {**_SELECTORES_V1, "estado": ".estado-pieza"},
                 True,
@@ -139,7 +141,7 @@ TIENDAS: tuple[Tienda, ...] = (
             VersionPerfil(
                 1,
                 datetime(2026, 10, 2, 16, 0),
-                "🤖 configurador · revisado por Julio",
+                "configurador IA · revisado por Julio",
                 "https://motorpiezas.example/b/{consulta}",
                 _SELECTORES_V1,
                 False,
@@ -151,7 +153,7 @@ TIENDAS: tuple[Tienda, ...] = (
         "autodescuento.example",
         "AutoDescuento",
         EstadoPerfil.SIN_PERFIL,
-        "Prohíbe /buscar (Disallow): no se visita",
+        "Lo prohíbe; se ignora por decisión del usuario (ADR-017)",
         False,
         None,
         0,
@@ -235,12 +237,12 @@ CATALOGO: tuple[_ProductoDemo, ...] = (
             Descartado(
                 "recambiosnorte.example",
                 "Sensor de desgaste de pastillas delanteras",
-                "🤖 Accesorio, no es la pieza buscada",
+                "IA · Accesorio, no es la pieza buscada",
             ),
             Descartado(
                 "motorpiezas.example",
                 "Kit discos + pastillas delanteras Golf",
-                "🤖 Kit: incluye otras piezas",
+                "IA · Kit: incluye otras piezas",
             ),
         ),
     ),
@@ -478,13 +480,16 @@ class FuenteDemo:
         ]
     )
 
-    async def buscar(self, consulta: ConsultaBusqueda) -> ResultadoBusqueda:
+    async def buscar(
+        self, consulta: ConsultaBusqueda, *, seguimiento: Seguimiento | None = None
+    ) -> ResultadoBusqueda:
         tiendas = [
             t for t in self._tiendas if not consulta.tiendas or t.dominio in consulta.tiendas
         ]
-        visitables = {t.dominio for t in tiendas if t.robots_permite}
+        # ADR-017: el robots.txt nunca deja fuera una tienda; solo se avisa en su progreso.
+        visitables = {t.dominio for t in tiendas}
         # Auto: la IA solo entra si falla la vía clásica (perfil roto) o hay filtro que aplicar.
-        falla_algo = any(t.estado is EstadoPerfil.ROTO for t in tiendas if t.robots_permite)
+        falla_algo = any(t.estado is EstadoPerfil.ROTO for t in tiendas)
         con_ia = consulta.modo is Modo.IA or (
             consulta.modo is Modo.AUTO and (falla_algo or bool(consulta.filtro))
         )
@@ -506,14 +511,14 @@ class FuenteDemo:
                     pide_usado and not pide_nuevo and not es_usado
                 ):
                     descartados.append(
-                        Descartado(o.tienda, o.titulo, f"🤖 Filtro: «{consulta.filtro}»")
+                        Descartado(o.tienda, o.titulo, f"IA · Filtro: «{consulta.filtro}»")
                     )
                     continue
                 ofertas.append(self._oferta(o, consulta.campos, con_ia))
             descartados.extend(
                 d
                 for d in producto.descartados
-                if d.tienda in visitables and (con_ia or not d.motivo.startswith("🤖"))
+                if d.tienda in visitables and (con_ia or not d.motivo.startswith("IA · "))
             )
             if ofertas:
                 grupos.append(self._grupo(producto, tuple(ofertas), con_ia))
@@ -529,6 +534,10 @@ class FuenteDemo:
                 0, ProgresoTienda("Google", (Paso("descubrir", EstadoPaso.AVISO, aviso),))
             )
 
+        if seguimiento is not None:
+            # La demo no descarga nada: todas las tiendas terminan a la vez (C1).
+            for t in tiendas:
+                seguimiento.tienda(t.dominio, EstadoTienda.HECHA)
         llamadas = 0 if not con_ia else (6 if consulta.modo is Modo.IA else 3)
         coste = {
             Modo.CLASICO: Decimal("0"),
@@ -575,21 +584,23 @@ class FuenteDemo:
         if p.oem:
             criterio = "Referencia OEM exacta"
         else:
-            criterio = "🤖 Emparejado por IA" if con_ia else "Similitud de texto (difflib)"
+            criterio = "Emparejado por IA" if con_ia else "Similitud de texto (difflib)"
         return GrupoProducto(p.id, p.nombre, p.oem, criterio, ofertas)
 
     @staticmethod
     def _progreso(t: Tienda, con_ia: bool) -> ProgresoTienda:
-        if not t.robots_permite:
-            return ProgresoTienda(t.dominio, (Paso("robots.txt", EstadoPaso.OMITIDO, t.robots),))
+        # ADR-017: si el robots.txt lo prohíbe se visita igual, con un aviso.
+        robots = Paso(
+            "robots.txt", EstadoPaso.OK if t.robots_permite else EstadoPaso.AVISO, t.robots
+        )
         version = t.version_actual
         if version is None:
-            # Tienda dada de alta en la demo: no se configura porque no se visita nada.
+            # Tienda dada de alta en la demo: no se configura porque no se visita nada, así que
+            # tampoco hay paso del robots.txt (su aviso sigue en Tiendas y en el inicio).
             sin_perfil = Paso(
                 "perfil", EstadoPaso.OMITIDO, "Sin perfil: en la demo no se configuran tiendas"
             )
             return ProgresoTienda(t.dominio, (sin_perfil,))
-        robots = Paso("robots.txt", EstadoPaso.OK, t.robots)
         busqueda = Paso("búsqueda", EstadoPaso.OK, "Resultados descargados (caché 6 h)")
         if t.estado is EstadoPerfil.ROTO:
             if not con_ia:
@@ -603,14 +614,14 @@ class FuenteDemo:
                     robots,
                     busqueda,
                     Paso(
-                        "perfil", EstadoPaso.IA, "🤖 Reparador: propone v2, pendiente de revisión"
+                        "perfil", EstadoPaso.IA, "IA · Reparador: propone v2, pendiente de revisión"
                     ),
-                    Paso("extracción", EstadoPaso.IA, "🤖 Extractor de respaldo"),
+                    Paso("extracción", EstadoPaso.IA, "Extractor de respaldo con IA"),
                     Paso("verificación", EstadoPaso.AVISO, "1 valor descartado por anclaje"),
                 ),
             )
         nota = {
-            EstadoPerfil.REPARADO: "reparado por 🤖",
+            EstadoPerfil.REPARADO: "reparado por la IA",
             EstadoPerfil.PENDIENTE_REVISION: "pendiente de revisión",
         }.get(t.estado, "revisado")
         estado_perfil = (
@@ -661,6 +672,17 @@ class FuenteDemo:
         self._tiendas[self._tiendas.index(tienda)] = nueva
         return nueva
 
+    def reintentar_configuracion(self, dominio: str) -> Tienda:
+        normalizado = normalizar_dominio(dominio)
+        tienda = self.tienda(normalizado) if normalizado else None
+        if tienda is None:
+            raise TiendaNoExiste(f"No hay ninguna tienda {dominio}.")
+        if tienda.fallo is None:
+            return tienda
+        nueva = replace(tienda, fallo=replace(tienda.fallo, reintentar_desde=None))
+        self._tiendas[self._tiendas.index(tienda)] = nueva
+        return nueva
+
     def revisar_perfil(self, dominio: str, version: int) -> Tienda:
         tienda = self.tienda(dominio)
         if tienda is None:
@@ -707,11 +729,20 @@ class FuenteDemo:
     def alertas(self) -> list[Alerta]:
         return list(self._alertas)
 
-    def crear_alerta(self, id_producto: str, umbral: Decimal, canal: str) -> Alerta:
+    def crear_alerta(
+        self, id_producto: str, umbral: Decimal, canal: str, *, solo_exactas: bool = True
+    ) -> Alerta:
         producto = self.producto(id_producto)
         if producto is None:
             raise KeyError(id_producto)
-        alerta = Alerta(len(self._alertas) + 1, id_producto, producto.nombre, umbral, canal)
+        alerta = Alerta(
+            len(self._alertas) + 1,
+            id_producto,
+            producto.nombre,
+            umbral,
+            canal,
+            solo_exactas=solo_exactas,
+        )
         self._alertas.append(alerta)
         return alerta
 

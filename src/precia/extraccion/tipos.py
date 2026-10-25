@@ -1,10 +1,22 @@
 """Contrato del paquete `extraccion`: precios, producto JSON-LD, listados y fichas."""
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 from typing import Protocol
 
 from precia.nucleo.modelos import ValorCampo
+
+OBRAS_VENDIBLES = frozenset(
+    {"Book", "Audiobook", "Movie", "MusicAlbum", "MusicRecording", "VideoGame"}
+    | {"SoftwareApplication"}
+)
+"""Tipos de `schema.org` que no son `Product` pero que las tiendas venden con su oferta.
+
+Las librerías publican `Book` o `Audiobook` con `offers` y sin `Product`. La lista es cerrada a
+propósito: `Event`, `Service`, `Organization` u `OfferCatalog` también llevan ofertas y no son el
+producto de una ficha.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +43,9 @@ class ProductoJSONLD:
     descripcion: str | None = None
     imagenes: tuple[str, ...] = ()
     url: str | None = None
+    en_lista: bool = False
+    """Va dentro de los `itemListElement` de una lista (`ItemList`, `OfferCatalog`): es una
+    tarjeta de un listado o un producto relacionado, no el producto de la página por sí solo."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +56,8 @@ class ResultadoListado:
     url: str
     """Absoluta y del mismo dominio que la tienda."""
     precio: Precio | None = None
+    foto: str | None = None
+    """La foto de la tarjeta (`imagenes.foto_de_tarjeta`), ya validada; `None` si no hay."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +70,24 @@ class FichaExtraida:
     campos: dict[str, ValorCampo]
     """Solo los campos pedidos que se han obtenido; cada uno con origen, anclaje y confianza."""
     avisos: tuple[str, ...] = field(default_factory=tuple)
+    referencias_citadas: frozenset[str] = frozenset()
+    """Las referencias buscadas que la página cita, ancladas en su texto visible o en una pestaña
+    oculta (B5). Solo sirven para el emparejado como «equivalente», nunca para anclar valores."""
+    obtenida: datetime | None = None
+    """Cuándo se descargó la página (o la respuesta de la API): si salió de la caché, es la
+    fecha de la descarga, no la de ahora. Es la que va al histórico (A3)."""
+    listado: int = 0
+    """Si la página es un listado y no una ficha (R2-C10: landing de marca o SEO), cuántos
+    productos trae su JSON-LD `ItemList`. Entonces no hay precio ni campos; si no, 0."""
+    repetidos: dict[str, str] = field(default_factory=dict)
+    """Campos cuyo selector del perfil leyó lo mismo que el de otro campo de más prioridad, y se
+    descartaron (R2-CAMPOS): campo descartado → campo que se queda con el valor."""
+    sin_forma: dict[str, str] = field(default_factory=dict)
+    """Campos cuyo selector del perfil leyó un valor sin forma de ese campo (R3-E: «100% algodón»
+    como referencia) y se descartaron: campo → valor leído, recortado."""
+    foto: str | None = None
+    """URL `https` de la foto principal, validada por `imagenes.foto_valida` y sacada del marcado
+    de la página o de la API de la tienda, nunca de la IA. Se enlaza, no se descarga."""
 
 
 class SelectorNoValido(ValueError):

@@ -26,6 +26,7 @@ from precia.navegador.http import (
     decodificar,
 )
 from precia.navegador.tipos import ErrorDescarga, URLNoPermitida
+from tests.cronometro import segundos_de_cpu
 from tests.navegador.falsos import IP_PUBLICA, Reloj, validar_con_dns_publico
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "navegador"
@@ -321,9 +322,7 @@ def test_utf16_declarado_dentro_de_un_documento_ascii_se_ignora(cuerpo: bytes, m
 
 def test_declaracion_xml_hostil_no_dispara_el_tiempo() -> None:
     hostil = b"<?xml " + b" " * 3000 + b"encoding" * 5000 + b"=" * 100_000
-    inicio = time.perf_counter()
-    decodificar(hostil)
-    assert time.perf_counter() - inicio < 1
+    assert segundos_de_cpu(lambda: decodificar(hostil), 1) < 1
 
 
 def test_errores_http_se_devuelven_como_pagina() -> None:

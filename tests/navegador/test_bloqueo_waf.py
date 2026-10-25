@@ -5,12 +5,12 @@ Las fixtures están escritas a mano imitando las páginas reales de cada proveed
 negativos son igual de importantes, porque un falso bloqueo deja una tienda sin comparar.
 """
 
-import time
 from pathlib import Path
 
 import pytest
 
 from precia.navegador.bloqueo import detectar_bloqueo
+from tests.cronometro import segundos_de_cpu
 from tests.navegador.falsos import pagina
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "navegador"
@@ -187,10 +187,11 @@ def test_xml_opensearch_no_es_bloqueo() -> None:
 # --- Entradas hostiles: lineal y rápido ---------------------------------------------------------
 
 
-def _cronometrar(html: str, estado: int, tipo: str = "text/html") -> float:
-    inicio = time.perf_counter()
-    detectar_bloqueo(pagina(URL, html, estado=estado, tipo=tipo))
-    return time.perf_counter() - inicio
+def _cronometrar(html: str, estado: int, tipo: str = "text/html", limite: float = 2) -> float:
+    """Segundos de CPU de la detección: el mejor de hasta 3 intentos (bug 6)."""
+    return segundos_de_cpu(
+        lambda: detectar_bloqueo(pagina(URL, html, estado=estado, tipo=tipo)), limite
+    )
 
 
 @pytest.mark.parametrize(

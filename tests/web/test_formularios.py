@@ -1,9 +1,9 @@
-import time
 from decimal import Decimal
+from urllib.parse import parse_qs
 
 import pytest
 
-from precia.nucleo.modelos import Modo
+from precia.nucleo.modelos import ConsultaBusqueda, Modo
 from precia.perfiles.entrada import MAX_ENTRADA
 from precia.web.formularios import (
     ErrorFormulario,
@@ -13,7 +13,9 @@ from precia.web.formularios import (
     leer_formulario,
     leer_importe,
     leer_version,
+    parametros_de_consulta,
 )
+from tests.cronometro import segundos_de_cpu
 
 
 def test_leer_formulario_admite_valores_repetidos() -> None:
@@ -146,7 +148,36 @@ def test_leer_entrada_con_el_mismo_tope_que_el_almacen() -> None:
 
 
 def test_leer_entrada_gigante_no_tarda() -> None:
-    inicio = time.perf_counter()
-    with pytest.raises(ErrorFormulario):
-        leer_entrada({"entrada": ["a" * 10_000_000]})
-    assert time.perf_counter() - inicio < 1
+    entrada = {"entrada": ["a" * 10_000_000]}
+
+    def rechazar() -> None:
+        with pytest.raises(ErrorFormulario):
+            leer_entrada(entrada)
+
+    assert segundos_de_cpu(rechazar, 1) < 1
+
+
+# --- C1: la URL de una búsqueda lleva su consulta ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "consulta",
+    [
+        ConsultaBusqueda("1K0698151"),
+        ConsultaBusqueda("pastillas freno", modo=Modo.CLASICO, campos=("precio", "marca")),
+        ConsultaBusqueda(
+            "faro & piloto", tiendas=("a.example", "b.example"), modo=Modo.IA, descubrir=True
+        ),
+        ConsultaBusqueda("disco", filtro="solo nuevas, sin envío & más baratas"),
+    ],
+    ids=["oem", "campos", "tiendas", "filtro"],
+)
+def test_parametros_de_consulta_es_la_inversa(consulta: ConsultaBusqueda) -> None:
+    texto = parametros_de_consulta(consulta)
+    assert consulta_desde_parametros(parse_qs(texto, keep_blank_values=True)) == consulta
+
+
+def test_parametros_de_consulta_solo_lo_que_hace_falta() -> None:
+    texto = parametros_de_consulta(ConsultaBusqueda("freno"))
+    assert texto.startswith("texto=freno&modo=auto&campos=precio")
+    assert "tiendas" not in texto and "descubrir" not in texto and "filtro" not in texto

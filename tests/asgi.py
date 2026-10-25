@@ -3,6 +3,10 @@
 Sustituye al `TestClient` de Starlette, que exigiría la dependencia `httpx`. Una aplicación ASGI
 es una corrutina `app(scope, receive, send)`: basta con construir el `scope` de una petición HTTP,
 entregar el cuerpo por `receive` y recoger por `send` el estado, las cabeceras y el cuerpo.
+
+Cada petición síncrona (`get`, `post`, `peticion`) abre su propio bucle con `asyncio.run`, que al
+salir cancela las tareas pendientes. Para una búsqueda en segundo plano (C1), que sigue después
+de responder, se usa la API asíncrona (`aget`, `apost`, `apedir`) dentro de un solo bucle.
 """
 
 import asyncio
@@ -30,8 +34,19 @@ class ClienteASGI:
         self._app = app
         self._host = host
 
-    def get(self, ruta: str, cabeceras: Mapping[str, str] | None = None) -> Respuesta:
-        return self.peticion("GET", ruta, cabeceras=cabeceras)
+    def get(
+        self, ruta: str, cabeceras: Mapping[str, str] | None = None, *, seguir: bool = False
+    ) -> Respuesta:
+        """Con `seguir`, sigue una redirección (302 o 303) a su `Location` en el mismo bucle."""
+        if not seguir:
+            return self.peticion("GET", ruta, cabeceras=cabeceras)
+        return asyncio.run(self._get_siguiendo(ruta, cabeceras))
+
+    async def _get_siguiendo(self, ruta: str, cabeceras: Mapping[str, str] | None) -> Respuesta:
+        respuesta = await self.aget(ruta, cabeceras)
+        if respuesta.estado in (302, 303):
+            respuesta = await self.aget(respuesta.cabeceras["location"], cabeceras)
+        return respuesta
 
     def post(
         self,
@@ -39,9 +54,7 @@ class ClienteASGI:
         datos: Mapping[str, str | list[str]] | None = None,
         cabeceras: Mapping[str, str] | None = None,
     ) -> Respuesta:
-        cuerpo = urlencode(datos or {}, doseq=True).encode()
-        todas = {"content-type": "application/x-www-form-urlencoded", **(cabeceras or {})}
-        return self.peticion("POST", ruta, cuerpo=cuerpo, cabeceras=todas)
+        return asyncio.run(self.apost(ruta, datos, cabeceras))
 
     def peticion(
         self,
@@ -50,13 +63,30 @@ class ClienteASGI:
         cuerpo: bytes = b"",
         cabeceras: Mapping[str, str] | None = None,
     ) -> Respuesta:
-        return asyncio.run(self._peticion(metodo, ruta, cuerpo, cabeceras or {}))
+        return asyncio.run(self.apedir(metodo, ruta, cuerpo, cabeceras))
 
-    async def _peticion(
-        self, metodo: str, ruta: str, cuerpo: bytes, cabeceras: Mapping[str, str]
+    async def aget(self, ruta: str, cabeceras: Mapping[str, str] | None = None) -> Respuesta:
+        return await self.apedir("GET", ruta, cabeceras=cabeceras)
+
+    async def apost(
+        self,
+        ruta: str,
+        datos: Mapping[str, str | list[str]] | None = None,
+        cabeceras: Mapping[str, str] | None = None,
+    ) -> Respuesta:
+        cuerpo = urlencode(datos or {}, doseq=True).encode()
+        todas = {"content-type": "application/x-www-form-urlencoded", **(cabeceras or {})}
+        return await self.apedir("POST", ruta, cuerpo=cuerpo, cabeceras=todas)
+
+    async def apedir(
+        self,
+        metodo: str,
+        ruta: str,
+        cuerpo: bytes = b"",
+        cabeceras: Mapping[str, str] | None = None,
     ) -> Respuesta:
         partes = urlsplit(ruta)
-        todas = {"host": self._host, **{k.lower(): v for k, v in cabeceras.items()}}
+        todas = {"host": self._host, **{k.lower(): v for k, v in (cabeceras or {}).items()}}
         if cuerpo:
             # `setdefault`: un test puede declarar una longitud falsa a propósito.
             todas.setdefault("content-length", str(len(cuerpo)))

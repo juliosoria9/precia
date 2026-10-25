@@ -41,6 +41,11 @@
         <input name="tope_llamadas_busqueda" type="number" min="1" max="100" value="{{ a.tope_llamadas_busqueda }}" required>
       </label>
     </div>
+    <label class="interruptor">
+      <input type="checkbox" name="revisar_resultados" value="on"{% if a.revisar_resultados %} checked{% endif %}>
+      <span>Revisar los resultados con IA en modo Auto</span>
+      <small>Una llamada por búsqueda (unos 0,001 $ con 60 ofertas; 0 $ si se repite, por la caché de 7 días) que aparta lo que no es lo buscado, como la cerradura al buscar una puerta. En modo IA se revisan siempre y en clásico nunca. Lo apartado se ve en «Descartados por la IA» con su motivo; si la IA falla, se aplica una regla sin IA.</small>
+    </label>
   </section>
 
   <section class="tarjeta">
@@ -62,11 +67,7 @@
       </label>
     </div>
     <p class="tenue">Con curl (por defecto, ADR-022), las descargas sin navegador llevan la huella TLS y HTTP/2 de Chrome y sus cabeceras, también su User-Agent; el de arriba lo usan urllib, el robots.txt y Evomi. Chromium lleva el de Chrome de su propio binario, sin «HeadlessChrome» (ADR-023), y una página bloqueada por HTTP se prueba una vez con él. Las cookies de cada tienda solo se guardan en memoria y nunca se inicia sesión.</p>
-    <label class="interruptor">
-      <input type="checkbox" name="respetar_robots" value="on"{% if a.respetar_robots %} checked{% endif %}>
-      <span>Respetar el robots.txt de las tiendas</span>
-      <small>Desactivado por decisión del usuario (ADR-017): se visita aunque el robots.txt lo prohíba y el progreso de cada búsqueda lo indica. Su Crawl-delay se respeta siempre, y un CAPTCHA o anti-bot para la tienda en cualquier caso.</small>
-    </label>
+    <p class="tenue">El robots.txt de las tiendas se ignora por decisión del usuario (ADR-017): se visita aunque lo prohíba y el progreso de cada búsqueda lo indica. Se sigue leyendo para respetar su Crawl-delay y usar sus sitemaps, y un CAPTCHA o anti-bot para la tienda en cualquier caso.</p>
     <label class="interruptor">
       <input type="checkbox" name="google_activado" value="on"{% if a.google_activado %} checked{% endif %}>
       <span>Activar el módulo propio de Google</span>

@@ -1,16 +1,20 @@
 """Controles de seguridad de la interfaz web (asignatura de ciberseguridad)."""
 
 from dataclasses import replace
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pytest
 
-from precia.nucleo.fuente_demo import FuenteDemo
+from precia.nucleo.fuente_demo import TIENDAS, FuenteDemo
 from precia.nucleo.modelos import (
     ConsultaBusqueda,
+    EstadoPerfil,
+    FalloConfiguracion,
     GrupoProducto,
     OrigenDato,
     ResultadoBusqueda,
+    Seguimiento,
     Tienda,
     ValorCampo,
 )
@@ -122,7 +126,8 @@ def test_cuerpo_demasiado_grande_se_rechaza(cliente: ClienteASGI) -> None:
     ],
 )
 def test_ninguna_pantalla_tiene_codigo_en_linea(cliente: ClienteASGI, ruta: str) -> None:
-    html = cliente.get(ruta).texto
+    # `seguir`: /buscar redirige a la página de la búsqueda, /busquedas/{id} (C1).
+    html = cliente.get(ruta, seguir=True).texto
     assert "<script>" not in html and "<style" not in html
     assert " style=" not in html and " onclick=" not in html and "hx-on" not in html
 
@@ -191,7 +196,8 @@ def test_busqueda_lanzada_desde_otra_web_se_rechaza(cliente: ClienteASGI, sitio:
 @pytest.mark.parametrize("sitio", ["same-origin", "none"])
 def test_busqueda_propia_o_escrita_a_mano_se_acepta(cliente: ClienteASGI, sitio: str) -> None:
     respuesta = cliente.get("/buscar?texto=freno", cabeceras={"Sec-Fetch-Site": sitio})
-    assert respuesta.estado == 200
+    # C1: la búsqueda se lanza y redirige a su página (`/busquedas/{id}`).
+    assert respuesta.estado == 303
 
 
 class FuenteEspia(FuenteDemo):
@@ -199,9 +205,11 @@ class FuenteEspia(FuenteDemo):
         super().__init__()
         self.consultas: list[ConsultaBusqueda] = []
 
-    async def buscar(self, consulta: ConsultaBusqueda) -> ResultadoBusqueda:
+    async def buscar(
+        self, consulta: ConsultaBusqueda, *, seguimiento: Seguimiento | None = None
+    ) -> ResultadoBusqueda:
         self.consultas.append(consulta)
-        return await super().buscar(consulta)
+        return await super().buscar(consulta, seguimiento=seguimiento)
 
 
 def test_tiendas_desconocidas_no_llegan_a_la_fuente() -> None:
@@ -215,8 +223,10 @@ def test_tiendas_desconocidas_no_llegan_a_la_fuente() -> None:
 
 
 class FuenteMaliciosaEnBusqueda(FuenteDemo):
-    async def buscar(self, consulta: ConsultaBusqueda) -> ResultadoBusqueda:
-        resultado = await super().buscar(consulta)
+    async def buscar(
+        self, consulta: ConsultaBusqueda, *, seguimiento: Seguimiento | None = None
+    ) -> ResultadoBusqueda:
+        resultado = await super().buscar(consulta, seguimiento=seguimiento)
         grupos = tuple(
             replace(
                 g,
@@ -233,7 +243,7 @@ class FuenteMaliciosaEnBusqueda(FuenteDemo):
 def test_resultados_escapan_datos_y_neutralizan_enlaces_peligrosos() -> None:
     cliente = ClienteASGI(crear_app(FuenteMaliciosaEnBusqueda()))
     for cabeceras in ({}, {"HX-Request": "true"}):
-        html = cliente.get("/buscar?texto=pastillas", cabeceras=cabeceras).texto
+        html = cliente.get("/buscar?texto=pastillas", cabeceras=cabeceras, seguir=True).texto
         assert "&lt;script&gt;" in html
         assert "<script>alert" not in html
         assert "javascript:" not in html
@@ -242,8 +252,10 @@ def test_resultados_escapan_datos_y_neutralizan_enlaces_peligrosos() -> None:
 class FuentePrecioInyectado(FuenteDemo):
     """Una tienda cuyo «precio» extraído por la IA no aparece en la página."""
 
-    async def buscar(self, consulta: ConsultaBusqueda) -> ResultadoBusqueda:
-        resultado = await super().buscar(consulta)
+    async def buscar(
+        self, consulta: ConsultaBusqueda, *, seguimiento: Seguimiento | None = None
+    ) -> ResultadoBusqueda:
+        resultado = await super().buscar(consulta, seguimiento=seguimiento)
         grupo = resultado.grupos[0]
         trampa = replace(
             grupo.ofertas[0],
@@ -282,3 +294,35 @@ def test_pedir_solo_tiendas_desconocidas_no_busca_en_todas() -> None:
     assert espia.consultas == []
     assert respuesta.estado == 422
     assert "Ninguna de las tiendas elegidas está dada de alta" in respuesta.texto
+
+
+# --- Configuración fallida y «Reintentar» (A1) ---------------------------------------------------
+
+
+def _con_caida(motivo: str = "No se ha podido configurar caida.example.") -> FuenteDemo:
+    t = datetime(2026, 10, 22, 12, 0)
+    fallo = FalloConfiguracion(1, t, motivo, t + timedelta(hours=1))
+    caida = Tienda(
+        "caida.example", "Caída", EstadoPerfil.SIN_PERFIL, "", True, None, 0, fallo=fallo
+    )
+    return FuenteDemo(_tiendas=[*TIENDAS, caida])
+
+
+def test_reintentar_sin_origen_se_rechaza() -> None:
+    fuente = _con_caida()
+    respuesta = ClienteASGI(crear_app(fuente)).post(
+        "/tiendas/caida.example/reintentar", {"confirmar": "1"}
+    )
+    assert respuesta.estado == 403
+    tienda = fuente.tienda("caida.example")
+    assert tienda is not None and tienda.fallo is not None
+    assert tienda.fallo.reintentar_desde is not None
+
+
+@pytest.mark.parametrize("ruta", ["/tiendas", "/tiendas/caida.example"])
+def test_la_configuracion_fallida_no_mete_codigo_en_linea(ruta: str) -> None:
+    # El motivo sale del configurador y puede citar texto de la tienda: se escapa.
+    html = ClienteASGI(crear_app(_con_caida(CARGA_XSS))).get(ruta).texto
+    assert "<script>" not in html and "<style" not in html
+    assert " style=" not in html and " onclick=" not in html and "hx-on" not in html
+    assert CARGA_XSS not in html

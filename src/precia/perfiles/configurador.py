@@ -1,17 +1,20 @@
-"""🤖 Configurador: crea el perfil de una tienda nueva con ayuda de la IA (memoria §4 y §5).
+"""IA · Configurador: crea el perfil de una tienda nueva con ayuda de la IA (memoria §4 y §5).
 
 0. Si la portada es de WooCommerce o Shopify y su API pública de solo lectura devuelve productos
    con precio para la consulta de prueba, el perfil es `api_woocommerce` o `api_shopify`: la
    búsqueda va a la API (`fuentes.apis`) y no hace falta ningún selector, así que **no se llama
    a la IA** (coste 0). Si la API no responde, no existe o no da productos, se sigue como siempre.
 1. Descubre la URL de búsqueda (`perfiles.descubrimiento`): OpenSearch, formularios y enlaces de
-   búsqueda de la portada, rutas de la plataforma, patrones habituales y, como último recurso,
-   🤖 las plantillas que proponga la IA (validadas como cualquier otra).
+   búsqueda de la portada, rutas de la plataforma, patrones habituales y las plantillas que
+   proponga la IA (validadas como cualquier otra): como último recurso o, si la portada no da
+   ninguna candidata, en paralelo con la ronda HTTP y antes de Chromium (B7).
 2. En la primera página de resultados que parece un listado, pide a la IA los selectores del
    listado a partir de `resumen_para_ia` (el HTML simplificado, como datos no confiables).
 3. Abre la primera ficha y pide los selectores de los campos. Si la ficha trae JSON-LD, solo los
    campos que este no da (y siempre el precio: decide la validación y no todas las fichas de una
-   tienda traen JSON-LD).
+   tienda traen JSON-LD). Mientras responde la IA se abren las demás fichas que mirará la
+   validación (`adelantar_fichas`, A6), que después las toma de las ya abiertas (`_ConAbiertas`),
+   también las que no dan un 2xx, que la caché del navegador no guarda.
 4. `necesita_js` si la búsqueda solo trae resultados al renderizarla con Chromium.
 5. Valida el perfil y, si no pasa, reintenta una única vez enviando a la IA los problemas.
 
@@ -28,7 +31,12 @@ siguiente; un bloqueo, un error de presupuesto de la IA o un error de programaci
   60 % de sus URL tienen palabras en el slug, no sirve. Si sirve, se prueban 3 fichas que encajan
   con la consulta de prueba: si 2 de 3 tienen precio anclado con el JSON-LD o los metadatos, el
   perfil `sitemap` no gasta IA; si no, 1 llamada a la IA para `sel_campos` (como en el paso 3) y
-  se valida otra vez. El catálogo solo se guarda si el perfil vale.
+  se valida otra vez. Si un sitemap no sirve, se prueba el siguiente de los declarados (causa
+  R3-C: Carrefour declara primero uno de páginas informativas), como mucho
+  `MAX_SITEMAPS_PROBADOS` y con una sola llamada a la IA en total. El catálogo solo se guarda si
+  el perfil vale. Si ninguna ficha tiene precio y las que se abren por HTTP son el armazón de
+  una SPA (`parece_armazon`, causa R5-E: Xtralife), antes de la IA se valida otra vez con
+  Chromium y, desde ahí, el perfil queda con `necesita_js` y la ficha de la IA se abre igual.
 - **A2**: la página 1 del listado hace de página de resultados: la IA da los selectores del
   listado y de la ficha, y el perfil `listado` se valida sin exigir que los resultados nombren la
   consulta. Si la página por HTTP no parece un listado se mira con Chromium (salvo un estado
@@ -42,33 +50,54 @@ código o de la propia tienda (el formulario, los enlaces del listado) y pasan p
 anti-SSRF y por el filtro de mismo dominio.
 
 El perfil nace con `revisado=False`: no se fija hasta que lo revisa una persona. Los errores de
-navegador (bloqueo, robots...) y de IA (presupuesto, salida no válida tras reintentar) se
+navegador (bloqueo...) y de IA (presupuesto, salida no válida tras reintentar) se
 propagan tal cual para que quien llama decida; si no se consigue un perfil válido se lanza
 `ConfiguracionFallida`.
+
+Si el perfil sale de un paso posterior (sitemap o listado del usuario), su nota acaba con los
+motivos de los pasos descartados antes («Antes, descartado: Buscador <plantilla>: …»): la IA
+pudo gastar llamadas en el buscador y quien revisa tiene que saber por qué no valió (causa
+R2-OBS de la campaña multi-sector). Cada motivo descartado y lo que propuso la IA en cada
+intento (selectores y problemas de la validación) van también al registro (`logging`, nivel
+INFO), en una sola línea y recortados: son datos no confiables y nunca se interpretan.
 """
 
+import asyncio
 import json
+import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import aclosing
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
+from precia.extraccion.dom import analizar
 from precia.extraccion.ficha import extraer_ficha
+from precia.extraccion.jsonld import productos_de_arbol
 from precia.extraccion.listado import extraer_listado
+from precia.extraccion.metadatos import producto_metadatos
+from precia.extraccion.precios import buscar_precios
 from precia.extraccion.texto import resumen_para_ia
 from precia.extraccion.tipos import ResultadoListado
 from precia.fuentes.apis import plantilla_api
-from precia.fuentes.plataformas import Plataforma, detectar_plataforma, origen_de
-from precia.ia.tipos import PeticionIA
-from precia.navegador.tipos import ErrorDescarga, Pagina, ProhibidoPorRobots, URLNoPermitida
+from precia.fuentes.plataformas import Plataforma, detectar_plataforma
+from precia.ia.tipos import PeticionIA, max_tokens_para
+from precia.navegador.tipos import (
+    ErrorDescarga,
+    ErrorNavegador,
+    Pagina,
+    URLNoPermitida,
+)
 from precia.navegador.url import Validador, validar_url
 from precia.nucleo.modelos import CAMPOS, CLAVES_CAMPOS, Campo
 from precia.perfiles.catalogo import (
+    MAX_SITEMAPS_PROBADOS,
     MIN_CON_PALABRAS,
+    Catalogo,
     GuardarCatalogo,
     NavegadorSitemaps,
-    descubrir_catalogo,
+    catalogos,
     elegir_fichas,
 )
 from precia.perfiles.descubrimiento import (
@@ -101,17 +130,29 @@ from precia.perfiles.validador import (
     de_la_tienda,
     problema_selector,
     problemas_de_url_listado,
+    problemas_de_url_sitemap,
     problemas_sin_resultados,
     resumir,
+    sin_campos_repetidos,
     url_de_listado,
     validar,
 )
 
 COMPONENTE = "configurador"
-AUTOR = "🤖 configurador"
+AUTOR = "configurador IA"
 MAX_SELECTOR = 300
 MAX_PROBLEMAS_IA = 20
 MAX_MOTIVO = 3
+MAX_DESCARTE = 400
+"""Caracteres de cada motivo descartado que van a la nota del perfil que sale."""
+MIN_DESCARTES = 200
+"""Sitio mínimo para los descartes en la nota, aunque haya que recortar el resumen."""
+MAX_REGISTRO = 2_000
+MAX_TEXTO_ARMAZON = 500
+"""Caracteres de texto por debajo de los que una ficha sin producto es el armazón de una SPA
+(R5-E): el de Xtralife deja solo el título (87); una página informativa real da miles."""
+
+registro = logging.getLogger(__name__)
 
 _ETIQUETA = re.compile(r"(?!-)[a-z0-9-]{1,63}(?<!-)")
 _TEXTO: dict[str, Any] = {"type": "string", "maxLength": MAX_SELECTOR}
@@ -138,7 +179,8 @@ INSTRUCCIONES_LISTADO = (
     "- sel_resultado: cada resultado (producto) de la búsqueda, sin @atributo;\n"
     "- sel_titulo: dentro de cada resultado, el nombre del producto;\n"
     "- sel_enlace: dentro de cada resultado, el enlace a la ficha del producto, normalmente "
-    "con @href;\n"
+    "con @href; si cada resultado es en sí mismo el enlace (un <a href> que envuelve la "
+    "tarjeta), sel_resultado es ese <a> y sel_enlace es «@href» a secas, sin selector;\n"
     "- sel_precio_listado: dentro de cada resultado, el precio, o null si el listado no "
     "muestra precios.\n"
     "Selecciona solo los resultados de la propia tienda: ni anuncios ni productos patrocinados "
@@ -218,6 +260,11 @@ async def configurar(
         creado=reloj(),
     )
     motivos: list[str] = []
+
+    def descartar(motivo: str) -> None:
+        motivos.append(motivo)
+        registro.info("Configurador de %s: descartado. %s", normalizado, _linea(motivo))
+
     try:
         configuracion.busqueda = await descubrir(
             portada,
@@ -231,23 +278,28 @@ async def configurar(
         )
         return await configuracion.ejecutar()
     except ConfiguracionFallida as error:
-        motivos.append(str(error))
+        busqueda = configuracion.busqueda
+        descartar(str(error) if busqueda is None else f"Buscador {busqueda.plantilla}: {error}")
     if catalogo is not None and isinstance(navegador, NavegadorSitemaps):
         try:
             base = (portada.url_final or portada.url) if portada is not None else None
-            return await configuracion.por_sitemap(
-                origen_de(base or f"https://{host}/") or f"https://{host}",
+            # La URL final entera, no solo su origen: su ruta da el prefijo de idioma o país
+            # (`/es/es/`) con que se filtra el catálogo (R4-C); con el origen se perdía (R5-C).
+            perfil = await configuracion.por_sitemap(
+                base or f"https://{host}/",
                 detectar_plataforma(portada) if portada is not None else None,
                 navegador,
                 catalogo,
             )
+            return replace(perfil, nota=con_descartes(perfil.nota, motivos))
         except ConfiguracionFallida as error:
-            motivos.append(str(error))
+            descartar(str(error))
     if entrada is not None and MARCADOR not in entrada:
         try:
-            return await configuracion.por_listado(entrada)
+            perfil = await configuracion.por_listado(entrada)
+            return replace(perfil, nota=con_descartes(perfil.nota, motivos))
         except ConfiguracionFallida as error:
-            motivos.append(str(error))
+            descartar(str(error))
     raise ConfiguracionFallida(sin_perfil(normalizado, motivos, con_entrada=entrada is not None))
 
 
@@ -270,6 +322,40 @@ def sin_perfil(dominio: str, motivos: Sequence[str], *, con_entrada: bool) -> st
     if len(detalle) > hueco:
         detalle = detalle[: max(hueco - 1, 0)] + "…"
     return f"No se ha podido configurar {dominio}. {detalle} {pista}"
+
+
+def con_descartes(nota: str, motivos: Sequence[str]) -> str:
+    """`nota` con los motivos de los pasos descartados al final (R2-OBS), en `MAX_RESUMEN`.
+
+    El principio de la nota (de dónde sale el perfil y su validación) no se toca; si no cabe
+    todo, se recortan primero los descartes, que tienen al menos `MIN_DESCARTES` caracteres.
+    """
+    if not motivos:
+        return nota
+    partes = (_recortar(m.strip(), MAX_DESCARTE) for m in motivos)
+    descartes = "Antes, descartado: " + " ".join(
+        m if m.endswith((".", "…")) else m + "." for m in partes
+    )
+    hueco = max(MAX_RESUMEN - len(nota) - 1, MIN_DESCARTES)
+    nota = _recortar(nota, MAX_RESUMEN - 1 - min(len(descartes), hueco))
+    return f"{nota} {_recortar(descartes, hueco)}"
+
+
+def _recortar(texto: str, maximo: int) -> str:
+    return texto if len(texto) <= maximo else texto[: maximo - 1] + "…"
+
+
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+")
+
+
+def _linea(texto: str) -> str:
+    """`texto` para el registro: una sola línea (sin caracteres de control) y recortado."""
+    return _recortar(_CONTROL.sub(" ", texto), MAX_REGISTRO)
+
+
+def _propuesto(propuesto: Mapping[str, Any]) -> str:
+    """Lo que propuso la IA, para el registro (dato no confiable: no se interpreta)."""
+    return _linea(json.dumps(propuesto, ensure_ascii=False, default=str))
 
 
 def _host(dominio: str) -> str | None:
@@ -298,7 +384,7 @@ async def _perfil_api(
 ) -> Perfil | None:
     """Perfil `api_*` validado si la plataforma de la portada tiene API pública y responde.
 
-    Un fallo al descargar la API (no existe, robots, URL no permitida) solo quiere decir que no
+    Un fallo al descargar la API (no existe, URL no permitida) solo quiere decir que no
     se puede usar: se sigue por el HTML. Un bloqueo sí se propaga.
     """
     plataforma = detectar_plataforma(portada)
@@ -324,7 +410,7 @@ async def _perfil_api(
     )
     try:
         informe = await validar(perfil, navegador, consulta, validador=validador)
-    except (ErrorDescarga, ProhibidoPorRobots, URLNoPermitida):
+    except (ErrorDescarga, URLNoPermitida):
         return None
     if not informe.valido:
         return None
@@ -350,6 +436,24 @@ class _Propuesta:
     problemas: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True, slots=True)
+class _ConAbiertas:
+    """El navegador, pero lo que ya abrió `_Configuracion.ficha` se sirve sin pedirlo otra vez.
+
+    La caché del navegador solo guarda los 2xx: sin esto, una ficha con un 404 (caso real:
+    decathlon.es, ronda 1) se pedía al adelantar (A6) y otra vez al validar.
+    """
+
+    navegador: Navegador
+    abiertas: Mapping[tuple[str, bool], Pagina]
+
+    async def obtener(self, url: str, *, js: bool = False) -> Pagina:
+        abierta = self.abiertas.get((url, js))
+        if abierta is not None:
+            return abierta
+        return await self.navegador.obtener(url, js=js)
+
+
 @dataclass
 class _Configuracion:
     dominio: str
@@ -362,7 +466,13 @@ class _Configuracion:
     """La página de resultados (o, en A2, la página 1 del listado) que se le enseña a la IA."""
     creado: datetime
     tipo: str = TIPO_HTML
-    _fichas: dict[str, Pagina | None] = field(default_factory=dict)
+    _fichas: dict[tuple[str, bool], Pagina | None] = field(default_factory=dict)
+    """Fichas ya abiertas, por URL y por si se abrieron con Chromium (R5-E)."""
+    _abiertas: dict[tuple[str, bool], Pagina] = field(default_factory=dict)
+    """Lo que devolvió el navegador para esas fichas, por URL validada y `js`, sea cual sea su
+    estado: la validación lo usa en lugar de pedirlo otra vez (`_ConAbiertas`)."""
+    _ia_en_sitemap: bool = False
+    """Ya se ha pedido a la IA la ficha de un sitemap: no se pide para otro (B)."""
 
     @property
     def pagina(self) -> Busqueda:
@@ -371,21 +481,45 @@ class _Configuracion:
 
     async def ejecutar(self) -> Perfil:
         anterior: _Propuesta | None = None
-        for _ in range(2):
+        for intento in (1, 2):
             propuesta = await self.proponer(anterior)
+            informe: InformeValidacion | None = None
             if propuesta.perfil is not None:
                 informe = await validar(
-                    propuesta.perfil, self.navegador, self.consulta, validador=self.validador
+                    propuesta.perfil,
+                    _ConAbiertas(self.navegador, self._abiertas),
+                    self.consulta,
+                    validador=self.validador,
                 )
-                if informe.valido:
-                    return replace(propuesta.perfil, nota=self.nota(informe))
-                propuesta.problemas.extend(informe.problemas)
+                if not informe.valido:
+                    propuesta.problemas.extend(informe.problemas)
+            self.registrar(f"intento {intento} de 2", propuesta, informe)
+            if propuesta.perfil is not None and informe is not None and informe.valido:
+                perfil = sin_campos_repetidos(propuesta.perfil, informe)
+                return replace(perfil, nota=self.nota(informe))
             anterior = propuesta
         assert anterior is not None
         motivo = "; ".join(anterior.problemas[:MAX_MOTIVO]) or "sin detalles"
         con = " con el listado de la URL de entrada" if self.tipo == TIPO_LISTADO else ""
         raise ConfiguracionFallida(
             f"La IA no ha conseguido un perfil válido para {self.dominio}{con}: {motivo}"
+        )
+
+    def registrar(
+        self, paso: str, propuesta: _Propuesta, informe: InformeValidacion | None
+    ) -> None:
+        """Al registro: lo que propuso la IA en un intento y cómo salió (R2-OBS)."""
+        if informe is not None and informe.valido:
+            resultado = resumir(informe)
+        else:
+            resultado = "problemas: " + ("; ".join(propuesta.problemas) or "sin detalles")
+        registro.info(
+            "Configurador de %s (%s, %s): la IA propone %s; %s",
+            self.dominio,
+            self.pagina.plantilla if self.busqueda is not None else "sin búsqueda",
+            paso,
+            _propuesto(propuesta.propuesto),
+            _linea(resultado),
         )
 
     def nota(self, informe: InformeValidacion) -> str:
@@ -416,9 +550,35 @@ class _Configuracion:
         if ficha is None:
             propuesta.problemas.append("No se pudo abrir ninguna ficha de los resultados.")
             return propuesta
-        sel_campos = await self.pedir_campos(ficha, anterior, propuesta)
+        urls = [r.url for r in resultados[:MAX_FICHAS]]
+        adelantadas = asyncio.create_task(self.adelantar_fichas(urls, js=self.pagina.necesita_js))
+        try:
+            sel_campos = await self.pedir_campos(ficha, anterior, propuesta)
+        except BaseException:
+            # Cancelar una descarga es seguro: el limitador da su dominio por ocupado hasta su
+            # timeout (C1), así que no coincide con la siguiente (ADR-017).
+            adelantadas.cancel()
+            raise
+        await adelantadas
         propuesta.perfil = self.perfil(listado, sel_campos)
         return propuesta
+
+    async def adelantar_fichas(self, urls: Sequence[str], *, js: bool) -> None:
+        """Abre las fichas que abrirá `validar` mientras responde la IA de campos (A6 del plan de
+        velocidad): luego las encuentra en la caché de páginas del navegador.
+
+        Son las mismas URL y con el mismo `js` (las `MAX_FICHAS` primeras del listado, que el
+        perfil de la validación lee igual: solo cambian los selectores de la ficha), en orden y
+        por la cortesía del navegador. Las ya abiertas no se piden otra vez (`ficha`), y
+        `validar` las toma de `_abiertas`, también las que no dan un 2xx. Un error aquí no decide
+        nada: se deja de adelantar, y `validar` vuelve a pedir la ficha y decide (un `Bloqueado`
+        sale de ahí). Si la IA falla, se habrán abierto hasta dos fichas de más.
+        """
+        try:
+            for url in urls:
+                await self.ficha(url, js=js)
+        except ErrorNavegador:
+            return
 
     def perfil(self, listado: Mapping[str, str | None], sel_campos: dict[str, str]) -> Perfil:
         return Perfil(
@@ -447,7 +607,7 @@ class _Configuracion:
                 instrucciones=_instrucciones(tarea, anterior),
                 datos=datos_para_ia(self.pagina.pagina, anterior_de(anterior)),
                 esquema=ESQUEMA_LISTADO,
-                max_tokens=512,
+                max_tokens=max_tokens_para(ESQUEMA_LISTADO),
             )
         )
         propuesta.propuesto.update(respuesta.datos)
@@ -456,18 +616,45 @@ class _Configuracion:
     async def primera_ficha(self, resultados: Sequence[ResultadoListado]) -> Pagina | None:
         return await self.abrir_ficha([r.url for r in resultados], js=self.pagina.necesita_js)
 
-    async def abrir_ficha(self, urls: Sequence[str], *, js: bool) -> Pagina | None:
-        """La primera de las `MAX_FICHAS` primeras `urls` que se abre bien y sigue en la tienda."""
+    async def abrir_ficha(
+        self, urls: Sequence[str], *, js: bool, producto: bool = False
+    ) -> Pagina | None:
+        """La primera de las `MAX_FICHAS` primeras `urls` que se abre bien y sigue en la tienda;
+        con `producto`, además tiene que parecer un producto (`parece_producto`)."""
         for url in urls[:MAX_FICHAS]:
-            if url not in self._fichas:
-                pagina = await abrir(self.navegador, url, js=js, validador=self.validador)
-                # Una ficha que redirige fuera de la tienda no se le enseña a la IA.
-                buena = pagina is not None and correcta(pagina)
-                buena = buena and pagina is not None and de_la_tienda(pagina, self.dominio)
-                self._fichas[url] = pagina if buena else None
-            if (pagina := self._fichas[url]) is not None:
+            pagina = await self.ficha(url, js=js)
+            if pagina is not None and (not producto or parece_producto(pagina)):
                 return pagina
         return None
+
+    async def ficha(self, url: str, *, js: bool) -> Pagina | None:
+        """La ficha `url` si se abre bien y sigue en la tienda; cada `(url, js)` se abre una vez."""
+        clave = (url, js)
+        if clave not in self._fichas:
+            pagina = await self._abrir(url, js=js)
+            # Una ficha que redirige fuera de la tienda no se le enseña a la IA.
+            buena = pagina is not None and correcta(pagina)
+            buena = buena and pagina is not None and de_la_tienda(pagina, self.dominio)
+            self._fichas[clave] = pagina if buena else None
+        return self._fichas[clave]
+
+    async def _abrir(self, url: str, *, js: bool) -> Pagina | None:
+        """Como `descubrimiento.abrir`, y guarda lo que devuelve el navegador en `_abiertas`."""
+        try:
+            validada = await self.validador(url)
+            pagina = await self.navegador.obtener(validada, js=js)
+        except (ErrorDescarga, URLNoPermitida):
+            return None
+        self._abiertas[(validada, js)] = pagina
+        return pagina
+
+    async def son_armazones(self, urls: Sequence[str]) -> bool:
+        """Alguna de las `MAX_FICHAS` primeras `urls` se abre bien por HTTP y todas las que se
+        abren son el armazón de una SPA (`parece_armazon`): con Chromium pueden pintarse."""
+        abiertas = [
+            p for url in urls[:MAX_FICHAS] if (p := await self.ficha(url, js=False)) is not None
+        ]
+        return bool(abiertas) and all(parece_armazon(p) for p in abiertas)
 
     # --- B. Catálogo por sitemap ------------------------------------------------------------
 
@@ -478,14 +665,64 @@ class _Configuracion:
         navegador: NavegadorSitemaps,
         destino: GuardarCatalogo,
     ) -> Perfil:
-        """Perfil `sitemap` validado, con su catálogo ya guardado en `destino` (ver el módulo)."""
-        leido = await descubrir_catalogo(
-            base, self.dominio, navegador, plataforma, validador=self.validador
-        )
-        if leido is None:
+        """Perfil `sitemap` validado, con su catálogo ya guardado en `destino` (ver el módulo).
+
+        `base` es la URL final de la portada, con su ruta: de ella sale el prefijo de idioma o país
+        del catálogo (`Catalogo.idioma`), que se guarda con él (R5-C).
+
+        Prueba los catálogos de `perfiles.catalogo.catalogos` en orden, como mucho
+        `MAX_SITEMAPS_PROBADOS`, hasta que uno vale; si ninguno, el motivo junta los de todos.
+        """
+        motivos: list[tuple[str, str]] = []
+        async with aclosing(
+            catalogos(base, self.dominio, navegador, plataforma, validador=self.validador)
+        ) as leidos:
+            async for leido in leidos:
+                try:
+                    perfil, informe, con_ia = await self.probar_sitemap(leido)
+                except ConfiguracionFallida as error:
+                    motivos.append((leido.sitemap, str(error)))
+                    registro.info(
+                        "Configurador de %s: sitemap %s descartado. %s",
+                        self.dominio,
+                        leido.sitemap,
+                        _linea(str(error)),
+                    )
+                    if len(motivos) >= MAX_SITEMAPS_PROBADOS:
+                        break
+                    continue
+                info = destino.guardar_catalogo(
+                    self.dominio,
+                    leido.sitemap,
+                    leido.entradas,
+                    parcial=leido.parcial,
+                    pendientes=leido.pendientes,
+                    idioma=leido.idioma,
+                )
+                tamano = f"{info.total} URL" + (", parcial" if info.parcial else "")
+                como = "selectores de la ficha por IA" if con_ia else "sin IA"
+                if perfil.necesita_js:
+                    como += ", con Chromium"
+                nota = _nota(f"Catálogo por sitemap ({tamano}), {como}. ", resumir(informe))
+                return replace(perfil, nota=nota)
+        if not motivos:
             raise ConfiguracionFallida(
                 f"{self.dominio} no publica un sitemap con URL de la tienda (ni en su robots.txt "
                 "ni en las rutas habituales)."
+            )
+        raise ConfiguracionFallida(_ningun_sitemap(self.dominio, motivos))
+
+    async def probar_sitemap(self, leido: Catalogo) -> tuple[Perfil, InformeValidacion, bool]:
+        """El perfil `sitemap` de `leido` validado, su informe y si se usó la IA; si no vale,
+        `ConfiguracionFallida`. La IA solo se pide si no se ha pedido ya para otro sitemap, si la
+        URL del sitemap vale para el perfil y si alguna ficha abierta parece un producto (R5-F):
+        si no, no podría arreglar nada y el sitemap siguiente se quedaría sin ella. Si las fichas
+        por HTTP son armazones de una SPA, se prueba con Chromium antes que la IA (R5-E)."""
+        problemas = problemas_de_url_sitemap(leido.sitemap, self.dominio)
+        if problemas:
+            raise ConfiguracionFallida(
+                f"El sitemap {leido.sitemap} no vale para el perfil de {self.dominio}: "
+                f"{problemas[0]}"
             )
         legibles = leido.con_palabras
         if legibles < MIN_CON_PALABRAS:
@@ -510,26 +747,39 @@ class _Configuracion:
             tipo=TIPO_SITEMAP,
         )
         informe = await self.validar_sitemap(perfil, fichas)
-        con_ia = not informe.valido
-        if con_ia:
-            # El JSON-LD y los metadatos no bastan: 1 llamada a la IA para los selectores.
-            ficha = await self.abrir_ficha(fichas, js=False)
-            if ficha is None:
-                raise ConfiguracionFallida(_no_vale_el_sitemap(self.dominio, informe))
-            propuesta = _Propuesta()
-            sel_campos = await pedir_campos(self.sesion, ficha, self.claves, None, propuesta)
-            perfil = replace(perfil, sel_campos=sel_campos)
+        if informe.valido:
+            return perfil, informe, False
+        if informe.fichas_ok == 0 and await self.son_armazones(fichas):
+            # R5-E: por HTTP las fichas son el armazón de una SPA; se prueba con Chromium antes de
+            # gastar la IA, y desde aquí todo (la ficha de la IA y su validación) va con Chromium.
+            perfil = replace(perfil, necesita_js=True)
             informe = await self.validar_sitemap(perfil, fichas)
-            if not informe.valido:
-                raise ConfiguracionFallida(_no_vale_el_sitemap(self.dominio, informe))
-        info = destino.guardar_catalogo(
-            self.dominio, leido.sitemap, leido.entradas, parcial=leido.parcial
+            if informe.valido:
+                return perfil, informe, False
+        # El JSON-LD y los metadatos no bastan: 1 llamada a la IA para los selectores, si no se
+        # ha gastado ya en otro sitemap y alguna ficha se abre y parece un producto.
+        ficha = (
+            None
+            if self._ia_en_sitemap
+            else await self.abrir_ficha(fichas, js=perfil.necesita_js, producto=True)
         )
-        tamano = f"{info.total} URL" + (", parcial" if info.parcial else "")
-        como = "🤖 selectores de la ficha" if con_ia else "sin IA"
-        return replace(
-            perfil, nota=_nota(f"Catálogo por sitemap ({tamano}), {como}. ", resumir(informe))
+        if ficha is None:
+            raise ConfiguracionFallida(_no_vale_el_sitemap(self.dominio, informe))
+        self._ia_en_sitemap = True
+        propuesta = _Propuesta()
+        sel_campos = await pedir_campos(self.sesion, ficha, self.claves, None, propuesta)
+        perfil = replace(perfil, sel_campos=sel_campos)
+        informe = await self.validar_sitemap(perfil, fichas)
+        registro.info(
+            "Configurador de %s (sitemap %s): la IA propone %s; %s",
+            self.dominio,
+            leido.sitemap,
+            _propuesto(propuesta.propuesto),
+            _linea(resumir(informe)),
         )
+        if not informe.valido:
+            raise ConfiguracionFallida(_no_vale_el_sitemap(self.dominio, informe))
+        return sin_campos_repetidos(perfil, informe), informe, True
 
     async def validar_sitemap(self, perfil: Perfil, fichas: Sequence[str]) -> InformeValidacion:
         return await validar(
@@ -570,9 +820,49 @@ class _Configuracion:
         return await pedir_campos(self.sesion, ficha, self.claves, anterior, propuesta)
 
 
+def parece_producto(pagina: Pagina) -> bool:
+    """La página parece la ficha de un producto: un importe a la vista (el mismo criterio que el
+    anclaje del precio), un `Product` en JSON-LD, o microdatos u OpenGraph de producto.
+
+    Antes de enseñarle una ficha a la IA (R5-F): un armazón SPA vacío o una página informativa
+    sin precio no le dejan proponer nada útil. No se exige el precio a la vista porque un
+    selector de atributo (`meta[itemprop=price] @content`) lo lee sin él.
+    """
+    raiz = analizar(pagina.html)
+    if next(buscar_precios(raiz.texto()), None) is not None:
+        return True
+    url = pagina.url_final or pagina.url
+    return bool(productos_de_arbol(raiz)) or producto_metadatos(raiz, url=url) is not None
+
+
+def parece_armazon(pagina: Pagina) -> bool:
+    """La página es el armazón de una SPA: no parece un producto (`parece_producto`), casi no
+    tiene texto (menos de `MAX_TEXTO_ARMAZON` caracteres) y no viene ya de Chromium.
+
+    Una ficha así por HTTP solo se pinta con JavaScript (R5-E): vale la pena probar el perfil
+    `sitemap` con Chromium. Una página sin precio pero con texto (informativa, agotada) no lo es,
+    y lo que ya vino por Chromium (`Pagina.por_chromium`, ADR-023) no gana nada repitiéndolo.
+    """
+    if pagina.por_chromium or parece_producto(pagina):
+        return False
+    return len(analizar(pagina.html).texto()) < MAX_TEXTO_ARMAZON
+
+
 def _no_vale_el_sitemap(dominio: str, informe: InformeValidacion) -> str:
     motivo = "; ".join(informe.problemas[:MAX_MOTIVO]) or "sin detalles"
     return f"El catálogo por sitemap de {dominio} no da fichas con precio: {motivo}"
+
+
+def _ningun_sitemap(dominio: str, motivos: Sequence[tuple[str, str]]) -> str:
+    """El motivo de B cuando no vale ningún sitemap: el de cada uno, con su URL si son varios."""
+    if len(motivos) == 1:
+        return motivos[0][1]
+    partes = (_recortar(motivo, MAX_DESCARTE) for _, motivo in motivos)
+    detalle = " ".join(
+        f"{sitemap}: {m if m.endswith(('.', '…')) else m + '.'}"
+        for (sitemap, _), m in zip(motivos, partes, strict=True)
+    )
+    return f"Se han probado {len(motivos)} sitemaps de {dominio} y ninguno sirve. {detalle}"
 
 
 async def pedir_campos(
@@ -582,18 +872,19 @@ async def pedir_campos(
     anterior: _Propuesta | None,
     propuesta: _Propuesta,
 ) -> dict[str, str]:
-    """🤖 Selectores de los campos de `ficha` (paso 3; también en B)."""
+    """Selectores de los campos de `ficha` (paso 3; también en B)."""
     # Lo que ya da el JSON-LD de la ficha no se pide, salvo el precio (ver el módulo).
     del_jsonld = await extraer_ficha(ficha, claves)
     pedidos = tuple(c for c in claves if c == "precio" or c not in del_jsonld.campos)
     lista = "\n".join(f"- {c}: {DESCRIPCIONES[c]}" for c in pedidos)
+    esquema = esquema_campos(pedidos)
     respuesta = await sesion.pedir(
         PeticionIA(
             componente=COMPONENTE,
             instrucciones=_instrucciones(INSTRUCCIONES_FICHA + lista + "\n", anterior),
             datos=datos_para_ia(ficha, anterior_de(anterior), listado=False),
-            esquema=esquema_campos(pedidos),
-            max_tokens=512,
+            esquema=esquema,
+            max_tokens=max_tokens_para(esquema),
         )
     )
     propuesta.propuesto["sel_campos"] = respuesta.datos

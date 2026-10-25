@@ -1,4 +1,4 @@
-"""🤖 Reparador: propone una versión nueva del perfil roto y solo la devuelve si valida."""
+"""IA · Reparador: propone una versión nueva del perfil roto y solo la devuelve si valida."""
 
 import asyncio
 from dataclasses import replace
@@ -97,7 +97,7 @@ def test_repara_y_sube_la_version() -> None:
         creado=AHORA,
         nota=nuevo.nota,
     )
-    assert AUTOR == "🤖 reparador"
+    assert AUTOR == "reparador IA"
     assert nuevo.nota.startswith("Válido")
     assert len(peticiones) == 1
     # Validado de verdad: búsqueda y fichas.

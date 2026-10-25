@@ -1,7 +1,6 @@
 """Conectores de solo lectura a las APIs públicas de WooCommerce y Shopify."""
 
 import json
-import time
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -21,6 +20,7 @@ from precia.fuentes.apis import (
 from precia.fuentes.plataformas import Plataforma
 from precia.navegador.tipos import Pagina
 from precia.nucleo.modelos import OrigenDato, ValorCampo
+from tests.cronometro import segundos_de_cpu
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "fuentes"
 TODOS = ("precio", "referencia_oem", "marca", "estado", "descripcion", "fotos")
@@ -388,11 +388,13 @@ def test_woocommerce_titulo_y_descripcion_con_html_hostil() -> None:
 
 def test_woocommerce_textos_enormes_se_recortan() -> None:
     producto = _producto_woo(name="Faro " * 100_000, description="<p>" + "palabra " * 200_000)
-    inicio = time.perf_counter()
-    (ficha,) = _woo(producto)
-    assert time.perf_counter() - inicio < 3
-    assert len(ficha.titulo) <= 300
-    assert len(ficha.campos["descripcion"].valor) <= 5_000
+
+    def comprobar() -> None:
+        (ficha,) = _woo(producto)
+        assert len(ficha.titulo) <= 300
+        assert len(ficha.campos["descripcion"].valor) <= 5_000
+
+    assert segundos_de_cpu(comprobar, 3) < 3
 
 
 # --- Shopify ----------------------------------------------------------------------------------
@@ -564,10 +566,12 @@ HOSTILES = [
 @pytest.mark.parametrize("texto", HOSTILES, ids=[f"hostil{i}" for i in range(len(HOSTILES))])
 def test_json_hostil_da_lista_vacia(plataforma: Plataforma, texto: str) -> None:
     pagina = _pagina(texto, URL_WOO if plataforma is Plataforma.WOOCOMMERCE else URL_SUGGEST)
-    inicio = time.perf_counter()
-    assert ofertas_api(plataforma, pagina, WOO, TODOS) == []
-    assert ofertas_api(plataforma, pagina, SHOP, TODOS) == []
-    assert time.perf_counter() - inicio < 3
+
+    def comprobar() -> None:
+        assert ofertas_api(plataforma, pagina, WOO, TODOS) == []
+        assert ofertas_api(plataforma, pagina, SHOP, TODOS) == []
+
+    assert segundos_de_cpu(comprobar, 3) < 3
 
 
 def test_json_gigante_se_ignora() -> None:
@@ -598,13 +602,15 @@ def test_muchos_productos_hostiles_en_tiempo_acotado() -> None:
     texto = json.dumps([producto] * 2)
     assert len(texto) < 5_000_000
     pagina = _pagina(texto, URL_WOO)
-    inicio = time.perf_counter()
-    fichas = ofertas_api(Plataforma.WOOCOMMERCE, pagina, WOO, TODOS)
-    assert time.perf_counter() - inicio < 3
-    assert len(fichas) == 1
-    assert "referencia_oem" not in fichas[0].campos
-    assert "estado" not in fichas[0].campos
-    assert fichas[0].campos["fotos"] == _api("50 fotos")
+
+    def comprobar() -> None:
+        fichas = ofertas_api(Plataforma.WOOCOMMERCE, pagina, WOO, TODOS)
+        assert len(fichas) == 1
+        assert "referencia_oem" not in fichas[0].campos
+        assert "estado" not in fichas[0].campos
+        assert fichas[0].campos["fotos"] == _api("50 fotos")
+
+    assert segundos_de_cpu(comprobar, 3) < 3
 
 
 # --- Revisión adversarial ---------------------------------------------------------------------
@@ -704,10 +710,11 @@ def test_productos_repetidos_con_html_pesado_no_se_reprocesan(plataforma: Plataf
         pagina = _pagina(json.dumps(respuesta), URL_SUGGEST)
         dominio = SHOP
     assert len(pagina.html) < 5_000_000
-    inicio = time.perf_counter()
-    fichas = ofertas_api(plataforma, pagina, dominio, TODOS)
-    assert time.perf_counter() - inicio < 1.5
-    assert len(fichas) == 1
+
+    def comprobar() -> None:
+        assert len(ofertas_api(plataforma, pagina, dominio, TODOS)) == 1
+
+    assert segundos_de_cpu(comprobar, 1.5) < 1.5
 
 
 # --- SKU interno frente a referencia OEM (prueba real de generalidad) -------------------------
@@ -888,10 +895,12 @@ def test_oem_etiquetada_con_texto_hostil_en_tiempo_acotado() -> None:
         "Referencia OEM 1 2 3 4 5 6 7 8 9 2015 " * 500,
         "N.º de pieza " + " 698" * 5_000,
     ]
-    inicio = time.perf_counter()
-    for texto in hostiles:
-        _woo(_producto_woo(sku="5K1941005", description=texto, short_description=texto))
-    assert time.perf_counter() - inicio < 2
+
+    def todos() -> None:
+        for texto in hostiles:
+            _woo(_producto_woo(sku="5K1941005", description=texto, short_description=texto))
+
+    assert segundos_de_cpu(todos, 2) < 2
 
 
 @pytest.mark.parametrize(
@@ -954,3 +963,121 @@ def test_shopify_js_sku_de_la_variante_corroborado_en_la_descripcion() -> None:
     descripcion = "<p>Izquierdo: ref. original 5K1941005. Derecho: ref. original 5K1941006.</p>"
     (ficha,) = _js(_producto_js(title="Faro Golf VI", variants=variantes, description=descripcion))
     assert ficha.campos["referencia_oem"] == _api("5K1941005")
+
+
+def test_atributo_oem_por_grupos_con_sufijo_se_conserva() -> None:
+    # Bug 7: «1K0 615 301 AA» se leía como 1K0615301 y, al no coincidir con la referencia
+    # entera, el atributo se perdía.
+    atributos = [{"name": "Referencia OEM", "terms": [{"name": "1K0 615 301 AA"}]}]
+    (ficha,) = _woo(_producto_woo(attributes=atributos))
+    assert ficha.campos["referencia_oem"].valor == "1K0 615 301 AA"
+
+
+# --- Marca de Shopify: `vendor` que es un código (causa R2-SHOP) ------------------------------
+
+ECOALF = "ecoalf.com"
+URL_ECOALF = (
+    "https://ecoalf.com/search/suggest.json?q=camiseta+algod%C3%B3n"
+    "&resources%5Btype%5D=product&resources%5Blimit%5D=10"
+)
+
+
+def test_ecoalf_real_el_vendor_con_el_codigo_de_estilo_no_es_la_marca() -> None:
+    """Ecoalf rellena `vendor` con su código de estilo («MCMGATSLARED0847W26-162»).
+
+    Es distinto en cada producto y no es una marca: no se da como tal. El título y el precio
+    de la misma respuesta siguen valiendo.
+    """
+    texto = (REALES / "ecoalf_api_shopify_suggest_camiseta.json").read_text(encoding="utf-8")
+    vendors = [p["vendor"] for p in json.loads(texto)["resources"]["results"]["products"]]
+    fichas = ofertas_api(Plataforma.SHOPIFY, _pagina(texto, URL_ECOALF), ECOALF, TODOS)
+    assert len(fichas) == 3
+    assert [f.titulo for f in fichas] == [
+        "CAMISETA MANGA LARGA LAREDO AZUL",
+        "CAMISETA VERONE GRIS OSCURO",
+        "CAMISETA ANDRO BLANCA",
+    ]
+    assert [f.precio.importe if f.precio else None for f in fichas] == [
+        Decimal("59.90"),
+        Decimal("69.90"),
+        Decimal("45.00"),
+    ]
+    assert [f.campos.get("marca") for f in fichas] == [None, None, None]
+    assert vendors == [
+        "MCMGATSLARED0847W26-162",
+        "MCWGATSVERON0874W26-309",
+        "MCMGATSANDRO0803W26-000",
+    ]
+
+
+@pytest.mark.parametrize(
+    "vendor",
+    ["MCWGATSVERON0874W26-309", "AB12345678", "SKU-2024-0001", "5K1941005", "20240001"],
+)
+def test_shopify_vendor_con_forma_de_codigo_no_es_marca(vendor: str) -> None:
+    (ficha,) = _js(_producto_js(vendor=vendor))
+    assert "marca" not in ficha.campos
+    assert ficha.precio is not None
+    assert ficha.titulo == "Retrovisor Seat León"
+
+
+@pytest.mark.parametrize(
+    ("vendor", "variantes"),
+    [
+        # El SKU de una variante (aunque tenga pocas cifras para parecer un código).
+        ("RSL-12", [{"id": 1, "sku": "rsl12", "price": 4500, "available": True}]),
+        (
+            "ABC 123",
+            [
+                {"id": 1, "sku": "", "price": 4500, "available": True},
+                {"id": 2, "sku": "ABC-123", "price": 4600, "available": True},
+            ],
+        ),
+        # El handle del producto.
+        ("retrovisor-seat-leon", [{"id": 1, "sku": "", "price": 4500, "available": True}]),
+    ],
+)
+def test_shopify_vendor_igual_al_sku_o_al_handle_no_es_marca(
+    vendor: str, variantes: list[dict[str, Any]]
+) -> None:
+    (ficha,) = _js(_producto_js(vendor=vendor, variants=variantes))
+    assert "marca" not in ficha.campos
+
+
+@pytest.mark.parametrize(
+    "vendor",
+    [
+        "Hella",
+        "Seat",
+        "BOSCH",
+        "MANN-FILTER",
+        "Febi Bilstein",
+        "FEBI BILSTEIN",
+        "K&N",
+        "3M",
+        "WD-40",
+        "NGK",
+        "KYB",
+        "K2",
+        "2XU",
+        "4F",
+        "4Racing",
+        "Zapatillas24",
+        "Repuestos4x4",
+        "New Balance",
+        "Motul 300V",
+        "Dr. Martens",
+        "Levi's",
+        "H&M",
+        "G-Star RAW",
+        "Ecoalf",
+    ],
+)
+def test_shopify_vendor_que_es_una_marca_se_conserva(vendor: str) -> None:
+    (ficha,) = _js(_producto_js(vendor=vendor))
+    assert ficha.campos["marca"] == _api(vendor)
+
+
+def test_shopify_suggest_marca_de_recambios_se_conserva(fichas_suggest: list[Any]) -> None:
+    """No regresión del caso de referencia: «Hella» en el buscador predictivo sigue siendo marca."""
+    assert fichas_suggest[0].campos["marca"] == _api("Hella")

@@ -19,6 +19,7 @@ from precia.nucleo.modelos import (
     ResultadoBusqueda,
     ResultadoEvaluacion,
     ResumenIA,
+    Seguimiento,
     SerieHistorico,
     Tienda,
 )
@@ -63,7 +64,14 @@ def entrada_normalizada(dominio: str, texto: str | None) -> str | None:
 class FuenteDatos(Protocol):
     es_demo: bool
 
-    async def buscar(self, consulta: ConsultaBusqueda) -> ResultadoBusqueda: ...
+    async def buscar(
+        self, consulta: ConsultaBusqueda, *, seguimiento: Seguimiento | None = None
+    ) -> ResultadoBusqueda:
+        """Busca en las tiendas de la consulta (todas si no elige ninguna).
+
+        `seguimiento` (C1) recibe el estado de cada tienda y los resultados provisionales.
+        """
+        ...
 
     def tiendas(self) -> list[Tienda]: ...
 
@@ -84,6 +92,12 @@ class FuenteDatos(Protocol):
         """
         ...
 
+    def reintentar_configuracion(self, dominio: str) -> Tienda:
+        """A1: quita la espera tras una configuración fallida; la tienda se configura en la
+        próxima búsqueda en modo Auto o IA. A8: también olvida el bloqueo recordado en memoria.
+        `TiendaNoExiste` si no existe."""
+        ...
+
     def revisar_perfil(self, dominio: str, version: int) -> Tienda:
         """Memoria §4: la persona revisa y fija la versión actual del perfil de la tienda.
 
@@ -97,7 +111,11 @@ class FuenteDatos(Protocol):
 
     def alertas(self) -> list[Alerta]: ...
 
-    def crear_alerta(self, id_producto: str, umbral: Decimal, canal: str) -> Alerta: ...
+    def crear_alerta(
+        self, id_producto: str, umbral: Decimal, canal: str, *, solo_exactas: bool = True
+    ) -> Alerta:
+        """Con `solo_exactas` (por defecto), no cuentan equivalentes ni revisiones (B5)."""
+        ...
 
     def resumen_ia(self) -> ResumenIA: ...
 

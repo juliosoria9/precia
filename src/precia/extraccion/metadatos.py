@@ -5,9 +5,10 @@ publican JSON-LD pero sí microdatos (PrestaShop los trae en su tema por defecto
 las redes sociales (Shopify pone `og:price:amount`). Son datos que la página entrega a cualquier
 visitante en su propio marcado, así que se leen con las mismas cautelas que el JSON-LD:
 
-- Solo cuenta como producto un ámbito `itemscope` cuyo `itemtype` es un `Product` (u `Offer`) de
-  `schema.org`, o un OpenGraph con `og:type` de producto o con precio. Un `og:title` y un
-  `og:image` sueltos los lleva cualquier portada o artículo de blog.
+- Solo cuenta como producto un ámbito `itemscope` cuyo `itemtype` es un `Product`, una obra que
+  se vende (`Book`, `Audiobook`...: `tipos.OBRAS_VENDIBLES`) o un `Offer` de `schema.org`, o un
+  OpenGraph con `og:type` de producto o con precio. Un `og:title` y un `og:image` sueltos los
+  lleva cualquier portada o artículo de blog.
 - Las propiedades de un ámbito anidado (el accesorio relacionado, la marca como `Organization`)
   no se mezclan con las del producto, y un `Product` anidado en otro nunca es el de la ficha.
 - Un ámbito que declara la URL de otra página (`itemprop="url"`) es otro producto: las
@@ -29,7 +30,7 @@ from urllib.parse import urljoin, urlsplit
 
 from precia.extraccion.dom import Nodo, analizar
 from precia.extraccion.precios import MAX_IMPORTE, leer_precio
-from precia.extraccion.tipos import Precio, ProductoJSONLD
+from precia.extraccion.tipos import OBRAS_VENDIBLES, Precio, ProductoJSONLD
 
 MAX_AMBITOS = 50
 """Ámbitos `Product` (y `Offer`) que se miran como mucho; una ficha real tiene unos pocos."""
@@ -45,7 +46,9 @@ MAX_URL = 2_000
 MAX_TEXTO_PRECIO = 50
 MIN_IMPORTE = Decimal("0.01")
 
-_TIPOS_PRODUCTO = frozenset({"Product", "IndividualProduct", "ProductModel", "SomeProducts"})
+_TIPOS_PRODUCTO = (
+    frozenset({"Product", "IndividualProduct", "ProductModel", "SomeProducts"}) | OBRAS_VENDIBLES
+)
 _TIPOS_OFERTA = frozenset({"Offer", "AggregateOffer"})
 _ESTADOS = {
     "newcondition": "Nuevo",

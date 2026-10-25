@@ -1,11 +1,17 @@
 """Validador propio del subconjunto de JSON Schema y lectura de la salida del modelo."""
 
+import json
 from typing import Any
 
 import pytest
 
 from precia.ia.salida import esquema_para_api, interpretar, validar
-from precia.ia.tipos import SalidaNoValida
+from precia.ia.tipos import (
+    CARACTERES_POR_TOKEN,
+    MINIMO_TOKENS,
+    SalidaNoValida,
+    max_tokens_para,
+)
 
 ESQUEMA: dict[str, Any] = {
     "type": "object",
@@ -171,3 +177,60 @@ def test_esquema_para_api_rechaza_palabras_clave_no_admitidas() -> None:
         )
     with pytest.raises(ValueError, match="Tipo"):
         esquema_para_api({"type": "object", "properties": {"u": {"type": "fecha"}}})
+
+
+# --- R2-TOK: tope de tokens de salida a partir del esquema --------------------------------------
+
+ACOTADO: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "sel": {"type": "string", "maxLength": 300},
+        "nulo": {"anyOf": [{"type": "string", "maxLength": 300}, {"type": "null"}]},
+        "lista": {"type": "array", "items": {"type": "string", "maxLength": 50}, "maxItems": 3},
+        "estado": {"type": "string", "enum": ["Nuevo", "Reacondicionado"]},
+        "n": {"type": "integer"},
+        "ok": {"type": "boolean"},
+    },
+    "required": ["sel", "nulo", "lista", "estado", "n", "ok"],
+    "additionalProperties": False,
+}
+MAXIMO: dict[str, Any] = {
+    "sel": "a" * 300,
+    "nulo": "b" * 300,
+    "lista": ["c" * 50] * 3,
+    "estado": "Reacondicionado",
+    "n": -1234567890123456,
+    "ok": False,
+}
+
+
+def test_max_tokens_cubre_la_salida_valida_mas_larga() -> None:
+    validar(MAXIMO, ACOTADO)
+    for texto in (json.dumps(MAXIMO, ensure_ascii=False), json.dumps(MAXIMO, indent=2)):
+        assert max_tokens_para(ACOTADO) * CARACTERES_POR_TOKEN >= len(texto)
+
+
+def test_max_tokens_crece_con_el_esquema() -> None:
+    uno = {**ACOTADO, "properties": {"sel": ACOTADO["properties"]["sel"]}, "required": ["sel"]}
+    assert max_tokens_para(uno) < max_tokens_para(ACOTADO)
+    assert max_tokens_para(uno) >= 300 // CARACTERES_POR_TOKEN
+
+
+def test_max_tokens_nunca_baja_del_minimo() -> None:
+    """Con un solo campo (la ficha cuando el JSON-LD ya da el resto) no baja del tope de antes."""
+    corto = {"type": "object", "properties": {}, "required": [], "additionalProperties": False}
+    assert max_tokens_para(corto) == MINIMO_TOKENS == 512
+
+
+@pytest.mark.parametrize(
+    "esquema",
+    [
+        {"type": "string"},
+        {"type": "array", "items": {"type": "string", "maxLength": 5}},
+        {"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]},
+    ],
+)
+def test_max_tokens_de_un_esquema_sin_cota(esquema: dict[str, Any]) -> None:
+    """Sin `maxLength` o `maxItems` no hay techo que calcular: es un error del que llama."""
+    with pytest.raises(ValueError, match="cota"):
+        max_tokens_para(esquema)

@@ -31,6 +31,7 @@ import re
 import unicodedata
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 from urllib.parse import parse_qsl, quote_plus, urlencode, urlsplit, urlunsplit
@@ -38,6 +39,7 @@ from urllib.parse import parse_qsl, quote_plus, urlencode, urlsplit, urlunsplit
 from precia.emparejado.referencias import es_referencia, normalizar_referencia, referencias_en
 from precia.extraccion.dom import analizar
 from precia.extraccion.ficha import formatear_precio
+from precia.extraccion.imagenes import primera_foto
 from precia.extraccion.listado import dominio_normalizado, url_de_la_tienda
 from precia.extraccion.precios import MAX_IMPORTE
 from precia.extraccion.tipos import FichaExtraida, Precio
@@ -64,6 +66,11 @@ MAX_VARIANTES = 100
 MAX_UNIDAD_MENOR = 6
 DIGITOS_MINIMOS_SKU_NUMERICO = 7
 """Un SKU solo de cifras más corto suele ser un número interno («1234», «000451»), no una OEM."""
+CIFRAS_MINIMAS_CODIGO = 4
+"""Un `vendor` de Shopify sin espacios, con forma de referencia y estas cifras, es un código.
+
+«MCMGATSLARED0847W26-162» lo es; «4Racing», «Zapatillas24», «Repuestos4x4» o «WD-40», no.
+"""
 MAX_OEM_ETIQUETADAS = 10
 """Referencias tras una etiqueta OEM que se leen de cada texto (las siguientes se ignoran)."""
 MAX_TRAS_ETIQUETA = 60
@@ -286,7 +293,7 @@ def ofertas_api(
     for producto in productos:
         if producto is None:
             continue
-        fichas.append(producto.ficha(pedidos, avisos))
+        fichas.append(producto.ficha(pedidos, avisos, obtenida=pagina.obtenida))
         if len(fichas) >= maximo:
             break
     return fichas
@@ -304,10 +311,14 @@ class _Producto:
     estado: str | None = None
     descripcion: str | None = None
     imagenes: int = 0
+    foto: str | None = None
+    """La foto principal ya validada (`imagenes.foto_valida`); el recuento va en `imagenes`."""
     agotado: bool = False
     avisos: list[str] = field(default_factory=list)
 
-    def ficha(self, pedidos: tuple[str, ...], avisos: Sequence[str]) -> FichaExtraida:
+    def ficha(
+        self, pedidos: tuple[str, ...], avisos: Sequence[str], *, obtenida: datetime | None = None
+    ) -> FichaExtraida:
         valores = {
             "precio": formatear_precio(self.precio) if self.precio is not None else None,
             "referencia_oem": self.referencia,
@@ -324,7 +335,15 @@ class _Producto:
         lista_avisos = [*avisos, *self.avisos]
         if self.agotado:
             lista_avisos.append(AVISO_AGOTADO)
-        return FichaExtraida(self.url, self.titulo, self.precio, campos, tuple(lista_avisos))
+        return FichaExtraida(
+            self.url,
+            self.titulo,
+            self.precio,
+            campos,
+            tuple(lista_avisos),
+            obtenida=obtenida,
+            foto=self.foto,
+        )
 
 
 # --- WooCommerce ----------------------------------------------------------------------------
@@ -353,6 +372,8 @@ def _producto_woo(
     claves = ("short_description", "description")
     textos = [_texto_html(datos.get(clave), MAX_DESCRIPCION) for clave in claves]
     oem_atributos = [v for nombre, valores in atributos if _es_nombre_oem(nombre) for v in valores]
+    imagenes = _dicts(datos.get("images"), MAX_IMAGENES)
+    fotos = [*(i.get("src") for i in imagenes), *(i.get("thumbnail") for i in imagenes)]
     return _Producto(
         titulo=titulo,
         url=url,
@@ -365,11 +386,8 @@ def _producto_woo(
         ),
         estado=_estado(atributos, etiquetas),
         descripcion=_primero(textos),
-        imagenes=sum(
-            1
-            for imagen in _dicts(datos.get("images"), MAX_IMAGENES)
-            if _no_vacio(imagen.get("src"))
-        ),
+        imagenes=sum(1 for imagen in imagenes if _no_vacio(imagen.get("src"))),
+        foto=primera_foto((f for f in fotos if isinstance(f, str)), base=url),
         agotado=datos.get("is_in_stock") is False,
     )
 
@@ -462,12 +480,40 @@ def _producto_shopify(
         url=url,
         precio=precio,
         referencia=_referencia_shopify(elegida[0] if elegida else None, variantes, titulo, textos),
-        marca=_texto_html(datos.get("vendor"), MAX_MARCA),
+        marca=_marca_shopify(datos.get("vendor"), variantes, datos.get("handle")),
         estado=_estado(opciones, _lista(datos.get("tags"), MAX_ETIQUETAS)),
         descripcion=_primero(textos),
         imagenes=_imagenes_shopify(datos),
+        foto=_foto_shopify(datos, url),
         agotado=datos.get("available") is False,
     )
+
+
+def _marca_shopify(vendor: object, variantes: list[dict[str, Any]], handle: object) -> str | None:
+    """`vendor` como marca, salvo que parezca un código del producto y no un nombre.
+
+    Hay tiendas que lo rellenan con su código de estilo o de SKU, distinto en cada producto
+    («MCMGATSLARED0847W26-162»). Se descarta si, normalizado, es el SKU de una variante o el
+    handle, o si es una sola pieza sin espacios con forma de referencia y al menos
+    `CIFRAS_MINIMAS_CODIGO` cifras. Descartado no se sustituye por nada: la marca queda vacía.
+    """
+    marca = _texto_html(vendor, MAX_MARCA)
+    if marca is None:
+        return None
+    normal = normalizar_referencia(marca)
+    propios = [v.get("sku") for v in variantes] + [handle]
+    if normal and any(
+        isinstance(p, str) and normalizar_referencia(p[: MAX_MARCA * 2]) == normal for p in propios
+    ):
+        return None
+    cifras = sum(c.isdigit() for c in normal)
+    codigo = (
+        " " not in marca
+        and cifras >= CIFRAS_MINIMAS_CODIGO
+        and es_referencia(normal)
+        and normal in referencias_en(marca)
+    )
+    return None if codigo else marca
 
 
 def _referencia_shopify(
@@ -523,6 +569,22 @@ def _imagenes_shopify(datos: dict[str, Any]) -> int:
     if isinstance(destacada, dict):
         destacada = destacada.get("url")
     return 1 if _no_vacio(datos.get("image")) or _no_vacio(destacada) else 0
+
+
+def _foto_shopify(datos: dict[str, Any], url: str) -> str | None:
+    """`featured_image`, si no la primera de `images`, si no `image` (texto, `{src}` o `{url}`)."""
+    candidatas = [
+        datos.get("featured_image"),
+        *_lista(datos.get("images"), MAX_IMAGENES),
+        datos.get("image"),
+    ]
+    return primera_foto((_src(c) for c in candidatas), base=url)
+
+
+def _src(valor: object) -> str | None:
+    if isinstance(valor, dict):
+        valor = valor.get("src") or valor.get("url")
+    return valor if isinstance(valor, str) else None
 
 
 def _sin_rastreo_shopify(url: str) -> str:

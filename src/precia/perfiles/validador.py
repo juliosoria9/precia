@@ -23,7 +23,14 @@ desde 49 €») y quedar anclado igual. Por eso una ficha solo cuenta si, ademá
   validar ese selector no se usa (manda el JSON-LD), pero sí en las fichas que no lo traen.
 
 Aun así, el validador no puede saber si los resultados son los productos buscados o si un
-selector de campo lee el dato correcto: por eso el perfil de la IA nace sin revisar.
+selector de campo lee el dato correcto: por eso el perfil de la IA nace sin revisar. Sí ve un
+caso seguro de error (R2-CAMPOS): dos selectores de campo que leen el mismo texto, como la marca
+y la referencia leyendo el mismo «P/N: …». `extraer_ficha` ya descarta el de menos prioridad en
+cada ficha; si en ninguna lee un valor propio, el campo va a `campos_repetidos` con un problema
+que lo explica (sin restar validez) y quien guarda el perfil lo quita con `sin_campos_repetidos`.
+Igual con un selector que lee un valor sin la forma de su campo (R3-E: la referencia leyendo
+«100% algodón», la marca leyendo el bloque entero del fabricante): `extraer_ficha` lo descarta
+(`con_forma`) y, si en ninguna ficha lee un valor con forma, el campo va a `campos_sin_forma`.
 
 Los `problemas` del informe explican qué falla con detalle suficiente para que el
 configurador se los devuelva a la IA en su reintento; pueden contener texto de la tienda, así
@@ -45,12 +52,13 @@ al menos un producto con precio. No se abre ninguna ficha: los datos vienen de l
 En Shopify la moneda sale de la portada (`Shopify.currency`); si no se sabe, el perfil no vale,
 porque leer libras como euros daría precios falsos con confianza 1.
 
-Los bloqueos (`Bloqueado`) y las prohibiciones de robots.txt se propagan: no son un fallo del
-perfil y quien llama tiene que pararse y registrarlos. También se propaga un error al descargar
-la búsqueda (la tienda no responde); el de una ficha cuenta como ficha fallida.
+Los bloqueos (`Bloqueado`) se propagan: no son un fallo del perfil y quien llama tiene que
+pararse y registrarlos. También se propaga un error al descargar la búsqueda (la tienda no
+responde); el de una ficha cuenta como ficha fallida.
 """
 
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 from itertools import islice
 from urllib.parse import quote, quote_plus, urlsplit
 
@@ -59,16 +67,19 @@ from precia.extraccion.ficha import extraer_ficha, formatear_precio
 from precia.extraccion.listado import (
     MAX_URL,
     dominio_normalizado,
+    enlace_del_resultado,
+    envoltura,
     extraer_listado,
     url_de_la_tienda,
 )
-from precia.extraccion.precios import leer_precio
+from precia.extraccion.precios import leer_precio, texto_de_precio
 from precia.extraccion.selectores import dividir_selector, extraer_valor, seleccionar
 from precia.extraccion.tipos import FichaExtraida, Precio, SelectorNoValido
 from precia.fuentes.apis import MAX_FICHAS as MAX_FICHAS_API
 from precia.fuentes.apis import ofertas_api
 from precia.fuentes.plataformas import Plataforma, moneda_shopify, origen_de
-from precia.navegador.tipos import ErrorDescarga, Pagina, ProhibidoPorRobots, URLNoPermitida
+from precia.fuentes.sitemap import url_de_sitemap
+from precia.navegador.tipos import ErrorDescarga, Pagina, URLNoPermitida
 from precia.navegador.url import Validador, validar_url
 from precia.nucleo.modelos import CAMPOS, CLAVES_CAMPOS, OrigenDato
 from precia.perfiles.protocolos import Navegador
@@ -103,6 +114,8 @@ MAX_RESULTADOS_REVISADOS = 50
 """Resultados en los que se busca un selector al explicar por qué no lee nada."""
 CLAVES = tuple(c.clave for c in CAMPOS)
 SELECTORES_LISTADO = ("sel_resultado", "sel_titulo", "sel_enlace", "sel_precio_listado")
+_FORMA = {"referencia_oem": "referencia"}
+"""Cómo se nombra la forma de un campo en el problema de un selector sin forma (R3-E)."""
 _RAIZ_VACIA = analizar("")
 PLATAFORMA_DE_TIPO: dict[str, Plataforma] = {
     TIPO_API_WOOCOMMERCE: Plataforma.WOOCOMMERCE,
@@ -232,6 +245,15 @@ async def _comprobar_fichas(
     """Abre las `fichas` (URL y precio del listado, si lo hay) y cuenta las de precio anclado."""
     con_precio = 0
     cuenta: dict[str, int] = {}
+    # R2-CAMPOS: campo descartado por repetido → (campo que se quedó el valor, valor), de la
+    # primera ficha; en cuántas fichas se descartó; y los que el perfil leyó con valor propio.
+    repetidos: dict[str, tuple[str, str]] = {}
+    veces: dict[str, int] = {}
+    propios: set[str] = set()
+    # R3-E: campo descartado por no tener la forma de su campo → valor leído en la primera ficha,
+    # y en cuántas fichas se descartó.
+    sin_forma: dict[str, str] = {}
+    veces_sin_forma: dict[str, int] = {}
     # Los avisos de la extracción van al final: si hay muchos, no deben tapar los problemas.
     avisos: list[str] = []
     for numero, (url_resultado, precio_listado) in enumerate(fichas, 1):
@@ -253,8 +275,24 @@ async def _comprobar_fichas(
             )
             continue
         ficha = await extraer_ficha(pagina_ficha, CLAVES, perfil=perfil)
-        for campo in ficha.campos:
+        if ficha.listado:
+            # R2-C10: una landing de marca o SEO no es una ficha, aunque traiga precios.
+            problemas.add(
+                f"Ficha {numero} ({url_resultado}): es un listado (ItemList con "
+                f"{ficha.listado} productos), no una ficha."
+            )
+            continue
+        for campo, leido in ficha.campos.items():
             cuenta[campo] = cuenta.get(campo, 0) + 1
+            if leido.origen is OrigenDato.PERFIL:
+                propios.add(campo)
+        for campo, ganador in ficha.repetidos.items():
+            veces[campo] = veces.get(campo, 0) + 1
+            if ganador in ficha.campos:
+                repetidos.setdefault(campo, (ganador, ficha.campos[ganador].valor))
+        for campo, leido_sin_forma in ficha.sin_forma.items():
+            veces_sin_forma[campo] = veces_sin_forma.get(campo, 0) + 1
+            sin_forma.setdefault(campo, leido_sin_forma)
         if ficha.precio is None:
             problemas.add(f"Ficha {numero} ({url_resultado}): no se encuentra un precio anclado.")
         elif precio_listado is not None and not _mismo_precio(ficha.precio, precio_listado):
@@ -274,8 +312,30 @@ async def _comprobar_fichas(
             con_precio += 1
         avisos.extend(f"Ficha {numero}: {aviso}" for aviso in ficha.avisos)
 
+    quitados = tuple(
+        c for c in CLAVES if c in perfil.sel_campos and c in repetidos and c not in propios
+    )
+    for clave in quitados:
+        ganador, texto = repetidos[clave]
+        donde = "en la ficha" if veces[clave] == 1 else f"en las {veces[clave]} fichas"
+        problemas.add(
+            f"sel_campos[{clave}] lee lo mismo que sel_campos[{ganador}] {donde} "
+            f"(«{_recortar_cita(texto)}»): se quita."
+        )
+    quitados_sin_forma = tuple(
+        c
+        for c in CLAVES
+        if c in perfil.sel_campos and c in sin_forma and c not in propios and c not in quitados
+    )
+    for clave in quitados_sin_forma:
+        veces_clave = veces_sin_forma[clave]
+        donde = "en la ficha" if veces_clave == 1 else f"en las {veces_clave} fichas"
+        problemas.add(
+            f"sel_campos[{clave}] lee «{_recortar_cita(sin_forma[clave])}» {donde}, que no tiene "
+            f"forma de {_FORMA.get(clave, clave)}: se quita."
+        )
     for clave in perfil.sel_campos:
-        if not cuenta.get(clave):
+        if not cuenta.get(clave) and clave not in quitados and clave not in quitados_sin_forma:
             problemas.add(
                 f"sel_campos[{clave}] no encuentra nada en ninguna de las {len(fichas)} fichas."
             )
@@ -293,7 +353,23 @@ async def _comprobar_fichas(
         fichas_ok=con_precio,
         fichas_total=len(fichas),
         campos={c: cuenta[c] for c in CLAVES if cuenta.get(c)},
+        repetidos=quitados,
+        sin_forma=quitados_sin_forma,
     )
+
+
+def sin_campos_repetidos(perfil: Perfil, informe: InformeValidacion) -> Perfil:
+    """`perfil` sin las claves de `sel_campos` que el informe da por repetidas (R2-CAMPOS) o sin
+    la forma de su campo (R3-E).
+
+    Vale más que falte un campo (puede salir del JSON-LD, de los metadatos o de la IA) que
+    guardar un selector que lee el valor de otro o algo que no es ese dato.
+    """
+    quitar = (*informe.campos_repetidos, *informe.campos_sin_forma)
+    if not quitar:
+        return perfil
+    sel_campos = {c: s for c, s in perfil.sel_campos.items() if c not in quitar}
+    return replace(perfil, sel_campos=sel_campos)
 
 
 async def _validar_api(
@@ -361,7 +437,7 @@ async def moneda_de_la_api(
         return None
     try:
         portada = await navegador.obtener(await validador(origen + "/"), js=False)
-    except (ErrorDescarga, ProhibidoPorRobots, URLNoPermitida):
+    except (ErrorDescarga, URLNoPermitida):
         return None
     if not _correcta(portada):
         return None
@@ -518,7 +594,12 @@ def problemas_de_url_listado(plantilla: object, dominio: str) -> list[str]:
 
 
 def problemas_de_url_sitemap(url: object, dominio: str) -> list[str]:
-    """Por qué `url` no vale como sitemap raíz de un perfil `sitemap` (lista vacía si vale)."""
+    """Por qué `url` no vale como sitemap raíz de un perfil `sitemap` (lista vacía si vale).
+
+    El host es el de la tienda o un subdominio estricto suyo, con la misma regla con la que se
+    descarga (`fuentes.sitemap.url_de_sitemap`, causa R5-B: Xtralife lo sirve en
+    `static.xtralife.com`). Las fichas que lleva dentro siguen exigiendo el host de la tienda.
+    """
     if not isinstance(url, str):
         return ["url_busqueda tiene que ser texto."]
     if "{" in url or "}" in url:
@@ -526,7 +607,7 @@ def problemas_de_url_sitemap(url: object, dominio: str) -> list[str]:
     if len(url) > MAX_URL or _caracteres_no_admitidos("La URL del sitemap", url):
         return ["La URL del sitemap es demasiado larga o lleva caracteres no admitidos."]
     normalizado = dominio_normalizado(dominio)
-    if "#" in url or normalizado is None or not _de_la_tienda_url(url, normalizado):
+    if "#" in url or normalizado is None or url_de_sitemap(url, f"https://{normalizado}/") is None:
         return [f"La URL del sitemap no es una URL http(s) del dominio {dominio}."]
     return []
 
@@ -605,6 +686,8 @@ class _Problemas:
         fichas_ok: int = 0,
         fichas_total: int = 0,
         campos: dict[str, int] | None = None,
+        repetidos: tuple[str, ...] = (),
+        sin_forma: tuple[str, ...] = (),
     ) -> InformeValidacion:
         return InformeValidacion(
             valido=valido,
@@ -613,6 +696,8 @@ class _Problemas:
             fichas_total=fichas_total,
             campos_encontrados=campos or {},
             problemas=tuple(self._lista),
+            campos_repetidos=repetidos,
+            campos_sin_forma=sin_forma,
         )
 
 
@@ -646,7 +731,7 @@ def _otro_precio_del_selector(
     if valor_ficha.origen is not OrigenDato.JSONLD:
         return None
     try:
-        texto = extraer_valor(analizar(pagina.html), selector)
+        texto = texto_de_precio(analizar(pagina.html), selector)
     except SelectorNoValido:
         return None
     leido = leer_precio(texto) if texto else None
@@ -685,6 +770,32 @@ def selectores_ausentes(raiz: Nodo, perfil: Perfil) -> list[str]:
 
 
 def _ausente(raiz: Nodo, resultados: Sequence[Nodo], nombre: str, selector: str) -> str | None:
+    if nombre != "sel_enlace":
+        return _ausente_en(raiz, resultados, nombre, selector)
+    # La misma regla que `extraer_listado`: el enlace puede ser el resultado o envolverlo (R2-C13).
+    ids = {id(r) for r in resultados}
+    revisados = resultados[:MAX_RESULTADOS_REVISADOS]
+    if any(enlace_del_resultado(r, selector, ids) for r in revisados):
+        return None
+    problema = _ausente_en(raiz, resultados, nombre, selector)
+    pista = _pista_enlace(revisados, ids)
+    return f"{problema} {pista}" if problema and pista else problema
+
+
+def _pista_enlace(revisados: Sequence[Nodo], ids: set[int]) -> str | None:
+    """Si los resultados son enlaces `<a href>` o están dentro de uno, cómo leerlo."""
+    envolturas = [envoltura(r, "a[href]", ids) for r in revisados]
+    if any(e is not None and e is r for e, r in zip(envolturas, revisados, strict=True)):
+        return "Cada resultado ya es un enlace <a href>: usa «@href» a secas como sel_enlace."
+    if any(e is not None for e in envolturas):
+        return (
+            "Cada resultado está dentro de un enlace <a href>: usa ese <a> como sel_resultado y "
+            "«@href» a secas como sel_enlace."
+        )
+    return None
+
+
+def _ausente_en(raiz: Nodo, resultados: Sequence[Nodo], nombre: str, selector: str) -> str | None:
     css, atributo = dividir_selector(selector)
     revisados = resultados[:MAX_RESULTADOS_REVISADOS]
     elementos = seleccionar(raiz, css) if css else list(revisados)
@@ -724,4 +835,8 @@ def _sin_resultados(raiz: Nodo, perfil: Perfil, consulta: str) -> str:
 
 
 def _cita(texto: str) -> str:
-    return repr(texto if len(texto) <= MAX_CITA else texto[: MAX_CITA - 1] + "…")
+    return repr(_recortar_cita(texto))
+
+
+def _recortar_cita(texto: str) -> str:
+    return texto if len(texto) <= MAX_CITA else texto[: MAX_CITA - 1] + "…"

@@ -18,15 +18,16 @@ no se consiguen, se avisa (sin secretos), se sigue sin proxy y «Ajustes» ense�
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
 
 from precia.almacen.sqlite import Almacen, DatoNoValido, TiendaDuplicada, TiendaNoEncontrada
+from precia.emparejado.agrupador import componente_revision
 from precia.ia.claude import ProveedorClaude
 from precia.ia.ollama import ProveedorOllama
-from precia.ia.servicio import ServicioIA
+from precia.ia.servicio import LlamadasEnVuelo, ServicioIA
 from precia.ia.tipos import ErrorIA, IANoDisponible, ProveedorIA
 from precia.navegador.cache import CachePaginas
 from precia.navegador.chromium import DescargadorChromium
@@ -34,7 +35,13 @@ from precia.navegador.con_proxy import DescargadorConProxy, UsoProxy
 from precia.navegador.cortesia import LimitadorDominio
 from precia.navegador.curl import TransporteCurl
 from precia.navegador.evomi import credenciales_evomi
-from precia.navegador.http import DescargadorHTTP, Transporte, TransporteURLLib
+from precia.navegador.http import (
+    FACTOR_TIEMPO_GRANDE,
+    TIMEOUT_HTTP_S,
+    DescargadorHTTP,
+    Transporte,
+    TransporteURLLib,
+)
 from precia.navegador.navegador import Navegador
 from precia.navegador.proxy import (
     NOMBRE_PROPIO,
@@ -67,14 +74,30 @@ from precia.nucleo.modelos import (
     ResultadoBusqueda,
     ResultadoEvaluacion,
     ResumenIA,
+    Seguimiento,
     SerieHistorico,
     Tienda,
 )
-from precia.nucleo.orquestador import MAX_FICHAS, Orquestador, estado_de
+from precia.nucleo.orquestador import (
+    CONSULTAS_CONFIGURACION,
+    MAX_FICHAS,
+    PLAZO_TIENDA_S,
+    Orquestador,
+    TurnosDePerfil,
+    estado_de,
+)
 
 registro = logging.getLogger(__name__)
 
 TTL_CACHE_S = 6 * 3600.0
+MARGEN_CANCELADO_S = TIMEOUT_HTTP_S * FACTOR_TIEMPO_GRANDE + TIMEOUT_HTTP_S
+"""Tras cancelar una descarga, cuánto se da su dominio por ocupado (C1): la descarga sigue en su
+hilo hasta su tiempo total (10 s, el triple en las grandes, A7; redirecciones incluidas) y, con
+urllib, una última lectura que puede pasarse otros 10 s (`http.TIMEOUT_HTTP_S`). No puede
+coincidir con otra (ADR-017)."""
+ESPERA_IA_AL_CERRAR_S = 60.0
+"""Lo que `cerrar` espera como mucho a las llamadas de IA en vuelo: el timeout de la API de
+Claude (`ProveedorClaude`), así que en la práctica espera a que terminen."""
 MAX_LLAMADAS_RESUMEN = 500
 MAX_NOMBRE_TIENDA = 200
 COMPONENTES = {
@@ -123,6 +146,12 @@ def proveedor_desde_ajustes(config: Config, ajustes: Ajustes) -> tuple[Proveedor
         return None, str(error)
 
 
+def _reservadas(consulta: ConsultaBusqueda, revisar: bool) -> tuple[str, ...]:
+    """El componente que revisará los resultados de esta búsqueda, si los va a revisar."""
+    componente = componente_revision(consulta, revisar)
+    return () if componente is None else (componente,)
+
+
 def _transporte(nombre: str, proxy: Proxy | None) -> Transporte:
     """El cliente HTTP de los ajustes (ADR-022). Uno desconocido usa el de por defecto."""
     if nombre not in TRANSPORTES_HTTP:
@@ -150,8 +179,12 @@ class FuenteReal:
         reloj: Callable[[], datetime] = _ahora,
         max_fichas: int = MAX_FICHAS,
         credenciales_evomi: CredencialesEvomi = credenciales_evomi,
+        consultas_configuracion: Sequence[str] = CONSULTAS_CONFIGURACION,
     ) -> None:
         """`validador` es el anti-SSRF de todo el flujo; solo se cambia en los tests.
+
+        `consultas_configuracion` son las consultas de prueba con las que se configura una tienda
+        sin perfil (A1); los tests las cambian para que coincidan con su tienda falsa.
 
         El proxy solo se usa con los descargadores reales: con `crear_descargadores` inyectado
         (tests, demo) no se interpreta ni se piden credenciales.
@@ -160,6 +193,7 @@ class FuenteReal:
         self._validador = validador
         self._reloj = reloj
         self._max_fichas = max_fichas
+        self._consultas_configuracion = tuple(consultas_configuracion)
         self._crear_descargadores = crear_descargadores or self._descargadores_reales
         self._descargadores_propios = crear_descargadores is None
         self._credenciales_evomi = credenciales_evomi
@@ -174,10 +208,20 @@ class FuenteReal:
         config.ruta_bd.parent.mkdir(parents=True, exist_ok=True)
         self._almacen = Almacen(config.ruta_bd, reloj=reloj)
         self._navegador: Navegador | None = None
-        self._clave_navegador: tuple[str, float, bool, Proxy | None, str] | None = None
+        self._clave_navegador: tuple[str, float, Proxy | None, str] | None = None
         self._usos: dict[Navegador, int] = {}
         """Búsquedas en vuelo por navegador (el actual y los sustituidos que aún se usan)."""
+        self._limitador: LimitadorDominio | None = None
+        """El limitador del navegador actual: el siguiente hereda sus márgenes (`heredar`)."""
+        self._ia_en_vuelo = LlamadasEnVuelo()
+        """Llamadas de IA en vuelo de todas las búsquedas: `cerrar` espera las de las canceladas y
+        su coste máximo cuenta en el presupuesto del mes hasta que se registran (B6)."""
+        self._turnos_perfil = TurnosDePerfil()
+        """Compartidos por las búsquedas simultáneas: una tienda no se configura ni se repara
+        dos veces a la vez (B6)."""
         self._candado = asyncio.Lock()
+        self.plazo_tienda_s = PLAZO_TIENDA_S
+        """Lo que puede tardar cada tienda en una búsqueda (C1); los tests lo acortan."""
 
     @property
     def almacen(self) -> Almacen:
@@ -185,16 +229,23 @@ class FuenteReal:
 
     # --- Búsqueda ---------------------------------------------------------------------------
 
-    async def buscar(self, consulta: ConsultaBusqueda) -> ResultadoBusqueda:
+    async def buscar(
+        self, consulta: ConsultaBusqueda, *, seguimiento: Seguimiento | None = None
+    ) -> ResultadoBusqueda:
         ajustes = self.ajustes()
         navegador = await self._tomar_navegador(ajustes)
         try:
-            return await self._buscar(consulta, ajustes, navegador)
+            return await self._buscar(consulta, ajustes, navegador, seguimiento)
         finally:
+            # También si se cancela (C1): el navegador se suelta y se cierra si lo sustituyeron.
             await self._soltar_navegador(navegador)
 
     async def _buscar(
-        self, consulta: ConsultaBusqueda, ajustes: Ajustes, navegador: Navegador
+        self,
+        consulta: ConsultaBusqueda,
+        ajustes: Ajustes,
+        navegador: Navegador,
+        seguimiento: Seguimiento | None,
     ) -> ResultadoBusqueda:
         proveedor, motivo = self._crear_proveedor(ajustes)
         servicio = None
@@ -205,6 +256,10 @@ class FuenteReal:
                 presupuesto_mes_usd=ajustes.presupuesto_mensual_usd,
                 tope_llamadas=ajustes.tope_llamadas_busqueda,
                 reloj=self._reloj,
+                en_vuelo=self._ia_en_vuelo,
+                # La revisión de los resultados tiene su llamada (nota 05), solo si la va a
+                # hacer y con el componente que va a usar: si no, quitaría una a los demás.
+                reservadas=_reservadas(consulta, ajustes.revisar_resultados),
             )
         orquestador = Orquestador(
             self._almacen,
@@ -214,8 +269,14 @@ class FuenteReal:
             validador=self._validador,
             reloj=self._reloj,
             motivo_sin_ia=motivo,
+            # Lo que extrae la IA de una ficha vale lo mismo que la ficha en caché (A3).
+            ttl_cache_ia=TTL_CACHE_S,
+            consultas_configuracion=self._consultas_configuracion,
+            plazo_tienda_s=self.plazo_tienda_s,
+            revisar_resultados=ajustes.revisar_resultados,
+            turnos_perfil=self._turnos_perfil,
         )
-        return await orquestador.buscar(consulta)
+        return await orquestador.buscar(consulta, seguimiento=seguimiento)
 
     async def _tomar_navegador(self, ajustes: Ajustes) -> Navegador:
         """El navegador para una búsqueda; hay que devolverlo con `_soltar_navegador`.
@@ -230,7 +291,6 @@ class FuenteReal:
             clave = (
                 ajustes.user_agent,
                 ajustes.retardo_dominio_s,
-                ajustes.respetar_robots,
                 self._proxy,
                 ajustes.transporte_http,
             )
@@ -240,14 +300,19 @@ class FuenteReal:
                     await viejo.cerrar()
             if self._navegador is None:
                 http, chromium = self._crear_descargadores(ajustes)
+                limitador = LimitadorDominio(
+                    ajustes.retardo_dominio_s, margen_cancelado_s=MARGEN_CANCELADO_S
+                )
+                if self._limitador is not None:
+                    limitador.heredar(self._limitador)
+                self._limitador = limitador
                 self._navegador = Navegador(
                     http=http,
                     chromium=chromium,
                     robots=ServicioRobots(http, ajustes.user_agent),
-                    limitador=LimitadorDominio(ajustes.retardo_dominio_s),
+                    limitador=limitador,
                     cache=CachePaginas(self._config.ruta_cache, TTL_CACHE_S),
                     validador=self._validador,
-                    respetar_robots=ajustes.respetar_robots,
                 )
                 self._clave_navegador = clave
             navegador = self._navegador
@@ -372,6 +437,9 @@ class FuenteReal:
             for navegador in pendientes:
                 if navegador is not None:
                     await navegador.cerrar()
+        # Las llamadas de IA de las búsquedas canceladas se registran al terminar: con la base
+        # cerrada se perderían y el gasto del mes se quedaría corto.
+        await self._ia_en_vuelo.esperar(ESPERA_IA_AL_CERRAR_S)
         self._almacen.cerrar()
 
     # --- Tiendas ----------------------------------------------------------------------------
@@ -410,6 +478,18 @@ class FuenteReal:
         except DatoNoValido as error:
             raise URLEntradaNoValida("La URL de entrada no es válida.") from error
 
+    def reintentar_configuracion(self, dominio: str) -> Tienda:
+        normalizado = normalizar_dominio(dominio)
+        if normalizado is None or self._almacen.tienda(normalizado) is None:
+            raise TiendaNoExiste(f"No hay ninguna tienda {dominio}.")
+        if self._navegador is not None:
+            # A8: también olvida el bloqueo recordado tras el proxy y Chromium.
+            self._navegador.olvidar_bloqueo(normalizado)
+        try:
+            return self._almacen.levantar_espera(normalizado)
+        except TiendaNoEncontrada as error:
+            raise TiendaNoExiste(f"No hay ninguna tienda {normalizado}.") from error
+
     def revisar_perfil(self, dominio: str, version: int) -> Tienda:
         normalizado = normalizar_dominio(dominio)
         tienda = self._almacen.tienda(normalizado) if normalizado else None
@@ -438,8 +518,10 @@ class FuenteReal:
     def alertas(self) -> list[Alerta]:
         return self._almacen.alertas()
 
-    def crear_alerta(self, id_producto: str, umbral: Decimal, canal: str) -> Alerta:
-        return self._almacen.crear_alerta(id_producto, umbral, canal)
+    def crear_alerta(
+        self, id_producto: str, umbral: Decimal, canal: str, *, solo_exactas: bool = True
+    ) -> Alerta:
+        return self._almacen.crear_alerta(id_producto, umbral, canal, solo_exactas=solo_exactas)
 
     # --- IA, ajustes y evaluación -----------------------------------------------------------
 

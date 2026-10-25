@@ -20,6 +20,7 @@ from precia.ia.defensas import construir_mensajes
 from precia.ia.salida import (
     Consumo,
     RechazoDelModelo,
+    SalidaCortada,
     SalidaNoValidaConConsumo,
     esquema_para_api,
     interpretar,
@@ -206,9 +207,7 @@ class ProveedorClaude:
         if motivo == "refusal":
             raise RechazoDelModelo("El modelo ha rechazado la petición", consumo)
         if motivo == "max_tokens":
-            raise SalidaNoValidaConConsumo(
-                "Salida incompleta: se ha alcanzado el máximo de tokens", consumo
-            )
+            raise SalidaCortada("Salida incompleta: se ha alcanzado el máximo de tokens", consumo)
         if motivo not in ("end_turn", "stop_sequence"):
             raise SalidaNoValidaConConsumo("Motivo de parada inesperado", consumo)
 

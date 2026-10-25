@@ -1,18 +1,18 @@
 """Motor de selectores CSS restringido (ADR-015): lo que no está en el subconjunto, se rechaza."""
 
-import time
-
 import pytest
 
 from precia.extraccion.dom import Nodo, analizar
 from precia.extraccion.selectores import (
     MAX_LONGITUD,
     dividir_selector,
+    encaja,
     extraer_valor,
     extraer_valores,
     seleccionar,
 )
 from precia.extraccion.tipos import SelectorNoValido
+from tests.cronometro import segundos_de_cpu
 
 HTML = """
 <div id="listado" class="productos rejilla">
@@ -221,28 +221,62 @@ def test_rendimiento_en_un_listado_grande() -> None:
         + "</ul>"
     )
     raiz = analizar(html)
-    inicio = time.perf_counter()
-    assert len(seleccionar(raiz, "ul li.p div > a span")) == 20_000
-    assert len(seleccionar(raiz, "li:nth-of-type(3) a")) == 1
-    assert len(seleccionar(raiz, "div div div div span")) == 0
-    assert time.perf_counter() - inicio < 5
+
+    def comprobar() -> None:
+        assert len(seleccionar(raiz, "ul li.p div > a span")) == 20_000
+        assert len(seleccionar(raiz, "li:nth-of-type(3) a")) == 1
+        assert len(seleccionar(raiz, "div div div div span")) == 0
+
+    assert segundos_de_cpu(comprobar, 5) < 5
 
 
 def test_rendimiento_con_anidamiento_profundo() -> None:
     raiz = analizar("<div>" * 500 + "<span>x</span>")
-    inicio = time.perf_counter()
-    assert len(seleccionar(raiz, "div div div div div div div div span")) == 1
-    assert len(seleccionar(raiz, "div > div div > div p")) == 0
-    assert time.perf_counter() - inicio < 5
+
+    def comprobar() -> None:
+        assert len(seleccionar(raiz, "div div div div div div div div span")) == 1
+        assert len(seleccionar(raiz, "div > div div > div p")) == 0
+
+    assert segundos_de_cpu(comprobar, 5) < 5
 
 
 def test_selector_gigante_con_sufijo_se_rechaza_rapido() -> None:
     # Revisión: el sufijo « @atributo» se buscaba con una expresión cuadrática antes de
     # comprobar la longitud; un selector de 100 000 caracteres tardaba decenas de segundos.
     gigante = "a" + " " * 100_000 + "b"
-    inicio = time.perf_counter()
+
+    def rechazar() -> None:
+        with pytest.raises(SelectorNoValido):
+            dividir_selector(gigante)
+        with pytest.raises(SelectorNoValido):
+            extraer_valor(analizar("<a>x</a>"), gigante)
+
+    assert segundos_de_cpu(rechazar, 1) < 1
+
+
+# --- encaja: si un nodo concreto encaja con la parte CSS (R2-C13) -----------------------------
+
+
+@pytest.mark.parametrize(
+    ("selector", "esperado"),
+    [
+        ("a", True),
+        ("a.tarjeta", True),
+        ("div.rejilla > a.tarjeta", True),
+        ("div a[href^='/p']", True),
+        ("a.otra", False),
+        ("div", False),
+        ("section a", False),
+        ("a.otra, a.tarjeta", True),
+    ],
+)
+def test_encaja(selector: str, esperado: bool) -> None:
+    raiz = analizar('<div class="rejilla"><a class="tarjeta" href="/p1"><h3>t</h3></a></div>')
+    (enlace,) = seleccionar(raiz, "a")
+    assert encaja(enlace, selector) is esperado
+
+
+def test_encaja_rechaza_lo_que_no_esta_en_el_subconjunto() -> None:
+    (enlace,) = seleccionar(analizar('<a href="/p">x</a>'), "a")
     with pytest.raises(SelectorNoValido):
-        dividir_selector(gigante)
-    with pytest.raises(SelectorNoValido):
-        extraer_valor(analizar("<a>x</a>"), gigante)
-    assert time.perf_counter() - inicio < 1
+        encaja(enlace, "a:has(h3)")

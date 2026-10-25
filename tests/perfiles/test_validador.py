@@ -1,15 +1,14 @@
 """Validador de perfiles: selectores admitidos, búsqueda real, listado y fichas con precio."""
 
 import asyncio
-import time
 from typing import Any
 
 import pytest
 
-from precia.extraccion.dom import analizar
+from precia.extraccion.dom import Nodo, analizar
 from precia.ia.servicio import SesionIA as SesionReal
 from precia.navegador.navegador import Navegador as NavegadorReal
-from precia.navegador.tipos import Bloqueado, ErrorDescarga, ProhibidoPorRobots, URLNoPermitida
+from precia.navegador.tipos import Bloqueado, ErrorDescarga, URLNoPermitida
 from precia.perfiles.protocolos import Navegador, SesionIA
 from precia.perfiles.tipos import TIPO_API_SHOPIFY, InformeValidacion, Perfil
 from precia.perfiles.validador import (
@@ -19,6 +18,7 @@ from precia.perfiles.validador import (
     url_de_busqueda,
     validar,
 )
+from tests.cronometro import proporcion_de_cpu, segundos_de_cpu
 from tests.navegador.falsos import validar_con_dns_publico
 from tests.perfiles.plataformas import (
     SHOPIFY_API,
@@ -69,6 +69,33 @@ def test_perfil_correcto_es_valido() -> None:
     # La búsqueda y solo las tres primeras fichas, sin JavaScript.
     assert navegador.pedidas == [(BUSQUEDA, False)] + [(p.url, False) for p in PRODUCTOS[:3]]
     assert MAX_FICHAS == 3
+
+
+def _con_precio_tachado() -> dict[str, str]:
+    """Las tres primeras fichas en oferta: un `<del>` con el precio antiguo delante del vigente."""
+    sitio = paginas_sitio(jsonld=(0, 1, 2))
+    for p in PRODUCTOS[:3]:
+        antes, despues = f'<span class="precio">{p.precio}</span>', p.precio
+        sitio[BUSQUEDA] = sitio[BUSQUEDA].replace(
+            antes, f'<span class="precio"><del>110,00 €</del> {despues}</span>'
+        )
+        antes = f'<span class="precio-ficha">{p.precio}</span>'
+        sitio[p.url] = sitio[p.url].replace(
+            antes, f'<span class="precio-ficha"><del>110,00 €</del> {despues}</span>'
+        )
+    return sitio
+
+
+def test_oferta_con_precio_tachado_valida() -> None:
+    # El listado leía el tachado (110,00 €) y no coincidía con el JSON-LD de la ficha; sin
+    # precio en el listado, sel_campos[precio] leía el tachado y tampoco coincidía.
+    informe = ejecutar(perfil(), NavegadorFalso(_con_precio_tachado()))
+    assert informe.valido, informe.problemas
+    assert informe.fichas_ok == 3
+    assert not any("no coincide" in problema for problema in informe.problemas)
+    informe = ejecutar(perfil(sel_precio_listado=None), NavegadorFalso(_con_precio_tachado()))
+    assert informe.valido, informe.problemas
+    assert not any("sel_campos[precio] lee" in problema for problema in informe.problemas)
 
 
 def test_selector_fuera_del_subconjunto_invalida_sin_descargar_nada() -> None:
@@ -222,12 +249,11 @@ def test_un_campo_que_no_aparece_en_ninguna_ficha_se_avisa() -> None:
     assert any("sel_campos[marca]" in p for p in informe.problemas)
 
 
-@pytest.mark.parametrize(
-    "error", [Bloqueado(BUSQUEDA, "reCAPTCHA"), ProhibidoPorRobots("robots.txt")]
-)
-def test_bloqueo_y_robots_se_propagan(error: Exception) -> None:
-    navegador = NavegadorFalso(paginas_sitio(), errores={BUSQUEDA: error})
-    with pytest.raises(type(error)):
+def test_bloqueo_se_propaga() -> None:
+    navegador = NavegadorFalso(
+        paginas_sitio(), errores={BUSQUEDA: Bloqueado(BUSQUEDA, "reCAPTCHA")}
+    )
+    with pytest.raises(Bloqueado):
         ejecutar(perfil(), navegador)
 
 
@@ -511,21 +537,30 @@ def test_precio_del_listado_que_no_aparece_se_senala_aunque_el_perfil_valga() ->
     )
 
 
-@pytest.mark.parametrize(
-    "hostil",
-    [
-        '<div class="r"><span>t</span><a href="/p">x</a></div>' * 40_000,
-        "<h1>t</h1>" + '<div class="r">' * 20_000 + "<a href='/p'>x</a>",
-    ],
-    ids=["hermanos", "anidamiento"],
-)
-def test_selectores_ausentes_con_html_hostil(hostil: str) -> None:
-    raiz = analizar(hostil)
-    sitio = perfil(sel_resultado="div.r", sel_titulo="h1", sel_enlace="a.no @href")
-    inicio = time.perf_counter()
-    problemas = selectores_ausentes(raiz, sitio)
-    assert time.perf_counter() - inicio < 3
+SITIO_HOSTIL = perfil(sel_resultado="div.r", sel_titulo="h1", sel_enlace="a.no @href")
+
+
+def _sin_enlace(raiz: Nodo) -> None:
+    problemas = selectores_ausentes(raiz, SITIO_HOSTIL)
     assert any(p.startswith("sel_enlace ('a.no @href') no aparece") for p in problemas)
+
+
+def test_selectores_ausentes_con_miles_de_hermanos() -> None:
+    raiz = analizar('<div class="r"><span>t</span><a href="/p">x</a></div>' * 40_000)
+    # Tiempo de CPU, el mejor de hasta 3 intentos (bug 6): unos 0,6 s con la máquina libre.
+    assert segundos_de_cpu(lambda: _sin_enlace(raiz), 3) < 3
+
+
+def test_selectores_ausentes_con_anidamiento_hostil() -> None:
+    # Los primeros resultados anidados contienen a casi todos los demás (`dom` deja de anidar a
+    # los 512 niveles): sin `MAX_RESULTADOS_REVISADOS`, buscar el selector dentro de cada uno
+    # cuesta unas 10 veces más. Se compara con construir el árbol de la misma página y no con un
+    # tope fijo, que fallaba en la suite completa con la CPU más lenta o más cargada (bug 6).
+    # Medido: de 8 a 13 veces el árbol; sin el tope de resultados revisados, más de 90.
+    html = "<h1>t</h1>" + '<div class="r">' * 20_000 + "<a href='/p'>x</a>"
+    raiz = analizar(html)
+    proporcion = proporcion_de_cpu(lambda: _sin_enlace(raiz), lambda: analizar(html), 30)
+    assert proporcion < 30
 
 
 def test_atributo_de_un_resultado_que_no_existe_no_dice_que_hay_elementos() -> None:

@@ -37,7 +37,7 @@ from precia.nucleo.modelos import Ajustes
 from precia.nucleo.orquestador import BLOQUEO, CATALOGO, LISTADO, MAX_PAGINAS_LISTADO
 from precia.perfiles.tipos import TIPO_HTML, TIPO_LISTADO, TIPO_SITEMAP, Perfil
 from precia.web.app import crear_app
-from tests.asgi import ClienteASGI
+from tests.asgi import ClienteASGI, Respuesta
 from tests.navegador.falsos import validar_con_dns_publico
 
 AHORA = datetime(2026, 10, 20, 12, 0, tzinfo=UTC)
@@ -122,7 +122,7 @@ def ficha(base: str, pieza: Pieza, *, jsonld: bool = True) -> str:
     return (
         f"<html><head><title>{escape(pieza.titulo)}</title>{script}</head><body>"
         f'<h1 class="titulo">{escape(pieza.titulo)}</h1>'
-        f'<p class="pvp">{pieza.precio}</p>'
+        f'<p class="pvp">{pieza.precio}</p><p>Marca: Valeo</p>'
         f'<p>Referencia: <span class="ref">{pieza.referencia}</span></p></body></html>'
     )
 
@@ -209,9 +209,23 @@ class Montaje:
         assert respuesta.estado == 303, respuesta.texto
 
     def buscar(self, consulta: str) -> str:
-        respuesta = self.web.get(f"/buscar?{consulta}", cabeceras={"HX-Request": "true"})
-        assert respuesta.estado == 200
-        return respuesta.texto
+        return asyncio.run(self._buscar_hasta_el_final(consulta)).texto
+
+    async def _buscar_hasta_el_final(self, consulta: str) -> Respuesta:
+        """C1: lanza la búsqueda (como el formulario, con htmx) y sondea su estado hasta que
+        termina, todo en un bucle: `asyncio.run` cancelaría la búsqueda al salir."""
+        respuesta = await self.web.aget(f"/buscar?{consulta}", {"HX-Request": "true"})
+        assert respuesta.estado == 200, respuesta.texto
+        id_busqueda = respuesta.cabeceras["hx-push-url"].split("?")[0].rsplit("/", 1)[-1]
+        for _ in range(500):
+            if "every 1s" not in respuesta.texto:
+                return respuesta
+            await asyncio.sleep(0.01)
+            respuesta = await self.web.aget(
+                f"/busquedas/{id_busqueda}/estado", {"HX-Request": "true"}
+            )
+            assert respuesta.estado == 200, respuesta.texto
+        raise AssertionError("La búsqueda no ha terminado")
 
     def perfil(self, dominio: str) -> Perfil:
         vigente = self.fuente.almacen.perfil_vigente(dominio)
@@ -251,6 +265,8 @@ def montar(tmp_path: Path) -> Iterator[Any]:
             crear_descargadores=descargadores,
             validador=validar_con_dns_publico,
             reloj=lambda: AHORA,
+            # La tienda falsa vende faros de Golf: es su consulta de prueba (A1).
+            consultas_configuracion=("faro golf",),
             crear_proveedor=crear_proveedor,
         )
         fuente.guardar_ajustes(replace(fuente.ajustes(), retardo_dominio_s=0.0))
@@ -297,8 +313,9 @@ def test_tienda_sin_buscador_con_sitemap_busca_en_el_catalogo_sin_ia(montar: Any
     m.alta(LIBRERIA)
     html = m.buscar("texto=faro+golf&modo=auto")
 
-    # Sin IA: las fichas traen JSON-LD con el precio, así que no hacen falta selectores.
-    assert m.peticiones_ia == []
+    # La IA no configura nada: las fichas traen JSON-LD con el precio, sin selectores.
+    # Auto revisa además los resultados con la IA (ajuste activado por defecto).
+    assert m.peticiones_ia == ["revision"]
     perfil = m.perfil(LIBRERIA)
     assert (perfil.tipo, perfil.url_busqueda, perfil.revisado) == (TIPO_SITEMAP, INDICE, False)
     info = m.fuente.almacen.catalogo(LIBRERIA)
@@ -359,7 +376,8 @@ def test_tienda_sin_buscador_con_listado_recorre_cinco_paginas(montar: Any) -> N
     html = m.buscar("texto=faro+golf&modo=auto")
     perfil = m.perfil(LISTADO_TIENDA)
     assert (perfil.tipo, perfil.url_busqueda) == (TIPO_LISTADO, ENTRADA_LISTADO)
-    assert m.peticiones_ia == ["configurador", "configurador"]
+    # Auto revisa además los resultados con la IA (ajuste activado por defecto).
+    assert m.peticiones_ia == ["configurador", "configurador", "revision"]
     # Como mucho 5 páginas: la 6 y la 7 no se piden nunca.
     assert MAX_PAGINAS_LISTADO == 5
     for numero in (6, 7):
@@ -395,7 +413,8 @@ def test_tienda_con_plantilla_de_busqueda_del_usuario(montar: Any) -> None:
 
     perfil = m.perfil(PLANTILLA_TIENDA)
     assert (perfil.tipo, perfil.url_busqueda) == (TIPO_HTML, ENTRADA_BUSQUEDA)
-    assert m.peticiones_ia == ["configurador", "configurador"]
+    # Auto revisa además los resultados con la IA (ajuste activado por defecto).
+    assert m.peticiones_ia == ["configurador", "configurador", "revision"]
     # La plantilla del usuario se prueba la primera, antes que los patrones habituales.
     assert transporte.sin_robots()[:2] == [f"{PLANTILLA_BASE}/", busqueda]
     for pieza in FAROS:

@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from precia.ia.ollama import ProveedorOllama
-from precia.ia.salida import SalidaNoValidaConConsumo
+from precia.ia.salida import SalidaCortada, SalidaNoValidaConConsumo
 from precia.ia.tipos import ErrorIA, IANoDisponible, PeticionIA, SalidaNoValida
 from precia.ia.transporte import ErrorTransporte
 from tests.ia.falsos import RelojFalso, TransporteFalso, respuesta_json
@@ -78,8 +78,10 @@ def test_respuesta_correcta_y_gratis() -> None:
 
 
 def test_salida_cortada_por_longitud() -> None:
-    with pytest.raises(SalidaNoValidaConConsumo, match="incompleta"):
+    with pytest.raises(SalidaNoValidaConConsumo, match="incompleta") as error:
         completar(proveedor(TransporteFalso([chat('{"marca": "MA', done_reason="length")])))
+    # R2-TOK: el servicio la repite con más tokens y no igual.
+    assert isinstance(error.value, SalidaCortada)
 
 
 def test_salida_que_no_cumple() -> None:

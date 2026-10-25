@@ -345,3 +345,132 @@ def test_urls_que_no_se_pueden_analizar_se_descartan() -> None:
     )
     assert producto.url == "https://tienda.es/p/1"
     assert producto.imagenes == ("/b.jpg",)
+
+
+REALES = Path(__file__).parent.parent / "fixtures" / "reales"
+TODOSTUSLIBROS = "https://www.todostuslibros.com/libros/la-puerta-de-no-retorno_978-84-8393-395-4"
+
+
+def test_libro_con_el_producto_anidado_que_solo_tiene_id_y_price_con_mayuscula() -> None:
+    # Campaña multi-sector (causa C6): el Book exterior no tiene oferta; la tiene el Product de
+    # `workExample`, que se identifica solo por `@id` y escribe «Price» con mayúscula.
+    html = (REALES / "todostuslibros_ficha_jsonld_book.html").read_text(encoding="utf-8")
+    libro, ejemplar = productos_jsonld(html)
+    assert libro.nombre == "La puerta de no retorno"
+    assert libro.precio is None
+    assert libro.url == TODOSTUSLIBROS
+    assert ejemplar.precio == Precio(Decimal("20"), "EUR", "20")
+    assert ejemplar.disponible is True
+    assert ejemplar.estado == "Nuevo"
+    assert ejemplar.url == TODOSTUSLIBROS
+
+
+def test_audiolibro_con_price_con_mayuscula() -> None:
+    html = (REALES / "casadellibro_audiolibro_jsonld.html").read_text(encoding="utf-8")
+    con_precio = [p for p in productos_jsonld(html) if p.precio is not None]
+    assert [(p.nombre, p.precio, p.url) for p in con_precio] == [
+        (
+            "Clásicos sin filtros",
+            Precio(Decimal("18.04"), "EUR", "18.04"),
+            "https://www.casadellibro.com/audiolibro-clasicos-sin-filtros-audiolibro/9788491999133/18238326",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "tipo",
+    [
+        "Book",
+        "Audiobook",
+        "Movie",
+        "MusicAlbum",
+        "MusicRecording",
+        "VideoGame",
+        "SoftwareApplication",
+        "https://schema.org/Book",
+    ],
+)
+def test_obras_que_se_venden_cuentan_como_producto(tipo: str) -> None:
+    producto = _uno({"@type": tipo, "name": "Obra", "offers": {"price": "9.99"}})
+    assert producto.nombre == "Obra"
+    assert producto.precio == Precio(Decimal("9.99"), "EUR", "9.99")
+
+
+@pytest.mark.parametrize(
+    "tipo", ["Event", "Service", "Organization", "Offer", "WebPage", "ItemList", "OfferCatalog"]
+)
+def test_lo_que_no_es_un_producto_no_cuenta_aunque_tenga_oferta(tipo: str) -> None:
+    dato = {"@type": tipo, "name": "Concierto", "offers": {"@type": "Offer", "price": "30"}}
+    assert productos_jsonld(_bloque(dato)) == []
+
+
+def test_la_grafia_canonica_del_precio_gana_a_la_de_mayusculas() -> None:
+    producto = _uno(
+        {
+            "@type": "Product",
+            "offers": {
+                "Price": "99",
+                "price": "10",
+                "PriceCurrency": "USD",
+                "priceCurrency": "GBP",
+            },
+        }
+    )
+    assert producto.precio == Precio(Decimal("10"), "GBP", "10")
+
+
+def test_claves_de_la_oferta_sin_distinguir_mayusculas() -> None:
+    agregada = _uno({"@type": "Product", "offers": {"LowPrice": "5", "Price": "50"}})
+    assert agregada.precio == Precio(Decimal("5"), "EUR", "5")
+    moneda = _uno({"@type": "Product", "offers": {"PRICE": "7", "PriceCurrency": "usd"}})
+    assert moneda.precio == Precio(Decimal("7"), "USD", "7")
+    especificacion = _uno(
+        {
+            "@type": "Product",
+            "offers": {"PriceSpecification": {"Price": "12", "PriceCurrency": "GBP"}},
+        }
+    )
+    assert especificacion.precio == Precio(Decimal("12"), "GBP", "12")
+
+
+def test_id_como_url_solo_si_falta_url() -> None:
+    assert _uno({"@type": "Product", "@id": "https://t.es/p/1#producto"}).url == (
+        "https://t.es/p/1#producto"
+    )
+    assert _uno({"@type": "Product", "@id": "#producto"}).url == "#producto"
+    con_url = _uno({"@type": "Product", "@id": "https://t.es/x", "url": "https://t.es/p/2"})
+    assert con_url.url == "https://t.es/p/2"
+    oferta = _uno({"@type": "Product", "@id": "_:b0", "offers": {"url": "https://t.es/p/3"}})
+    assert oferta.url == "https://t.es/p/3"
+
+
+# --- Productos de una lista (R2-C10) -------------------------------------------------------------
+
+
+def test_los_productos_de_una_lista_se_marcan() -> None:
+    # R2-C10: las landings de marca o SEO publican un `ItemList` de productos; su producto no es el
+    # de la página. Los que van en `itemListElement` (de un `ItemList` o un `OfferCatalog`), a
+    # cualquier profundidad, se marcan; los sueltos, no.
+    html = (
+        _bloque(
+            {
+                "@type": "ItemList",
+                "itemListElement": [
+                    {"@type": "ListItem", "item": {"@type": "Product", "name": "Uno"}},
+                    {"@type": "Product", "name": "Dos"},
+                ],
+            }
+        )
+        + _bloque({"@type": "Product", "name": "Tres"})
+        + _bloque(
+            {
+                "@type": "WebPage",
+                "mainEntity": {
+                    "@type": "OfferCatalog",
+                    "itemListElement": [{"@type": "Offer", "itemOffered": {"@type": "Product"}}],
+                },
+            }
+        )
+    )
+    assert [p.en_lista for p in productos_jsonld(html)] == [True, True, False, True]
+    assert ProductoJSONLD().en_lista is False

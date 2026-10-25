@@ -175,12 +175,18 @@ def test_los_errores_de_ia_se_propagan() -> None:
     ("clasificacion", "esperado"),
     [
         (Clasificacion(), None),
-        (Clasificacion(ClaseOferta.ACCESORIO, "Es un sensor"), "🤖 Accesorio: Es un sensor"),
-        (Clasificacion(ClaseOferta.VARIANTE, "Eje trasero"), "🤖 Variante: Eje trasero"),
-        (Clasificacion(ClaseOferta.KIT, "Con discos"), "🤖 Kit: Con discos"),
-        (Clasificacion(ClaseOferta.OTRA, "Es un filtro"), "🤖 Otra pieza: Es un filtro"),
-        (Clasificacion(ClaseOferta.KIT, ""), "🤖 Kit"),
-        (Clasificacion(cumple_filtro=False), "🤖 Filtro: «solo usadas»"),
+        (
+            Clasificacion(ClaseOferta.ACCESORIO, "Es un sensor"),
+            "IA · Pieza o accesorio de lo buscado: Es un sensor",
+        ),
+        (
+            Clasificacion(ClaseOferta.VARIANTE, "Eje trasero"),
+            "IA · Variante (otro lado, medida o modelo): Eje trasero",
+        ),
+        (Clasificacion(ClaseOferta.KIT, "Con discos"), "IA · Kit: Con discos"),
+        (Clasificacion(ClaseOferta.OTRA, "Es un filtro"), "IA · Otro producto: Es un filtro"),
+        (Clasificacion(ClaseOferta.KIT, ""), "IA · Kit"),
+        (Clasificacion(cumple_filtro=False), "IA · Filtro: «solo usadas»"),
     ],
 )
 def test_motivo_descarte(clasificacion: Clasificacion, esperado: str | None) -> None:

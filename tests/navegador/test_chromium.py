@@ -30,6 +30,7 @@ from playwright.async_api import Error as ErrorPlaywright
 from precia.navegador import chromium as modulo_chromium
 from precia.navegador.chromium import (
     ARGUMENTOS,
+    ESPERA_RED_S,
     DescargadorChromium,
     FiltroPeticiones,
     metadatos_de_chrome,
@@ -134,6 +135,46 @@ def test_navegacion_de_un_iframe_no_es_la_principal() -> None:
     filtro = filtrar(ruta)
     assert ruta.acciones == ["abort:blockedbyclient"]
     assert filtro.bloqueo_principal is None
+
+
+async def permitir_todo(url: str) -> str:
+    return url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.googletagmanager.com/gtm.js?id=GTM-X",
+        "https://region1.google-analytics.com/g/collect?v=2",
+        "https://stats.g.doubleclick.net/j/collect",
+        "https://connect.facebook.net/es_ES/fbevents.js",
+        "https://www.facebook.com/tr?id=1&ev=PageView",
+        "https://static.hotjar.com/c/hotjar-1.js",
+        "https://www.clarity.ms/tag/abc",
+    ],
+)
+def test_a9_aborta_la_analitica_para_que_la_red_quede_quieta_antes(url: str) -> None:
+    ruta = RutaFalsa(PeticionFalsa(url, resource_type="script"))
+    asyncio.run(FiltroPeticiones(permitir_todo)(ruta))
+    assert ruta.acciones == ["abort:blockedbyclient"]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://tienda.example/js/googletagmanager.js",
+        "https://googletagmanager.com.tienda.example/a.js",
+        "https://cdn.tienda.example/app.js",
+    ],
+)
+def test_a9_la_analitica_se_mira_por_host(url: str) -> None:
+    ruta = RutaFalsa(PeticionFalsa(url, resource_type="script"))
+    asyncio.run(FiltroPeticiones(permitir_todo)(ruta))
+    assert ruta.acciones == ["continue"]
+
+
+def test_a9_espera_de_red_quieta_de_1_s() -> None:
+    assert ESPERA_RED_S == 1.0
 
 
 # --- Huella de Chrome sin «HeadlessChrome» ------------------------------------------------------
@@ -662,7 +703,7 @@ def con_chromium(
     return _ejecutar(ejecutar)
 
 
-def _ejecutar(funcion: Callable[[], Coroutine[Any, Any, Pagina]]) -> Pagina:
+def _ejecutar[T](funcion: Callable[[], Coroutine[Any, Any, T]]) -> T:
     try:
         return asyncio.run(funcion())
     except URLNoPermitida:
@@ -846,11 +887,28 @@ def test_sin_trafico_fuera_del_rele(
 
 @pytest.mark.chromium
 def test_pagina_que_cuelga_el_navegador_respeta_el_timeout(servidor: _Servidor) -> None:
-    puerto = servidor.server_port
-    inicio = time.monotonic()
-    with pytest.raises(ErrorDescarga):
-        con_chromium(puerto, f"http://tienda.example:{puerto}/bucle", timeout=3)
-    assert time.monotonic() - inicio < 10
+    # Lo que protege: que el timeout corta una página colgada (sin él, `content()` no vuelve
+    # nunca). Es una espera de verdad, no CPU: se mide con el reloj, pero solo la descarga
+    # colgada, con Chromium ya arrancado (arrancarlo tarda de 1 a varios segundos según la
+    # carga, y eso hacía fallar el tope fijo de 10 s en la suite completa). Lo esperado es la
+    # espera de red más el timeout, así que el tope es relativo al timeout del test.
+    puerto, timeout = servidor.server_port, 3
+
+    async def ejecutar() -> float:
+        descargador = descargador_local(puerto, timeout=timeout)
+        try:
+            await descargador.descargar(f"http://tienda.example:{puerto}/marco")  # lo arranca
+            inicio = time.monotonic()
+            with pytest.raises(ErrorDescarga):
+                # Si no se respeta el timeout, aquí salta TimeoutError y el test falla.
+                await asyncio.wait_for(
+                    descargador.descargar(f"http://tienda.example:{puerto}/bucle"), timeout * 4
+                )
+            return time.monotonic() - inicio
+        finally:
+            await descargador.cerrar()
+
+    assert _ejecutar(ejecutar) < 2 * timeout
 
 
 # --- Chromium real por el proxy (relé encadenado) -----------------------------------------------

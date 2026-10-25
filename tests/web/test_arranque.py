@@ -15,6 +15,7 @@ from precia.nucleo.fuente_real import FuenteReal
 from precia.web import __main__ as principal
 from precia.web.app import aplicacion_desde_config, crear_app
 from tests.asgi import ClienteASGI
+from tests.web.test_busquedas import FuenteLenta
 
 
 def configuracion(raiz: Path, *, demo: bool) -> Config:
@@ -129,3 +130,21 @@ def test_main_arranca_uvicorn_solo_en_local(
     assert opciones.get("proxy_headers") is False
     assert app.state.fuente.es_demo is es_demo
     asyncio.run(app.state.fuente.cerrar())
+
+
+def test_apagar_cancela_las_busquedas_antes_de_cerrar_la_fuente() -> None:
+    # C1: una búsqueda en segundo plano no puede seguir usando el navegador ya cerrado.
+    fuente = FuenteLenta()
+    app = crear_app(fuente, espera_inicial_s=0)
+    cliente = ClienteASGI(app)
+
+    async def escenario() -> None:
+        respuesta = await cliente.aget("/buscar?texto=freno", {"HX-Request": "true"})
+        assert respuesta.estado == 200 and "every 1s" in respuesta.texto
+        while not fuente.consultas:  # Que la búsqueda haya empezado.
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        await _ciclo_de_vida(app)
+
+    asyncio.run(escenario())
+    assert fuente.orden == ["cancelada", "cerrar"]

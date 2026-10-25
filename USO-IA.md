@@ -9,7 +9,7 @@ El enunciado exige documentar en cada entrega todo uso de IA. Este fichero se ge
 
 ## Entrega en curso (desde 2026-10-19)
 
-**Sesiones cubiertas:** S01 (2026-10-19) y S03 (2026-10-22, sección propia más abajo). S02 (2026-10-21) está en su nota del diario y falta pasarla aquí.
+**Sesiones cubiertas:** S01 (2026-10-19), S02 (2026-10-21) y S03 (del 2026-10-22 al 25), cada una con su sección más abajo.
 
 ### Tareas asistidas por IA
 
@@ -43,9 +43,26 @@ El enunciado exige documentar en cada entrega todo uso de IA. Este fichero se ge
 
 ---
 
-## S03 (2026-10-22): TLS y HTTP/2 en el scraper
+## S02 (2026-10-21): análisis de los bloqueos de Cloudflare
 
-Fuente: `../precia-vault/sesiones/2026-10-22 S03 - TLS y HTTP2 en el scraper.md`. Rama `core/tls-http2` (desde `083851b`), **sin commit**.
+**Qué se pidió (literal):** «usa siempre sub agentes si algun sub agentes es bloqueado revisa por que ha sido bloqueado cambia lo que le pediste para que no lo bloquee y vuelve a lanzarlo», más un texto pegado con el objetivo «solucionar los bloqueos de Cloudflare en PrecIA» (analizar la arquitectura, cabeceras, huella TLS y HTTP/2, JavaScript y sesiones), que pedía, entre otras cosas, «eliminar la identificación incorrecta como Chrome cuando se usa urllib» y «no falsificar huellas TLS».
+
+**Cómo se usó la IA:** un flujo de Claude Code con 6 subagentes de solo lectura: 5 lectores en paralelo (cliente HTTP, Chromium, sesiones y cookies, reglas y ADR, tests y herramientas) y 1 sintetizador que contrastó sus afirmaciones con el código. No se modificó ningún fichero.
+
+| Fecha | Tarea | Herramienta | Qué generó la IA | Decisión |
+|---|---|---|---|---|
+| 2026-10-21 | Diagnóstico del acceso web | Claude Code (flujo `precia-cloudflare-understand`, 6 subagentes) | Informe de diagnóstico con los defectos propios (Chromium sacaba su red por Node con `route.fetch`, sin cookies en HTTP, desafío en `robots.txt` que bloqueaba también a Chromium, `Pagina` sin cabeceras de respuesta, sin `Retry-After`) | Aceptado como base; Julio fijó el alcance a las 19:33 |
+
+**Aceptado, modificado y descartado:**
+- **Refutado por la IA:** la premisa de la petición «urllib se identifica como Chrome» no se cumplía: el User-Agent por defecto era `PrecIA/0.1 (proyecto universitario; uso personal)` y no había «Chrome/» en `src`.
+- **Corregido por el sintetizador:** 3 afirmaciones de los lectores (números de línea inexistentes, cookies de Chromium en las redirecciones y la premisa del User-Agent).
+- **Conflicto señalado y no resuelto en S02:** ADR-021 permite falsear la huella y la petición del día lo prohibía. Se resolvió en S03 con ADR-022 y ADR-023, elegidas por Julio.
+
+**Validación:** solo lectura. Estado de la suite según el lector de tests: 3120 en verde y 2 en rojo (tope de 1 s en `tests/extraccion/test_embebidos.py`, con la máquina cargada).
+
+## S03 (2026-10-22 a 2026-10-24): TLS y HTTP/2, eficiencia y campaña multi-sector
+
+Fuente: `../precia-vault/sesiones/2026-10-22 S03 - TLS y HTTP2 en el scraper.md`. Rama `core/tls-http2` (desde `083851b`), con el commit `41bea7a` que Julio autorizó; la tanda de eficiencia y la campaña multi-sector van en `core/eficiencia`, **sin commit**.
 
 ### Qué se pidió
 
@@ -100,3 +117,155 @@ También están en la tabla «Errores de la IA detectados» de `BITACORA.md`.
 - Puertas finales: `ruff check .`, `ruff format --check .` y `mypy` (180 ficheros) en verde. `pytest` con los tests de Chromium real: 3305 en verde de 3307. Fallan los 2 intermitentes conocidos de cronómetro de `test_embebidos`, en un fichero que la rama no toca. `test_curl*.py` + `test_rele.py`, 5 veces seguidas: 133 en verde las 5.
 - Medición real, sin proxy: con curl, Oscaro, Ecooparts y Ovoko pasan del desafío de Cloudflare a la portada. eBay solo pasa con el rescate de Chromium. La búsqueda de B-Parts sigue bloqueada por AWS WAF con las tres vías.
 - **Todo el código de la sesión queda pendiente de revisión de Julio.**
+
+### S03, segunda parte: tanda de eficiencia y facilidad de uso (2026-10-22, rama `core/eficiencia`, sin commit)
+
+**Qué se pidió:** «necesito que sea un scraper bien eficiente y facil de usar».
+
+**Cómo se usó la IA:**
+- **Diagnóstico con 4 auditores** (subagentes de solo lectura) y una síntesis que propuso mejoras con su coste y su efecto medidos sin cambiar nada.
+- **Decisiones de Julio**, a cuatro preguntas con alternativas: «Paquete recomendado (Recommended)» (B4 precio tachado, B5 OEM equivalentes, A2 filtrar antes de abrir fichas, A3 caché y corte del extractor de IA, A1 recordar configuraciones fallidas, C1 búsqueda en segundo plano; C2 fuera), «Commit S03 y rama nueva (Recommended)» (commit `41bea7a` en `core/tls-http2` y rama `core/eficiencia`), «Sí, etiquetadas aparte (Recommended)» (equivalentes y revisiones distintas de «exacta», alertas solo de exactas) y «Usa esos valores (Recommended)» (esperas de 1 h y 1 día, consulta genérica filtro/faro/freno, corte del extractor en la 1.ª ficha, caché con el TTL de las páginas).
+- **6 planificadores**, uno por mejora, con el plan paso a paso y los tests; después, **implementación con TDD en serie** (B4 → B5 → A2 → A3 → A1 → C1): test en rojo, código, puertas completas y documentación de cada mejora antes de la siguiente.
+- **Revisión con 4 lentes** (seguridad y rendimiento, corrección, tests y reglas del proyecto) y **verificación adversarial**: cada hallazgo lo comprobaron 2 verificadores antes de darlo por bueno. 29 hallazgos, 21 confirmados y 20 corregidos con TDD; el otro (sin conexión, todas las tiendas en espera) lo decide Julio.
+
+| Fecha | Tarea | Herramienta | Qué generó la IA | Decisión |
+|---|---|---|---|---|
+| 2026-10-22 | Diagnóstico de eficiencia y facilidad de uso | Claude Code (Workflow: 4 auditores + síntesis) | Mediciones sin red, propuestas con coste y preguntas con alternativas | Julio eligió las opciones recomendadas |
+| 2026-10-22 | Commit de S03 y rama `core/eficiencia` | Claude Code | Revisión de secretos, normalización a CRLF, commit `41bea7a` con `Co-Authored-By` | Commit autorizado por Julio |
+| 2026-10-22 | B4, B5, A2, A3, A1 y C1 | Claude Code (6 planificadores + implementadores con TDD, en serie) | Precio vigente y no el tachado, emparejado por OEM con revisiones y equivalentes (migración 5), filtro por la consulta antes de abrir fichas, caché del extractor de IA (migración 6), configuraciones fallidas con espera y consulta genérica (migraciones 7 y 8), búsqueda en segundo plano con progreso, plazo y Cancelar; de 3307 a 3593 tests | Pendiente de revisión |
+| 2026-10-22/23 | Revisión adversarial de la tanda | Claude Code (Workflow: 4 lentes + 2 verificadores por hallazgo) | 20 correcciones con TDD (3633 tests) | Pendiente de revisión |
+
+### S03, tercera parte: campaña de pruebas reales multi-sector (2026-10-23/24, rama `core/eficiencia`, sin commit)
+
+**Qué se pidió (literal):** «continua con el scraper tambien lanza pruebas co varias web no solo recambios ropa zapatillas cosas asi y busca que va fallando y ve corrigiendolo recuerda hacer todo con subagetes y si fallan revisa por que han fallado edita el promt y vuelve a lanzarlos».
+
+**Cómo se usó la IA:**
+- **Rondas reales** (3): un subagente comprobó las portadas, escribió el arnés fuera del repo (las mismas clases que la web, modo Auto, copia de la BD, sin proxy ni Google) y en cada ronda lanzó 12 tiendas nuevas más los reintentos, y clasificó cada tienda contra el HTML guardado.
+- **Diagnóstico** por subagentes que reprodujeron cada causa sin red con el código de la app, y **verificación adversarial de las causas**: dos verificadores votaron cada propuesta de arreglo (qué parte hacer y qué parte no) antes de tocar el código.
+- **Arreglos con TDD**, un subagente por causa: recorte byte a byte de la página real como fixture, test en rojo por el motivo esperado, arreglo genérico sin código por dominio, barrido del corpus guardado (hasta 431 páginas) para ver que no cambiaba nada más, puertas completas y documentación.
+- **Relanzamientos:** cuando el arnés no probaba de verdad un arreglo (perfil viejo) se añadió `--reconfigurar` y se repitieron las tiendas.
+
+| Fecha | Tarea | Herramienta | Qué generó la IA | Decisión |
+|---|---|---|---|---|
+| 2026-10-23 | Diseño de la campaña y arnés | Claude Code (subagente) | Lista de 36 tiendas en 3 oleadas, arnés y comprobación de portadas, todo fuera del repo | Aceptado por Claude; pendiente de revisión |
+| 2026-10-23/24 | Rondas 1, 2 y 3 | Claude Code (subagentes de prueba y clasificación) | 52 visitas a 36 tiendas, tablas tienda a tienda, 124 llamadas de la IA de la app por 0,1465 USD | Resultados registrados (📏 en `BITACORA.md`) |
+| 2026-10-23/24 | Diagnóstico y verificación de causas | Claude Code (diagnosticadores + 2 verificadores adversariales) | 34 causas con su evidencia y el arreglo votado | 29 arregladas; 5 fuera de alcance o sin decidir |
+| 2026-10-23/24 | Arreglos con TDD | Claude Code (un subagente por causa) | 29 arreglos genéricos, 39 recortes de páginas reales como fixtures, migración 9; de 3633 a 4132 tests | Pendiente de revisión, igual que los recortes |
+| 2026-10-24 | Cierre documental | Claude Code (subagente) | Bitácora, notas 03, 04, 05, 12, 14, 15 y 16, este apartado, resumen de la sesión | Pendiente de revisión |
+
+**Aceptado, modificado y descartado:**
+- **Descartado por los verificadores** antes de escribir código: rehacer el buscador «como un usuario» con Chromium (cambia el protocolo `Navegador`), la prueba de sensibilidad con una segunda descarga (rechazaría búsquedas buenas sin resultados), abrir una URL de cada sitemap, el «precio más repetido» para elegir variante, ampliar el lenguaje de selectores (ADR-015) y el sku como referencia OEM.
+- **No hecho porque lo decide Julio:** la consulta de prueba y los prompts sin sesgo de recambios (C4), el respaldo por texto de Thomann en modo Auto, un `OrigenDato.LISTADO` para los precios del listado, el proxy para los bloqueos reales.
+
+**Errores de la IA detectados** (también en «Errores de la IA detectados» de `BITACORA.md`, 41 filas del 23 y el 24):
+- **Código de sesiones anteriores** que la campaña destapó: `parece_listado` aceptaba la portada; el catálogo por sitemap tiraba los neutros, se quedaba con el primero, ordenaba por URL y leía solo 10 hijos; el resumen para la IA no cumplía lo que prometía su docstring; `_principal` tomaba otra variante o el primer producto de un `ItemList`; `NOMBRES_BUSQUEDA` no se sincronizó con `PARAMETROS_ENLACE`; topes de tokens puestos a ojo; `dom.invisible` sin el *streaming* de React; `vendor` como marca; el validador que solo contaba que hubiera algo; la regla del bloque JSON-LD que se cumplía siempre; `Nodo.texto` sin los céntimos aparte; el robots.txt con desafío que cortaba antes del rescate; y el propio filtro A2 de esta sesión.
+- **Errores de los subagentes al arreglar:** «product» dentro de «reproductores», 50 000 hijos en la cola, finales de línea mal leídos con `file | sed`, tests demasiado estrictos o con la confianza equivocada, un recorte que pegaba el `<h1>` al precio, una regex 7 veces más lenta, un `extraer_ficha` sin `await` en un barrido, nombres de variable reutilizados (lo cazó `mypy`) y `referencias_en` que toma «038253014G» por gramos.
+- **Errores del arnés de la campaña:** gastaba el tope de páginas guardadas en robots.txt y portada, y reintentaba con el perfil viejo; y un recuento de llamadas escrito sin sumar.
+- En la tanda de eficiencia, la revisión adversarial encontró 21 defectos confirmados en el código recién generado (DoS de CPU en `texto_de_precio`, fallos de plazo sin recordar, llamadas de IA sin registrar al apagar, comparación de fechas como texto…) y el mojibake de dos filas de la bitácora.
+
+**Validación:**
+- TDD en cada arreglo: rojo por el motivo esperado antes del código y verde después; cada recorte de página real reproduce el fallo por sí solo.
+- Puertas al terminar (2026-10-24 01:35): `ruff check .` y `ruff format --check .` (201 ficheros) en verde, `mypy` sin errores (197 ficheros), `pytest` completo 4131 en verde y 1 en rojo: el test de cronómetro de `test_embebidos` (bug 6), que pasa lanzado solo.
+- Prueba con las tiendas reales: los arreglos de las rondas 1 y 2 se comprobaron en la ronda siguiente; los de la ronda 3 solo sin red.
+- **Todo el código, los recortes de páginas reales y la documentación de la tanda y de la campaña quedan pendientes de revisión de Julio.**
+
+### S03, cuarta parte: rondas 4 y 5 de la campaña multi-sector (2026-10-24, rama `core/eficiencia`, sin commit)
+
+**Qué se pidió (literal):** la misma petición de la campaña («continua con el scraper tambien lanza pruebas co varias web no solo recambios [...] busca que va fallando y ve corrigiendolo») y, al reanudar tras el corte del flujo, «continua mejorandolo» y «continua».
+
+**Cómo se usó la IA:**
+- **Mismo método que en las rondas 1-3:** un subagente lanzó cada ronda con el arnés fuera del repo y clasificó tienda a tienda contra el HTML guardado; diagnosticadores reprodujeron cada causa sin red; 2 verificadores adversariales votaron cada propuesta; un subagente por causa la arregló con TDD y un recorte byte a byte de la página real.
+- **Relanzamiento tras un corte:** el flujo se paró a las 02:15 (terminó el proceso de Claude Code, no la tarea) con las búsquedas de la ronda 4 hechas y sin clasificar. Se reescribió el prompt para que reutilizara esas búsquedas sin repetir ninguna petición y se relanzó.
+- **Cierre de discrepancias** de la verificación independiente: el test intermitente del bug 6 y el origen de las fichas de Oscaro.
+
+| Fecha | Tarea | Herramienta | Qué generó la IA | Decisión |
+|---|---|---|---|---|
+| 2026-10-24 | Ronda 4: 9 reintentos y oleada 4 (8 sectores nuevos) | Claude Code (subagentes de prueba y clasificación) | 19 visitas, tabla tienda a tienda, 45 llamadas de la IA de la app por 0,0401 USD | Resultados registrados (📏 en `BITACORA.md`) |
+| 2026-10-24 | Diagnóstico y arreglos de la ronda 4 | Claude Code (diagnosticadores, 2 verificadores por causa, un implementador por causa con TDD) | 9 causas; 8 arreglos genéricos (R4-A, B, C, D, E, G, H, I) con 14 recortes de páginas reales | Pendiente de revisión |
+| 2026-10-24 | Ronda 5: 8 reintentos con `--reconfigurar` | Claude Code (subagente) | Tabla tienda a tienda, 26 llamadas por 0,0175 USD | Resultados registrados |
+| 2026-10-24 | Diagnóstico y arreglos de la ronda 5 | Claude Code (mismo método) | 9 causas nuevas más R4-F; 9 arreglos (R5-A, B, C, D, E, F, H, I, J) con 9 recortes nuevos y la migración 10 (`catalogos.idioma`) | Pendiente de revisión |
+| 2026-10-24 | Bug 6 y README de las fichas de Oscaro | Claude Code (subagente cerrar-discrepancias) | Test de escala entre tamaños en `test_embebidos.py`; `tests/fixtures/extraccion/README.md` | Pendiente de revisión |
+| 2026-10-24 | Cierre documental de las rondas 4-5 | Claude Code (subagente) | Bitácora, notas 04, 05, 12, 14 y 15, este apartado, resumen de la sesión | Pendiente de revisión |
+
+**Resultado:** acumulado de las cinco rondas, 45 tiendas de 20 sectores, 79 visitas, 52 causas y 46 arregladas con TDD, 195 llamadas de la IA de la app por 0,2041 USD; en su última visita, 28 ok, 6 parciales, 4 fallos, 6 bloqueadas y 1 fuera de alcance. Los 9 arreglos de la ronda 5 solo están comprobados sin red.
+
+**Aceptado, modificado y descartado:**
+- **Modificado por los verificadores** antes de escribir código: `NIVELES_CONTENEDOR` a 5 y no a 6 como proponía el diagnóstico (a 6, el enlace de marca de una ficha de Coolmod se llevaba el precio); rutas de búsqueda por «empieza por» y no también por «termina por» (habría colado `/opensearch.xml`); en R5-I, grupos por turnos y no rellenar primero con el grupo mayor (no arreglaba Decántalo); en R5-D, sin cortar variantes por cuerpo igual (el hash cambiaba en cada variante).
+- **No hecho porque lo decide Julio:** la consulta de prueba sin sesgo de recambios (C4); seguir por sitemap tras un bloqueo con Chromium (Back Market); un tope menor para la búsqueda tras configurar; la Public Suffix List para subdominios (dependencia fuera de la nota 06).
+- **Sin arreglar:** R5-G (Carrefour solo lee el primer sitemap declarado, bug 28).
+
+**Errores de la IA detectados** (también en «Errores de la IA detectados» de `BITACORA.md`):
+- **Elegir mal la muestra:** el subagente de la campaña eligió Bebitus mirando solo que la portada respondía 200; ya no es una tienda.
+- **Arreglos que se quedaron cortos o rompieron otra cosa:** R3-C destapó una regresión (un 403 seco en `/sitemap.xml` bloqueaba la tienda, R4-D); R4-B y R4-C pasaban sus tests pero no llegaban al flujo real (el validador y el almacén rechazaban el subdominio; el configurador pasaba solo el origen), y salieron en la ronda 5 como R5-B y R5-C; el arreglo de R3-C había aceptado gastar la llamada de IA del sitemap en fichas sin precio y lo fijó en un test (R5-F).
+- **Código de sesiones anteriores** que destaparon estas rondas: `_palabras_slug` con el «/p» final, el filtro de mismo host en `candidatos`, `NIVELES_CONTENEDOR` = 4, `elegir_fichas` sin desempate, la ruta de búsqueda por subcadena, `buscar_catalogo` con el máximo de palabras sin peso y por subcadena, `desde_perfil` con la primera coincidencia y el modo sitemap con `necesita_js=False` fijo.
+- **Errores de los subagentes al arreglar:** un `registro` sin definir en `catalogo.py` (lo cazaron los tests), la URL del índice de Kenay sin `www.` en un README, el diagnóstico de R4-G que proponía 6 niveles, un `sed -i` sobre `tests/perfiles/sitio.py` y, en el bug 6, dar por buena la primera versión con el test solo y suponer carga externa cuando era la frecuencia de la CPU.
+- **Protocolo del diario:** un subagente volvió a meter un CRLF real en una entrada (corregido al releerla) y otro casi lo repite (lo paró la aserción de su script); en este cierre, una hora escrita antes de consultar el reloj (18:01 en vez de 18:00), corregida al momento.
+
+**Validación:**
+- TDD en cada arreglo: rojo por el motivo esperado antes del código (o guarda que ya pasaba, dicha como tal) y verde después; los arreglos de la ronda 4 se comprobaron en real en la ronda 5.
+- Bug 6: el test nuevo falla con dos implementaciones malas simuladas fuera del repo; la suite pasó 5 veces seguidas.
+- Puertas al cerrar (2026-10-24 17:59): `ruff check .` y `ruff format --check .` (211 ficheros) en verde, `mypy` sin errores (206 ficheros), `pytest` completo **4332 en verde y 0 en rojo** (167,8 s).
+- **Todo el código, los 23 recortes nuevos y la documentación de las rondas 4-5 quedan pendientes de revisión de Julio.**
+
+### S03: revisión con IA de los resultados (2026-10-24, rama `core/eficiencia`, sin commit)
+
+**Qué se pidió (literal):** «ademas me gustaria que la ia revise los resultados por ejemplo he buscado puerta delantera derecha y me ha salido la cerradura de la puerta delantera derecha».
+
+**Cómo se usó la IA:** un flujo de Claude Code leyó el código sin editarlo y escribió la causa y el diseño (regla sin IA del núcleo nominal + revisión con IA en una llamada, caché, salvaguardas, coste estimado). Después un subagente lo implementó con TDD en paralelo a otros dos flujos (amazon.es y desafíos JS), sin tocar sus ficheros.
+
+| Fecha | Tarea | Herramienta | Qué generó la IA | Decisión |
+|---|---|---|---|---|
+| 2026-10-24 | Causa y diseño de la revisión de resultados | Claude Code (flujo de diseño) | Diagnóstico (Auto no miraba el significado; A2 solo contaba palabras), diseño, riesgos y coste | Implementado; ADR-024 propuesto, pendiente de Julio |
+| 2026-10-24 | Implementación con TDD | Claude Code (subagente) | `emparejado/nucleo_nominal.py`, `revisar` con caché en `semantico.py`, agrupador, migración 12, reserva de llamada, orquestador, web; 9 ficheros de tests nuevos | Pendiente de revisión |
+
+**Aceptado, modificado y descartado:**
+- **Modificado durante la implementación:** la regla del núcleo solo descarta si alguna oferta es de verdad lo buscado (lo destapó un test existente con «freno golf»); en modo IA la revisión conserva el componente `emparejado` y en Auto usa `revision`; el constructor del orquestador deja la revisión apagada por defecto y la búsqueda real la activa desde el ajuste.
+- **No hecho (opcional, lo decide Julio):** R3-D también en Auto; columna `imagen` en `productos`.
+
+**Errores de la IA detectados:** la regla descartaba «pastillas de freno» al buscar «freno golf»; una hora del diario escrita sin mirar el reloj (corregida); un `sed` que convirtió `\u2013` en «2013» en un test (corregido).
+
+**Validación:** TDD (rojo por el motivo esperado y verde después). Puertas al cerrar (2026-10-24 21:31): `ruff check .` y `ruff format --check .` (232 ficheros) en verde, `mypy` sin errores (227 ficheros), `pytest` completo **4575 en verde**. Coste de la revisión estimado (≈ 0,001 $ por búsqueda con 60 ofertas), sin medir todavía con el banco. **Todo el código queda pendiente de revisión de Julio.**
+
+### S03: rediseño de la interfaz sin emojis (2026-10-25, rama `core/eficiencia`, sin commit)
+
+**Qué se pidió (literal):** «necesito que este acabado hoy mejora la interfaz /find-skills  busca una skill para hacer una interfaz bomnita y que no parezca ia quita lo emojies y termina el trabajo tienes 1h».
+
+**Cómo se usó la IA:** Claude Code usó la skill find-skills para buscar en skills.sh e instaló `anthropics/skills@frontend-design`, una guía de diseño para el asistente (no es una dependencia de PrecIA). Un flujo con subagentes repartió el trabajo: uno diseñó y reescribió el CSS y las plantillas siguiendo la skill, otro quitó a la vez los emojis de los textos de los `.py`, un tercero revisó el resultado con capturas de Playwright y el último pasó las puertas y documentó.
+
+| Fecha | Tarea | Herramienta | Qué generó la IA | Decisión |
+|---|---|---|---|---|
+| 2026-10-25 | Búsqueda e instalación de la skill | Claude Code (find-skills) | Elección de `frontend-design` (fuente oficial) | Instalada en el entorno del asistente |
+| 2026-10-25 | Plan y rediseño | Claude Code (subagente con frontend-design) | Plan de tokens; `estilos.css` reescrito, `icono.svg` y diez plantillas | Pendiente de revisión |
+| 2026-10-25 | Quitar emojis del código Python | Claude Code (subagente) | Textos con prefijo `IA · ` en 8 módulos de `src/` y 24 ficheros de tests | Pendiente de revisión |
+| 2026-10-25 | Crítica visual | Claude Code (subagente, Playwright) | 9 páginas en 1366/390 px, claro y oscuro; 5 correcciones de CSS | Pendiente de revisión |
+| 2026-10-25 | Puertas y documentación | Claude Code (subagente) | Verificación y textos del diario, la bitácora, la nota 12 y este documento | Pendiente de revisión |
+
+**Aceptado, modificado y descartado:**
+- **Modificado:** la primera idea de barra lateral blanca con el activo en azul claro se cambió por grafito con marca amarilla, porque la propia revisión contra la skill la vio genérica. Dos textos que comprueban los tests («incluye equivalentes y revisiones», «Falló · En espera hasta el») volvieron a su redacción original en vez de cambiar los tests.
+- **No hecho:** puntos medios y una flecha en textos que genera el núcleo (`nucleo/fuente_demo.py`: «JSON fuera del esquema → reintento»; «Usado · 60 % de vida»), porque tocan `.py` del núcleo y tests.
+
+**Errores de la IA detectados:** el primer pase del rediseño cambió dos textos comprobados por tests; el script de los emojis no cambió un texto sin emoji que un test esperaba con la palabra nueva («extractor de respaldo en 1»); la crítica visual encontró cinco fallos de maquetación que los tests no veían (detalle en la bitácora).
+
+**Validación:** puertas al cerrar (2026-10-25): `ruff check .` y `ruff format --check .` (243 ficheros) en verde, `mypy` sin errores (238 ficheros), `pytest` completo **4744 en verde y 4 saltados** (openssl no instalado); 0 emojis en `src/`; sin desbordamiento horizontal en las capturas. **Todo el código queda pendiente de revisión de Julio.**
+
+### S03: foto principal, amazon.es y velocidad (2026-10-24, rama `core/eficiencia`, sin commit)
+
+**Qué se pidió (literal):** «y poder ver la foto principal de el articulo»; «amazon no funciona»; «se puede hacer que todo esto funcione mas rapido».
+
+**Cómo se usó la IA:** subagentes de Claude Code con TDD para cada arreglo, analistas de solo lectura para medir dónde se iba el tiempo, rondas reales con el arnés de la campaña (rondas 6 a 11) y dos revisiones escépticas con subagentes distintos de los que implementaron. Las decisiones de velocidad las tomó Julio (BITACORA 2026-10-24 21:04).
+
+| Fecha | Tarea | Herramienta | Qué generó la IA | Decisión |
+|---|---|---|---|---|
+| 2026-10-24 | Foto principal del artículo | Claude Code (subagente, TDD) | `extraccion/imagenes.py`, migración 11, macro de la foto y CSP `img-src 'self' https:`; la foto nunca sale de la IA | Pendiente de revisión |
+| 2026-10-24 | amazon.es | Claude Code (subagentes, TDD) y rondas reales 6, 9 y 10 | Buscador reconocido por su rol, caché sin páginas a medias, resumen de ficha para la IA, precio partido en elementos hermanos (R9-P) | Pendiente de revisión |
+| 2026-10-24 | Medida de la velocidad | Claude Code (4 analistas de solo lectura) | Reparto del tiempo: cortesía 67 %, red 34 %, IA y CPU 1-3 % | Julio decide cortesía de 1,0 s, varias búsquedas a la vez y plantillas de la IA en paralelo |
+| 2026-10-24 | Tres tandas de velocidad | Claude Code (subagentes, TDD) | Timeouts más cortos, resultados parciales por ficha, red e IA en paralelo, 3 búsquedas a la vez | Pendiente de revisión |
+| 2026-10-24 | Revisiones escépticas | Claude Code (2 subagentes por revisión) | Foto y revisión con IA: 12 señalados, 10 reales; velocidad: 8 señalados, 7 ciertos | Corregidos con TDD; pendiente de revisión |
+
+**Aceptado, modificado y descartado:**
+- **Rechazado por Julio:** precios provisionales, número de fichas ajustable, modo rápido, cortar tiendas lentas, leer menos sitemaps y validar con su consulta.
+- **Descartado:** resolver el CAPTCHA de b-parts.com; ni el proxy residencial ni Chrome con ventana lo evitaron (5 de 5 cargas con el CAPTCHA de AWS WAF).
+
+**Errores de la IA detectados:** tests mal montados y un escape perdido en un heredoc al implementar la foto; con 3 búsquedas a la vez se podía romper la cortesía (robots.txt fuera del turno, filas distintas para `www.` y sin `www.`); un `sed -i` y tres tests mal montados en la tanda 3; el primer arreglo del precio partido aceptaba otro importe. Todos están en la tabla «Errores de la IA detectados» de `BITACORA.md`.
+
+**Validación:** medida real antes y después (BITACORA 2026-10-24 23:44): dos búsquedas sobre 4 tiendas pasan de 23,3 s una tras otra a 11,2 s a la vez, sin solapes de peticiones al mismo host y sin ningún 429 ni 403; amazon.es se configura sola en la ronda 10 con 5 ofertas y el precio vigente anclado, por 0,014 USD.

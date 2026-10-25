@@ -1,4 +1,4 @@
-"""🤖 Configurador: descubre la búsqueda, pide los selectores a la IA y valida antes de devolver."""
+"""Configurador IA: descubre la búsqueda, pide los selectores a la IA y valida antes de devolver."""
 
 import asyncio
 from collections.abc import Mapping
@@ -170,7 +170,7 @@ def test_configura_con_el_formulario_de_la_portada() -> None:
         creado=AHORA,
         nota=perfil.nota,
     )
-    assert AUTOR == "🤖 configurador"
+    assert AUTOR == "configurador IA"
     assert perfil.nota.startswith("Válido: 4 resultados, 3/3 fichas con precio anclado.")
     assert len(peticiones) == 2
     # Ni los formularios trampa ni los patrones: la búsqueda del formulario funcionó.
@@ -224,8 +224,10 @@ def test_necesita_js_si_solo_chromium_trae_resultados() -> None:
     assert perfil.necesita_js
     assert (BUSQUEDA, False) in navegador.pedidas
     assert (BUSQUEDA, True) in navegador.pedidas
-    # La validación ya usa Chromium para la búsqueda y las fichas.
-    assert navegador.pedidas[-1] == (PRODUCTOS[2].url, True)
+    # La validación ya usa Chromium para la búsqueda. Las fichas se abrieron con Chromium al
+    # adelantarlas (A6) y la validación no las pide otra vez.
+    assert navegador.pedidas[-1] == (BUSQUEDA, True)
+    assert all(navegador.pedidas.count((p.url, True)) == 1 for p in PRODUCTOS[:3])
 
 
 def test_sin_chromium_una_tienda_con_js_no_se_configura() -> None:

@@ -40,7 +40,7 @@ from typing import Any, Protocol, runtime_checkable
 from urllib.parse import urljoin, urlsplit
 
 from precia.navegador.proxy import Proxy
-from precia.navegador.tipos import ErrorDescarga, Pagina, URLNoPermitida
+from precia.navegador.tipos import DemasiadoGrande, ErrorDescarga, Pagina, URLNoPermitida
 from precia.navegador.url import IP, Validador, ip_publica, validar_url
 
 MAXIMO_BYTES = 5 * 1024 * 1024
@@ -51,6 +51,14 @@ MAX_MIEMBROS_GZIP = 64
 descompresor nuevo y miles de miembros vacíos serían trabajo sin salida."""
 MAX_CAPAS_GZIP = 2
 """Un `.xml.gz` servido además con `Content-Encoding: gzip` llega comprimido dos veces."""
+TIMEOUT_HTTP_S = 10.0
+"""Tiempo total de una página (A7): la p99 medida es 5,1 s y solo 2 de 842 peticiones pasaban de
+10 s. Una tienda lenta frenaba la búsqueda entera, que espera a la última.
+
+Es total desde que empieza la descarga, redirecciones incluidas: cada salto solo tiene lo que
+queda. Con curl lo corta el transporte. Con urllib, las cabeceras las corta un temporizador y el
+cuerpo se mira entre lecturas, así que la última lectura puede pasarse lo que dura una lectura
+(como mucho `TIMEOUT_HTTP_S`): el margen tras cancelar (C1) lo cuenta."""
 FACTOR_TIEMPO_GRANDE = 3
 """`descargar_grande` lee hasta 4 veces más bytes: tiene el triple de tiempo total."""
 MAGIA_GZIP = b"\x1f\x8b"
@@ -140,7 +148,7 @@ class DescargadorHTTP:
         self,
         user_agent: str,
         *,
-        timeout: float = 20.0,
+        timeout: float = TIMEOUT_HTTP_S,
         max_bytes: int = MAXIMO_BYTES,
         validador: Validador = validar_url,
         transporte: Transporte | None = None,
@@ -174,11 +182,24 @@ class DescargadorHTTP:
         """
         return await self._descargar(url, max_bytes, self._timeout * FACTOR_TIEMPO_GRANDE)
 
+    async def descargar_con_tiempo(self, url: str, tiempo_s: float) -> Pagina:
+        """Como `descargar`, con otro tiempo total (el robots.txt, A7). Se corta en su hilo (ver
+        `TIMEOUT_HTTP_S`): tras el corte no queda ninguna petición en vuelo a la tienda
+        (ADR-017)."""
+        return await self._descargar(url, self._max_bytes, tiempo_s)
+
     async def _descargar(self, url: str, max_bytes: int, tiempo: float) -> Pagina:
         pedida = await self._validador(url)
         actual = pedida
+        limite: float | None = None
         for salto in range(MAXIMO_REDIRECCIONES + 1):
-            resultado = await asyncio.to_thread(self._pedir, actual, max_bytes, tiempo)
+            if limite is None:
+                restante, limite = tiempo, self._reloj() + tiempo
+            else:
+                restante = limite - self._reloj()
+                if restante <= 0:
+                    raise ErrorDescarga("Se agotó el tiempo de descarga.")
+            resultado = await asyncio.to_thread(self._pedir, actual, max_bytes, restante, limite)
             if resultado.destino is None:
                 return Pagina(
                     url=pedida,
@@ -201,24 +222,26 @@ class DescargadorHTTP:
         if isinstance(self._transporte, TransporteNavegador):
             await asyncio.to_thread(self._transporte.cerrar)
 
-    def _pedir(self, url: str, max_bytes: int, tiempo: float) -> "_Resultado":
+    def _pedir(self, url: str, max_bytes: int, tiempo: float, limite: float) -> "_Resultado":
+        """Un salto con `tiempo` segundos, lo que queda hasta `limite` (en el reloj `_reloj`)."""
         try:
             if isinstance(self._transporte, TransporteNavegador):
                 crudo = self._transporte.pedir(url, self._cabeceras, tiempo, max_bytes)
             else:
-                # urllib: el tiempo de cada lectura de siempre (el total lo vigila `_leer`).
-                crudo = self._transporte(url, self._cabeceras, self._timeout)
+                # urllib: el tiempo de cada lectura de siempre, o lo que queda si es menor; el
+                # total del cuerpo lo vigila `_leer`.
+                crudo = self._transporte(url, self._cabeceras, min(self._timeout, tiempo))
         except (OSError, http.client.HTTPException) as error:
             raise ErrorDescarga("No se pudo conectar con la tienda.") from error
         try:
-            return self._procesar(crudo, url, max_bytes, tiempo)
+            return self._procesar(crudo, url, max_bytes, limite)
         except (OSError, http.client.HTTPException) as error:
             raise ErrorDescarga("La conexión con la tienda se cortó.") from error
         finally:
             crudo.cuerpo.close()
 
     def _procesar(
-        self, crudo: RespuestaCruda, url: str, max_bytes: int, tiempo: float
+        self, crudo: RespuestaCruda, url: str, max_bytes: int, limite: float
     ) -> "_Resultado":
         cabeceras = {k.lower(): v for k, v in crudo.cabeceras.items()}
         destino = cabeceras.get("location", "").strip()
@@ -244,8 +267,8 @@ class DescargadorHTTP:
             raise ErrorDescarga("La tienda envió el contenido comprimido sin pedirlo.")
         longitud = cabeceras.get("content-length", "").strip()
         if longitud.isdigit() and int(longitud) > max_bytes:
-            raise ErrorDescarga("La página es demasiado grande.")
-        datos = self._leer(crudo.cuerpo, max_bytes, tiempo)
+            raise DemasiadoGrande("La página es demasiado grande.")
+        datos = self._leer(crudo.cuerpo, max_bytes, limite)
         con_firma = datos.startswith(MAGIA_GZIP)
         if crudo.descomprimida:
             # Sin `Content-Encoding` ya: solo queda gzip si el fichero mismo lo es (un `.xml.gz`
@@ -265,10 +288,10 @@ class DescargadorHTTP:
                 mime = "application/xml"  # lo de dentro de un sitemap `.xml.gz`
         return _Resultado(crudo.estado, html=decodificar(datos, charset, mime=mime), tipo=mime)
 
-    def _leer(self, cuerpo: Lector, max_bytes: int, tiempo: float) -> bytes:
+    def _leer(self, cuerpo: Lector, max_bytes: int, limite: float) -> bytes:
         # El timeout del socket solo limita cada lectura: una web que suelta un byte cada pocos
-        # segundos lo esquivaría. Por eso también hay un límite de tiempo total.
-        limite = self._reloj() + tiempo
+        # segundos lo esquivaría. Por eso también hay un límite de tiempo total, el de toda la
+        # descarga (cuenta lo que tardaron las cabeceras y las redirecciones).
         trozos: list[bytes] = []
         total = 0
         while True:
@@ -279,7 +302,7 @@ class DescargadorHTTP:
                 return b"".join(trozos)
             total += len(trozo)
             if total > max_bytes:
-                raise ErrorDescarga("La página es demasiado grande.")
+                raise DemasiadoGrande("La página es demasiado grande.")
             trozos.append(trozo)
 
 
@@ -366,7 +389,7 @@ def _descomprimir_capa(datos: bytes, max_bytes: int) -> bytes:
                 raise ErrorDescarga("El fichero comprimido está dañado.") from error
             total += len(trozo)
             if total > max_bytes:
-                raise ErrorDescarga("La página es demasiado grande.")
+                raise DemasiadoGrande("La página es demasiado grande.")
             salida.append(trozo)
             posicion += len(entrada) - len(descompresor.unconsumed_tail)
         # Lo que sobró del último trozo es lo que va detrás de este miembro.

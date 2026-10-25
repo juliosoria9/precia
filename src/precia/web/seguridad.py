@@ -27,7 +27,9 @@ CSP = "; ".join(
         "default-src 'self'",
         "script-src 'self'",
         "style-src 'self'",
-        "img-src 'self'",
+        # Las fotos de los artículos se enlazan desde la tienda o su CDN (solo https). Nunca
+        # `data:`, `blob:` ni `*`; la URL ya llega validada y el autoescape impide colar un `<img>`.
+        "img-src 'self' https:",
         "connect-src 'self'",
         "form-action 'self'",
         "frame-ancestors 'none'",

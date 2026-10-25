@@ -8,7 +8,6 @@ ficha salía titulada «Test Sites».
 
 import asyncio
 import json
-import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -18,6 +17,7 @@ from precia.extraccion.ficha import MAX_TITULO, extraer_ficha
 from precia.extraccion.tipos import FichaExtraida
 from precia.navegador.tipos import Pagina
 from precia.perfiles.tipos import Perfil
+from tests.cronometro import segundos_de_cpu
 
 REALES = Path(__file__).parent.parent / "fixtures" / "reales"
 
@@ -209,18 +209,16 @@ def test_titulo_sin_caracteres_de_control_ni_invisibles() -> None:
 def test_titulo_hostil_con_miles_de_separadores_es_rapido() -> None:
     sitio = '<meta property="og:site_name" content="Desguaces Pepe">'
     hostil = " | " * 300_000 + "x" + " -" * 300_000
-    inicio = time.perf_counter()
-    titulo = _titulo(f"{sitio}<h1>{hostil}</h1><title>{hostil}</title>")
-    assert time.perf_counter() - inicio < 5
-    assert len(titulo) <= MAX_TITULO
+    html = f"{sitio}<h1>{hostil}</h1><title>{hostil}</title>"
+    assert len(_titulo(html)) <= MAX_TITULO
+    assert segundos_de_cpu(lambda: _titulo(html), 5) < 5
 
 
 def test_muchos_h1_en_la_cabecera_es_rapido() -> None:
     profundo = "<header>" + "<div>" * 400 + "<h1>Logo</h1>" * 50_000 + "</div>" * 400
-    inicio = time.perf_counter()
-    titulo = _titulo(profundo + "</header><title>Faro</title>")
-    assert time.perf_counter() - inicio < 5
-    assert titulo == "Faro"
+    html = profundo + "</header><title>Faro</title>"
+    assert _titulo(html) == "Faro"
+    assert segundos_de_cpu(lambda: _titulo(html), 5) < 5
 
 
 def test_el_nombre_de_los_microdatos_en_un_enlace_no_da_su_url() -> None:

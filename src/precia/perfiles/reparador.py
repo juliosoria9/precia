@@ -1,4 +1,4 @@
-"""🤖 Reparador: propone una versión nueva de un perfil que ha dejado de funcionar (memoria §5).
+"""IA · Reparador: propone una versión nueva de un perfil que ha dejado de funcionar (memoria §5).
 
 Cuando el listado sale vacío con el perfil vigente (lo normal es que la tienda haya cambiado su
 HTML), se pide a la IA un perfil corregido a partir de los selectores viejos y del resumen de la
@@ -20,7 +20,7 @@ from typing import Any
 
 from precia.extraccion.listado import extraer_listado
 from precia.extraccion.texto import resumen_para_ia
-from precia.ia.tipos import PeticionIA
+from precia.ia.tipos import PeticionIA, max_tokens_para
 from precia.navegador.tipos import Pagina
 from precia.navegador.url import Validador, validar_url
 from precia.perfiles.configurador import (
@@ -34,10 +34,16 @@ from precia.perfiles.configurador import (
 )
 from precia.perfiles.protocolos import Navegador, SesionIA
 from precia.perfiles.tipos import Perfil, ReparacionFallida
-from precia.perfiles.validador import CLAVES, problema_sin_resultados, resumir, validar
+from precia.perfiles.validador import (
+    CLAVES,
+    problema_sin_resultados,
+    resumir,
+    sin_campos_repetidos,
+    validar,
+)
 
 COMPONENTE = "reparador"
-AUTOR = "🤖 reparador"
+AUTOR = "reparador IA"
 MAX_MOTIVO = 3
 
 ESQUEMA: dict[str, Any] = {
@@ -54,7 +60,9 @@ INSTRUCCIONES = (
     "simplificado de la página de resultados actual. Devuelve el perfil corregido:\n"
     "- sel_resultado: cada resultado (producto) de la búsqueda, sin @atributo;\n"
     "- sel_titulo: dentro de cada resultado, el nombre del producto;\n"
-    "- sel_enlace: dentro de cada resultado, el enlace a la ficha, normalmente con @href;\n"
+    "- sel_enlace: dentro de cada resultado, el enlace a la ficha, normalmente con @href; si "
+    "cada resultado es en sí mismo el enlace (un <a href> que envuelve la tarjeta), "
+    "sel_resultado es ese <a> y sel_enlace es «@href» a secas, sin selector;\n"
     "- sel_precio_listado: dentro de cada resultado, el precio, o null si no se muestra;\n"
     "- sel_campos: para cada campo de la ficha de producto, un selector aplicado a toda la "
     "ficha, o null. La página que recibes es un listado y no una ficha: conserva los "
@@ -90,7 +98,7 @@ async def reparar(
             instrucciones=INSTRUCCIONES,
             datos=_datos(perfil, pagina),
             esquema=ESQUEMA,
-            max_tokens=768,
+            max_tokens=max_tokens_para(ESQUEMA),
         )
     )
     problemas: list[str] = []
@@ -125,7 +133,7 @@ async def reparar(
         raise ReparacionFallida(
             f"El perfil propuesto para {perfil.dominio} no valida. {resumir(informe)}"
         )
-    return replace(nuevo, nota=resumir(informe))
+    return replace(sin_campos_repetidos(nuevo, informe), nota=resumir(informe))
 
 
 def _datos(perfil: Perfil, pagina: Pagina) -> str:

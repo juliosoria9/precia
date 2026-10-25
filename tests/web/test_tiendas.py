@@ -1,10 +1,12 @@
 """Alta de tiendas y revisión del perfil desde la web (memoria §4: la persona fija el perfil)."""
 
 from dataclasses import replace
+from datetime import datetime, timedelta
 
 import pytest
 
-from precia.nucleo.fuente_demo import FuenteDemo
+from precia.nucleo.fuente_demo import TIENDAS, FuenteDemo
+from precia.nucleo.modelos import EstadoPerfil, FalloConfiguracion, Tienda
 from precia.web.app import crear_app
 from tests.asgi import ClienteASGI, Respuesta
 
@@ -376,3 +378,76 @@ def test_cambiar_la_entrada_de_una_tienda_que_no_existe(cliente: ClienteASGI) ->
 
 def test_cambiar_la_entrada_por_get_no_existe(cliente: ClienteASGI) -> None:
     assert cliente.get(f"/tiendas/{NORTE}/entrada").estado in (404, 405)
+
+
+# --- Configuración fallida y «Reintentar» (A1) ---------------------------------------------------
+
+CAIDA = "caida.example"
+T = datetime(2026, 10, 22, 12, 0)
+MOTIVO = "No se ha podido configurar caida.example."
+
+
+def con_caida(motivo: str = MOTIVO) -> FuenteDemo:
+    fallo = FalloConfiguracion(2, T, motivo, T + timedelta(days=1))
+    caida = Tienda(CAIDA, "Caída", EstadoPerfil.SIN_PERFIL, "", True, None, 0, fallo=fallo)
+    return FuenteDemo(_tiendas=[*TIENDAS, caida])
+
+
+def cliente_a_las(fuente: FuenteDemo, ahora: datetime = T) -> ClienteASGI:
+    """La web con el reloj parado en `ahora`: la espera se compara con él."""
+    return ClienteASGI(crear_app(fuente, reloj=lambda: ahora))
+
+
+def test_tienda_con_configuracion_fallida_muestra_el_motivo_y_reintentar() -> None:
+    html = cliente_a_las(con_caida()).get(f"/tiendas/{CAIDA}").texto
+    assert MOTIVO in html
+    assert "2 intentos" in html
+    assert "No se reintenta hasta el 23 oct 12:00" in html
+    formulario = html.split(f'action="/tiendas/{CAIDA}/reintentar"')[1].split("</form>")[0]
+    assert "Reintentar" in formulario and "disabled" not in formulario
+    # Un navegador envía «Content-Length: 0» sin campos; el campo oculto evita depender de eso.
+    assert 'name="confirmar" value="1"' in formulario
+
+
+def test_reintentar_quita_la_espera_y_redirige() -> None:
+    fuente = con_caida()
+    cliente = cliente_a_las(fuente)
+    respuesta = cliente.post(f"/tiendas/{CAIDA}/reintentar", {"confirmar": "1"}, cabeceras=ORIGEN)
+    assert respuesta.estado == 303
+    assert respuesta.cabeceras["location"] == f"/tiendas/{CAIDA}?reintentar=1"
+    tienda = fuente.tienda(CAIDA)
+    assert tienda is not None and tienda.fallo is not None
+    assert tienda.fallo.reintentar_desde is None
+    html = cliente.get(f"/tiendas/{CAIDA}?reintentar=1").texto
+    assert "se volverá a configurar en la próxima búsqueda" in html
+    assert MOTIVO in html
+    assert "/reintentar" not in html
+
+
+def test_reintentar_tienda_inexistente_da_404(cliente: ClienteASGI) -> None:
+    respuesta = cliente.post(
+        "/tiendas/no-existe.example/reintentar", {"confirmar": "1"}, cabeceras=ORIGEN
+    )
+    assert respuesta.estado == 404
+
+
+def test_tienda_sin_fallo_no_tiene_reintentar(cliente: ClienteASGI) -> None:
+    assert "/reintentar" not in cliente.get(f"/tiendas/{PENDIENTE}").texto
+
+
+def test_la_lista_de_tiendas_marca_las_que_estan_en_espera() -> None:
+    html = cliente_a_las(con_caida()).get("/tiendas").texto
+    tarjeta = html.split(f'href="/tiendas/{CAIDA}"')[1].split("</a>")[0]
+    assert "En espera hasta el 23 oct 12:00" in tarjeta
+    assert "En espera" not in html.split(f'href="/tiendas/{PENDIENTE}"')[1].split("</a>")[0]
+
+
+def test_espera_vencida_no_se_ensena_como_espera_ni_ofrece_reintentar() -> None:
+    # Revisión: la web solo miraba si había fecha, no si ya había pasado.
+    cliente = cliente_a_las(con_caida("No encuentra el buscador"), T + timedelta(days=2))
+    tarjeta = cliente.get("/tiendas").texto.split(f'href="/tiendas/{CAIDA}"')[1].split("</a>")[0]
+    assert "En espera" not in tarjeta
+    assert "Falló · Se reintentará en la próxima búsqueda" in tarjeta
+    html = " ".join(cliente.get(f"/tiendas/{CAIDA}").texto.split())
+    assert "No se reintenta hasta" not in html and "/reintentar" not in html
+    assert "No encuentra el buscador. Se reintentará en la próxima búsqueda" in html

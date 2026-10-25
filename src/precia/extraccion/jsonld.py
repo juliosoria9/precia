@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 
 from precia.extraccion.dom import Nodo, analizar
 from precia.extraccion.precios import MAX_IMPORTE, leer_precio
-from precia.extraccion.tipos import Precio, ProductoJSONLD
+from precia.extraccion.tipos import OBRAS_VENDIBLES, Precio, ProductoJSONLD
 
 MAX_BLOQUE = 1_000_000
 MAX_BLOQUES = 50
@@ -27,7 +27,7 @@ MAX_DESCRIPCION = 5_000
 MAX_IDENTIFICADOR = 100
 MAX_URL = 2_000
 
-_TIPOS_PRODUCTO = frozenset({"Product", "IndividualProduct", "ProductModel"})
+_TIPOS_PRODUCTO = frozenset({"Product", "IndividualProduct", "ProductModel"}) | OBRAS_VENDIBLES
 _ESTADOS = {
     "NewCondition": "Nuevo",
     "UsedCondition": "Usado",
@@ -57,8 +57,8 @@ def productos_de_arbol(raiz: Nodo) -> list[ProductoJSONLD]:
         dato = _cargar(texto)
         if dato is None:
             continue
-        for objeto in _productos_en(dato):
-            productos.append(_producto(objeto))
+        for objeto, en_lista in _productos_en(dato):
+            productos.append(_producto(objeto, en_lista=en_lista))
             if len(productos) >= MAX_PRODUCTOS:
                 return productos
     return productos
@@ -89,22 +89,26 @@ def _cargar(texto: str) -> Any:
         return None
 
 
-def _productos_en(dato: Any) -> Iterator[dict[str, Any]]:
-    """Objetos de tipo producto a cualquier profundidad (en preorden), sin pasar del tope."""
-    pila: list[tuple[Any, int]] = [(dato, 0)]
+def _productos_en(dato: Any) -> Iterator[tuple[dict[str, Any], bool]]:
+    """Objetos de tipo producto a cualquier profundidad (en preorden), sin pasar del tope.
+
+    Cada uno con si va dentro del valor de un `itemListElement` (de un `ItemList`, un
+    `OfferCatalog`...): entonces es un elemento de una lista, no el producto de la página.
+    """
+    pila: list[tuple[Any, int, bool]] = [(dato, 0, False)]
     while pila:
-        actual, profundidad = pila.pop()
+        actual, profundidad, en_lista = pila.pop()
         if profundidad > MAX_PROFUNDIDAD:
             continue
         if isinstance(actual, dict):
             if _es_producto(actual):
-                yield actual
-            hijos = list(actual.values())
+                yield actual, en_lista
+            hijos = [(h, en_lista or k == "itemListElement") for k, h in actual.items()]
         elif isinstance(actual, list):
-            hijos = actual
+            hijos = [(h, en_lista) for h in actual]
         else:
             continue
-        pila.extend((hijo, profundidad + 1) for hijo in reversed(hijos))
+        pila.extend((hijo, profundidad + 1, lista) for hijo, lista in reversed(hijos))
 
 
 def _es_producto(objeto: dict[str, Any]) -> bool:
@@ -118,7 +122,7 @@ def _nombre_esquema(valor: str) -> str:
     return valor.strip().rsplit("/", 1)[-1].rsplit(":", 1)[-1]
 
 
-def _producto(objeto: dict[str, Any]) -> ProductoJSONLD:
+def _producto(objeto: dict[str, Any], *, en_lista: bool = False) -> ProductoJSONLD:
     ofertas = _ofertas(objeto.get("offers"))
     oferta, precio = next(
         ((o, p) for o in ofertas if (p := _precio_oferta(o)) is not None),
@@ -148,8 +152,19 @@ def _producto(objeto: dict[str, Any]) -> ProductoJSONLD:
         disponible=disponible,
         descripcion=_descripcion(objeto.get("description")),
         imagenes=_imagenes(objeto.get("image")),
-        url=_url(objeto.get("url")) or _url(oferta.get("url")),
+        url=_url(objeto.get("url")) or _url(oferta.get("url")) or _url_de_id(objeto.get("@id")),
+        en_lista=en_lista,
     )
+
+
+def _url_de_id(valor: Any) -> str | None:
+    """`@id` como url de reserva: el `Product` anidado en un `Book` solo trae `@id` (la página).
+
+    Un nodo en blanco (`_:b0`) no es una dirección.
+    """
+    if isinstance(valor, str) and valor.strip().startswith("_:"):
+        return None
+    return _url(valor)
 
 
 def _ofertas(valor: Any) -> list[dict[str, Any]]:
@@ -158,15 +173,16 @@ def _ofertas(valor: Any) -> list[dict[str, Any]]:
 
 
 def _precio_oferta(oferta: dict[str, Any], profundidad: int = 0) -> Precio | None:
-    moneda = _moneda(oferta.get("priceCurrency"))
+    moneda = _moneda(_clave(oferta, "priceCurrency"))
     claves = ("lowPrice", "price") if _es_agregada(oferta) else ("price",)
     for clave in claves:
-        precio = _leer_importe(oferta.get(clave), moneda)
+        precio = _leer_importe(_clave(oferta, clave), moneda)
         if precio is not None:
             return precio
-    for especificacion in _ofertas(oferta.get("priceSpecification")):
+    for especificacion in _ofertas(_clave(oferta, "priceSpecification")):
         precio = _leer_importe(
-            especificacion.get("price"), _moneda(especificacion.get("priceCurrency")) or moneda
+            _clave(especificacion, "price"),
+            _moneda(_clave(especificacion, "priceCurrency")) or moneda,
         )
         if precio is not None:
             return precio
@@ -181,7 +197,20 @@ def _precio_oferta(oferta: dict[str, Any], profundidad: int = 0) -> Precio | Non
 def _es_agregada(oferta: dict[str, Any]) -> bool:
     tipo = oferta.get("@type")
     return (isinstance(tipo, str) and _nombre_esquema(tipo) == "AggregateOffer") or (
-        "lowPrice" in oferta
+        _clave(oferta, "lowPrice") is not None
+    )
+
+
+def _clave(objeto: dict[str, Any], clave: str) -> Any:
+    """`objeto[clave]` y, si esa grafía no está, la misma clave con otras mayúsculas.
+
+    Hay tiendas que escriben `"Price"` o `"PriceCurrency"`; la grafía de `schema.org` gana.
+    """
+    if clave in objeto:
+        return objeto[clave]
+    minusculas = clave.lower()
+    return next(
+        (v for k, v in objeto.items() if isinstance(k, str) and k.lower() == minusculas), None
     )
 
 

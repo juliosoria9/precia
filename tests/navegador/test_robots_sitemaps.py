@@ -1,12 +1,12 @@
 """Líneas `Sitemap:` del robots.txt (nota 16, sección B): fuera de grupo y en cualquier sitio."""
 
 import asyncio
-import time
 
 import pytest
 
 from precia.navegador.robots import MAX_SITEMAPS_ROBOTS, ServicioRobots, analizar_robots
 from precia.navegador.tipos import ErrorDescarga, Pagina
+from tests.cronometro import segundos_de_cpu
 from tests.navegador.falsos import DescargadorFalso, Reloj, pagina
 
 UA = "PrecIA/0.1 (+https://github.com/juliosoria9/precia)"
@@ -88,10 +88,8 @@ def test_url_demasiado_larga_se_descarta() -> None:
 
 def test_robots_hostil_con_muchisimos_sitemaps_es_rapido() -> None:
     texto = "".join(f"Sitemap: {TIENDA}/{'x' * 40}{i}.xml\n" for i in range(8000))
-    inicio = time.perf_counter()
-    reglas = analizar_robots(texto, "precia")
-    assert time.perf_counter() - inicio < 1.0
-    assert len(reglas.sitemaps) == MAX_SITEMAPS_ROBOTS
+    assert len(analizar_robots(texto, "precia").sitemaps) == MAX_SITEMAPS_ROBOTS
+    assert segundos_de_cpu(lambda: analizar_robots(texto, "precia"), 1.0) < 1.0
 
 
 # --- ServicioRobots.sitemaps --------------------------------------------------------------------
@@ -131,8 +129,8 @@ def test_servicio_reutiliza_el_robots_ya_leido() -> None:
         pagina(ROBOTS, "No encontrado", estado=404),
         pagina(ROBOTS, "Error", estado=503),
         ErrorDescarga("sin red"),
-        # Desafío de Cloudflare en el robots.txt: no hay sitemaps que leer (y el navegador lo trata
-        # como `Bloqueado` al pedir cualquier cosa de la tienda).
+        # Desafío de Cloudflare en el robots.txt: no hay sitemaps que leer (el navegador lo trata
+        # como `Bloqueado` si se respeta el robots.txt; si se ignora, como si no lo hubiera, R3-B).
         pagina(
             ROBOTS,
             "<html><head><title>Just a moment...</title></head><body>cloudflare</body></html>",

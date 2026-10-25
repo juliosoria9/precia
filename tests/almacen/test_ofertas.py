@@ -6,14 +6,21 @@ migración) se siguen leyendo con valores vacíos.
 """
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from precia.almacen.sqlite import MIGRACIONES, Almacen, DatoNoValido, ErrorAlmacen
-from precia.nucleo.modelos import GrupoProducto, Modo, Oferta, OrigenDato, ValorCampo
+from precia.nucleo.modelos import (
+    Coincidencia,
+    GrupoProducto,
+    Modo,
+    Oferta,
+    OrigenDato,
+    ValorCampo,
+)
 
 PRODUCTO = "oem-1k0698151"
 NOMBRE = "Pastillas de freno delanteras"
@@ -207,3 +214,123 @@ def test_registrar_busqueda_valida(
         almacen.registrar_busqueda(
             texto, Modo.CLASICO, datetime(2026, 10, 19), llamadas, Decimal(coste), duracion
         )
+
+
+# --- Coincidencia con la referencia buscada (B5) -----------------------------------------------
+
+
+def test_guardar_y_leer_la_coincidencia(almacen: Almacen) -> None:
+    almacen.guardar_precio(
+        PRODUCTO,
+        NOMBRE,
+        "1K0698151",
+        "oscaro.example",
+        URL_A,
+        Decimal("31.52"),
+        datetime(2026, 10, 22, 13, 39),
+        coincidencia=Coincidencia.EQUIVALENTE,
+    )
+    assert almacen.ultimas_ofertas(PRODUCTO)[0].coincidencia is Coincidencia.EQUIVALENTE
+    producto = almacen.producto(PRODUCTO)
+    assert producto is not None
+    assert producto.ofertas[0].coincidencia is Coincidencia.EQUIVALENTE
+
+
+def test_coincidencia_no_valida(almacen: Almacen) -> None:
+    with pytest.raises(DatoNoValido):
+        almacen.guardar_precio(
+            PRODUCTO,
+            NOMBRE,
+            "1K0698151",
+            "oscaro.example",
+            URL_A,
+            Decimal("31.52"),
+            datetime(2026, 10, 22),
+            coincidencia="otra",  # type: ignore[arg-type]
+        )
+    assert almacen.ultimas_ofertas(PRODUCTO) == []
+
+
+# --- La visita que vio cada oferta (A1, con las ofertas de la caché de A3) -----------------------
+
+T1 = datetime(2026, 10, 22, 10, 0)
+T2 = T1 + timedelta(hours=2)
+URL_C = "https://recambiosnorte.example/p/pastillas-c"
+
+
+def _visto(a: Almacen, url: str, precio: str, fecha: datetime, visita: datetime) -> None:
+    a.guardar_precio(
+        PRODUCTO,
+        NOMBRE,
+        "1K0698151",
+        "recambiosnorte.example",
+        url,
+        Decimal(precio),
+        fecha,
+        visita=visita,
+    )
+
+
+def test_una_oferta_de_la_cache_sigue_en_las_ultimas_junto_a_las_nuevas(almacen: Almacen) -> None:
+    # Visita 1 (T1): A y B. Visita 2 (T2): A sale de la caché (descargada en T1) y C es nueva.
+    # Las últimas ofertas son las de la visita 2, A incluida, aunque A conserve su fecha T1.
+    _visto(almacen, URL_A, "10", T1, T1)
+    _visto(almacen, URL_B, "11", T1, T1)
+    _visto(almacen, URL_A, "10", T1, T2)
+    _visto(almacen, URL_C, "12", T2, T2)
+    assert [o.url for o in almacen.ultimas_ofertas(PRODUCTO)] == [URL_A, URL_C]
+    (fila,) = almacen._consultar("SELECT count(*) AS n FROM precios")
+    assert fila["n"] == 3
+
+
+def test_lo_que_no_se_ha_vuelto_a_ver_no_esta_en_las_ultimas(almacen: Almacen) -> None:
+    _visto(almacen, URL_A, "10", T1, T1)
+    _visto(almacen, URL_B, "11", T1, T1)
+    _visto(almacen, URL_A, "10", T1, T2)  # Solo A, desde la caché.
+    assert [o.url for o in almacen.ultimas_ofertas(PRODUCTO)] == [URL_A]
+
+
+def test_sin_visita_cuenta_la_fecha(almacen: Almacen) -> None:
+    _guardar(almacen, "recambiosnorte.example", "40.00", T1)
+    _guardar(almacen, "recambiosnorte.example", "41.00", T2, url=URL_C)
+    assert [o.url for o in almacen.ultimas_ofertas(PRODUCTO)] == [URL_C]
+
+
+def test_visita_no_valida(almacen: Almacen) -> None:
+    with pytest.raises(DatoNoValido):
+        almacen.guardar_precio(
+            PRODUCTO,
+            NOMBRE,
+            None,
+            "a.example",
+            URL_A,
+            Decimal("1"),
+            T1,
+            visita="ayer",  # type: ignore[arg-type]
+        )
+
+
+def test_la_migracion_de_la_visita_conserva_las_ultimas_ofertas(tmp_path: Path) -> None:
+    ruta = tmp_path / "precia.db"
+    # La visita es la migración 8: se parte de la 7 (con `[:-1]`, R2-C14b la daría ya hecha).
+    Almacen(ruta, migraciones=MIGRACIONES[:7]).cerrar()
+    # Filas escritas por la versión anterior del código, sin la columna `visita`.
+    con = sqlite3.connect(ruta)
+    con.execute("INSERT INTO productos (id, nombre) VALUES (?, ?)", (PRODUCTO, NOMBRE))
+    for tienda, url, precio, fecha in [
+        ("recambiosnorte.example", URL_A, "40.00", T1),
+        ("recambiosnorte.example", URL_C, "41.00", T2),
+        ("piezasya.example", URL_B, "39.00", T1),
+    ]:
+        con.execute(
+            "INSERT INTO precios (producto_id, tienda, url, precio, fecha, dia)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (PRODUCTO, tienda, url, precio, fecha.isoformat(), fecha.date().isoformat()),
+        )
+    con.commit()
+    con.close()
+    with Almacen(ruta) as a:
+        assert a.pragma("user_version") == len(MIGRACIONES)
+        assert [o.url for o in a.ultimas_ofertas(PRODUCTO)] == [URL_B, URL_C]
+        filas = a._consultar("SELECT count(*) AS n FROM precios WHERE visita = fecha")
+        assert filas[0]["n"] == 3
