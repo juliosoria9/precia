@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1" xmlns:xhtml="http://www.w3.org/1999/xhtml">
+  <url>
+    <loc>https://tienda.es/</loc>
+    <changefreq>daily</changefreq>
+  </url>
+  <url>
+    <loc>https://tienda.es/products/retrovisor-derecho-seat-leon-iii</loc>
+    <lastmod>2026-10-15T14:05:11+02:00</lastmod>
+    <changefreq>daily</changefreq>
+    <xhtml:link rel="alternate" hreflang="es-ES" href="https://tienda.es/products/retrovisor-derecho-seat-leon-iii"/>
+    <xhtml:link rel="alternate" hreflang="pt-PT" href="https://tienda.es/pt/products/retrovisor-derecho-seat-leon-iii"/>
+    <image:image>
+      <image:loc>https://cdn.shopify.com/s/files/1/0123/4567/products/retrovisor.jpg?v=1697371511</image:loc>
+      <image:title>Retrovisor derecho Seat Le&#243;n III</image:title>
+      <image:caption>Retrovisor &quot;el&#233;ctrico&quot; &amp; calefactado</image:caption>
+    </image:image>
+  </url>
+  <url>
+    <loc>https://tienda.es/products/kit-distribucion-gates-k015603xs</loc>
+    <lastmod>2026-10-14T09:00:00+02:00</lastmod>
+    <changefreq>daily</changefreq>
+  </url>
+</urlset>

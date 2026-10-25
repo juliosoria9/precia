@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block titulo %}Tiendas{% endblock %}
+{% block contenido %}
+<section class="cabecera">
+  <h1>Tiendas y perfiles</h1>
+  <p class="sub">Cada tienda tiene un perfil: la URL de búsqueda y los selectores CSS que leen sus fichas. La IA lo genera una sola vez, PrecIA lo valida y desde entonces se usa sin IA. Si la tienda cambia su HTML, la IA propone una versión nueva, que no se fija hasta que la revisas. «Reparado» quiere decir reparado por la IA y confirmado por ti.</p>
+</section>
+
+{% if not tiendas %}
+<p class="tarjeta tenue">Todavía no hay tiendas. Añade la primera con el formulario de abajo.</p>
+{% endif %}
+<div class="rejilla-tiendas">
+  {% for t in tiendas %}
+  {% set v = t.version_actual %}
+  <a class="tarjeta tarjeta-enlace tienda" href="/tiendas/{{ t.dominio }}">
+    <header>
+      <h2>{{ t.nombre }}</h2>
+      {% with estado = t.estado %}{% include "_estado_perfil.html" %}{% endwith %}
+    </header>
+    <p class="tenue">{{ t.dominio }}</p>
+    <dl class="datos">
+      <div><dt>robots.txt</dt><dd class="{{ '' if t.robots_permite else 'texto-error' }}">{{ t.robots }}</dd></div>
+      <div><dt>Perfil</dt><dd>{% if v %}v{{ v.numero }}, {{ v.autor }}{% else %}—{% endif %}</dd></div>
+      <div><dt>Última visita</dt><dd>{{ t.ultima_visita | fecha_hora if t.ultima_visita else "Nunca" }}</dd></div>
+      <div><dt>Bloqueos / CAPTCHA</dt><dd>{{ t.bloqueos }}</dd></div>
+      {% if t.fallo and t.fallo.reintentar_desde %}
+      <div><dt>Configuración</dt><dd class="texto-error">{% if t.fallo.en_espera(ahora) %}Falló · En espera hasta el {{ t.fallo.reintentar_desde | fecha_hora }}{% else %}Falló · Se reintentará en la próxima búsqueda{% endif %}</dd></div>
+      {% endif %}
+    </dl>
+  </a>
+  {% endfor %}
+</div>
+
+<section class="tarjeta nota" id="alta">
+  <h2>Añadir una tienda</h2>
+  <p>Escribe su dominio. En la primera búsqueda en modo Auto o IA, la IA lee una página de resultados y una ficha y propone los selectores; PrecIA los valida ejecutándolos. El perfil queda pendiente de revisión hasta que lo confirmas. En modo clásico, una tienda sin perfil no se visita.</p>
+  {% if error %}<p class="mensaje mensaje-error" role="alert">{{ error }}</p>{% endif %}
+  <form class="formulario" method="post" action="/tiendas">
+    <div class="campo-fila">
+      <label>Dominio
+        <input name="dominio" required maxlength="253" autocomplete="off" spellcheck="false"
+               placeholder="tienda.es" value="{{ dominio or '' }}">
+      </label>
+      <label>Nombre (opcional)
+        <input name="nombre" maxlength="100" autocomplete="off" placeholder="Recambios Ejemplo" value="{{ nombre or '' }}">
+      </label>
+    </div>
+    <div class="campo-fila">
+      <label class="crece">URL de entrada (opcional)
+        <input name="entrada" maxlength="500" autocomplete="off" spellcheck="false" inputmode="url"
+               aria-describedby="ayuda-entrada" placeholder="https://tienda.es/buscar?q={consulta}" value="{{ entrada or '' }}">
+      </label>
+      <button class="boton boton-primario" type="submit">Añadir tienda</button>
+    </div>
+    {% include "_ayuda_entrada.html" %}
+  </form>
+  {% if es_demo %}<p class="tenue">En la demo la tienda solo se guarda en memoria y no se visita.</p>{% endif %}
+</section>
+{% endblock %}

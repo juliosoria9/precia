@@ -1,0 +1,21 @@
+## SITEMAPS 
+
+#SITEMAP INDEX
+
+Sitemap: https://www.pccomponentes.com/sitemap/sitemap.xml
+
+#PRODUCT SITEMAPS
+
+Sitemap: https://www.pccomponentes.com/sitemap/sitemap_articles.xml
+
+#CATEGORY SITEMAP
+
+Sitemap: https://www.pccomponentes.com/sitemap/sitemap_categories.xml
+
+#BRAND SITEMAP
+
+Sitemap: https://www.pccomponentes.com/sitemap/sitemap_brands.xml
+
+#BLOG SITEMAP
+
+Sitemap: https://www.pccomponentes.com/sitemap/blog.xml

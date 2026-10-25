@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block titulo %}Registro de IA{% endblock %}
+{% block contenido %}
+{% set r = resumen %}
+<section class="cabecera">
+  <h1>Registro de IA</h1>
+  <p class="sub">Todas las llamadas que hace PrecIA al modelo, con su coste. El modelo no ejecuta nada: solo devuelve JSON, que PrecIA valida contra un esquema y comprueba contra la página (anclaje).</p>
+</section>
+
+<div class="kpis">
+  <div class="tarjeta kpi"><span>Llamadas este mes</span><strong>{{ r.llamadas | length }}</strong></div>
+  <div class="tarjeta kpi">
+    <span>Gasto del mes</span>
+    <strong>{{ r.gasto_mes_usd | dolares }}</strong>
+    <progress max="{{ r.presupuesto_mes_usd }}" value="{{ r.gasto_mes_usd }}">{{ r.gasto_mes_usd }}</progress>
+    <small class="tenue">de {{ r.presupuesto_mes_usd | dolares }} de presupuesto</small>
+  </div>
+  {% set ns = namespace(rechazadas=0) %}
+  {% for c in r.llamadas if not c.resultado.startswith("Válida") %}{% set ns.rechazadas = ns.rechazadas + 1 %}{% endfor %}
+  <div class="tarjeta kpi"><span>Tokens enviados</span><strong>{{ r.llamadas | sum(attribute="tokens_entrada") | miles }}</strong></div>
+  <div class="tarjeta kpi"><span>Con algo rechazado por la validación</span><strong>{{ ns.rechazadas }}</strong></div>
+</div>
+
+<section class="tarjeta">
+  <h2>Por componente</h2>
+  <ul class="barras">
+    {% set maximo = r.por_componente.values() | max if r.por_componente else 1 %}
+    {% for componente, n in r.por_componente | dictsort(by="value", reverse=true) %}
+    <li><span>{{ componente }}</span><meter min="0" max="{{ maximo }}" value="{{ n }}">{{ n }}</meter><strong>{{ n }}</strong></li>
+    {% endfor %}
+  </ul>
+</section>
+
+<section class="tarjeta">
+  <h2>Llamadas</h2>
+  <div class="tabla-contenedor">
+    <table class="tabla">
+      <thead>
+        <tr><th scope="col">Fecha</th><th scope="col">Componente</th><th scope="col">Proveedor</th><th scope="col" class="num">Tokens (entrada / salida)</th><th scope="col" class="num">Coste</th><th scope="col" class="num">Duración</th><th scope="col">Resultado</th></tr>
+      </thead>
+      <tbody>
+        {% for c in r.llamadas %}
+        <tr>
+          <td class="sin-salto">{{ c.fecha | fecha_hora }}</td>
+          <td>{{ c.componente }}</td>
+          <td class="sin-salto"><span class="insignia {{ 'insignia-tenue' if c.proveedor == 'ollama' else 'insignia-ia' }}">{{ "Local" if c.proveedor == "ollama" else "API" }}</span> {{ c.modelo }}</td>
+          <td class="num">{{ c.tokens_entrada | miles }} / {{ c.tokens_salida | miles }}</td>
+          <td class="num">{{ c.coste_usd | dolares }}</td>
+          <td class="num">{{ (c.duracion_ms / 1000) | decimal }} s</td>
+          <td><span class="resultado-ia {{ 'resultado-ok' if c.resultado.startswith('Válida') else 'resultado-aviso' }}" aria-hidden="true"></span>{{ c.resultado }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="tenue">Solo se guardan métricas, nunca el contenido de los prompts ni claves.</p>
+</section>
+{% endblock %}

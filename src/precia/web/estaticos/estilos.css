@@ -1,0 +1,554 @@
+/* PrecIA: hoja de estilos propia, sin frameworks ni fuentes externas. Sin estilos en línea: lo exige la CSP.
+   Idea: la etiqueta de pieza de un almacén de recambios. El mejor precio es una etiqueta amarilla con
+   taladro y la referencia OEM va estampada en letra técnica (Bahnschrift, la DIN de Windows). El resto
+   de la interfaz es callado: superficies planas, bordes finos y sin sombras. */
+
+:root {
+  color-scheme: light dark;
+
+  /* Base */
+  --chapa: #e4e7ea;          /* fondo: gris acero frío */
+  --ficha: #ffffff;          /* paneles y tablas */
+  --ficha-2: #f2f4f5;        /* bandas de cabecera, filas destacadas */
+  --linea: #d3d8dd;
+  --linea-fuerte: #9aa3ac;
+  --control: #6e7882;        /* borde de los campos: 3:1 sobre blanco */
+  --grafito: #1e2328;        /* texto */
+  --grafito-2: #4f5962;      /* texto secundario: AA sobre blanco y sobre la chapa */
+  --azul: #1d4f91;           /* enlaces, acción principal, foco */
+  --azul-tinta: #ffffff;
+  --azul-suave: #e3ebf6;
+  --amarillo: #f3c623;       /* solo la etiqueta del mejor precio y la marca del menú */
+  --amarillo-suave: #fbf1c9;
+  --sobre-amarillo: #1e2328;
+
+  /* Estado (siempre acompañado de texto) */
+  --ok: #1f6b3a;
+  --ok-suave: #e1f0e5;
+  --aviso: #8a5300;
+  --aviso-suave: #fbeed6;
+  --error: #a8322a;
+  --error-suave: #f9e4e1;
+  --ia: #4a4ca3;
+  --ia-suave: #e9e9f8;
+
+  /* Barra lateral: grafito en los dos modos */
+  --tablero: #1e2328;
+  --tablero-texto: #c4cbd2;
+  --tablero-activo: #2c3339;
+
+  /* Series de la gráfica */
+  --s0: #1d4f91;
+  --s1: #c2410c;
+  --s2: #1f6b3a;
+  --s3: #8e3fa8;
+  --s4: #0e7490;
+  --s5: #a8322a;
+
+  --letra: "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", sans-serif;
+  --letra-tecnica: Bahnschrift, "DIN Alternate", "D-DIN", "DIN 2014", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --letra-codigo: Consolas, "Cascadia Mono", "SFMono-Regular", Menlo, monospace;
+
+  --r-insignia: 2px;
+  --r-control: 3px;
+  --r-panel: 4px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --chapa: #1b1f23;
+    --ficha: #252a2f;
+    --ficha-2: #2d3338;
+    --linea: #3a4148;
+    --linea-fuerte: #5b656e;
+    --control: #808a94;
+    --grafito: #e3e6e9;
+    --grafito-2: #a9b2ba;
+    --azul: #8db4ee;
+    --azul-tinta: #14181b;
+    --azul-suave: #24344a;
+    --amarillo-suave: #3d3618;
+    --ok: #79cf95;
+    --ok-suave: #1d3325;
+    --aviso: #f0b85c;
+    --aviso-suave: #3a2e17;
+    --error: #ff9087;
+    --error-suave: #3d2321;
+    --ia: #b3b5f5;
+    --ia-suave: #2e2f4f;
+    --tablero: #14181b;
+    --tablero-texto: #b8c0c8;
+    --tablero-activo: #252a2f;
+    --s0: #8db4ee;
+    --s1: #fb9a5b;
+    --s2: #79cf95;
+    --s3: #d9a3ec;
+    --s4: #5ccbe0;
+    --s5: #ff9087;
+  }
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--chapa);
+  color: var(--grafito);
+  font: 15px/1.5 var(--letra);
+  font-variant-numeric: tabular-nums;
+}
+
+a { color: var(--azul); text-underline-offset: 3px; text-decoration-thickness: 1px; }
+a:hover { text-decoration-thickness: 2px; }
+code { font: 0.88em var(--letra-codigo); background: var(--ficha-2); padding: 0.05em 0.3em; border-radius: var(--r-insignia); overflow-wrap: anywhere; }
+h1, h2, h3 { font-family: var(--letra-tecnica); font-weight: 600; line-height: 1.2; margin: 0 0 0.5rem; }
+h1 { font-size: 1.75rem; }
+h2 { font-size: 1.2rem; }
+h3 { font-size: 1.05rem; }
+p { margin: 0 0 0.75rem; }
+small { font-size: 0.85rem; }
+:focus-visible { outline: 2px solid var(--azul); outline-offset: 2px; }
+
+.oculto { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.saltar { position: absolute; left: -999px; top: 0.5rem; background: var(--ficha); color: var(--azul); padding: 0.5rem 1rem; z-index: 10; }
+.saltar:focus { left: 0.5rem; }
+.tenue { color: var(--grafito-2); }
+.texto-error { color: var(--error); }
+.ayuda, .ayuda-en-linea { color: var(--grafito-2); font-size: 0.85rem; font-weight: 400; font-family: var(--letra); }
+.ayuda { margin: 0.4rem 0 0; max-width: 78ch; }
+.sin-salto { white-space: nowrap; }
+
+/* ---------- Marco: barra lateral + contenido ---------- */
+
+.marco {
+  display: grid; grid-template-columns: 208px minmax(0, 1fr); min-height: 100vh;
+  /* La columna del menú sigue grafito aunque la página sea más larga que la ventana. */
+  background: linear-gradient(to right, var(--tablero) 208px, transparent 208px);
+}
+
+.lateral {
+  position: sticky; top: 0; height: 100vh;
+  display: flex; flex-direction: column; gap: 1.75rem;
+  padding: 1.25rem 0;
+  background: var(--tablero);
+  color: var(--tablero-texto);
+}
+.marca {
+  display: flex; align-items: center; gap: 0.6rem; padding: 0 1.25rem;
+  color: #ffffff; text-decoration: none;
+  font: 600 1.35rem/1 var(--letra-tecnica);
+}
+.marca b { font-weight: 600; }
+.lateral ul { list-style: none; margin: 0; padding: 0; display: grid; }
+.lateral nav a {
+  display: block; padding: 0.55rem 1.25rem;
+  border-left: 3px solid transparent;
+  color: var(--tablero-texto); text-decoration: none;
+}
+.lateral nav a:hover { background: var(--tablero-activo); color: #ffffff; }
+.lateral nav a[aria-current="page"] { border-left-color: var(--amarillo); background: var(--tablero-activo); color: #ffffff; font-weight: 600; }
+.lateral a:focus-visible { outline-color: var(--amarillo); outline-offset: -2px; }
+.lateral-pie { margin: auto 0 0; padding: 0 1.25rem; font-size: 0.8rem; color: var(--tablero-texto); }
+
+main { padding: 1.75rem clamp(1rem, 3vw, 2.5rem) 3rem; max-width: 1200px; width: 100%; }
+
+@media (max-width: 820px) {
+  .marco { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 1fr; background: none; }
+  .lateral {
+    height: auto; z-index: 5;
+    flex-direction: row; align-items: center; gap: 0.5rem;
+    padding: 0 0 0 1rem;
+  }
+  .marca { padding: 0; }
+  /* El difuminado del borde derecho indica que el menú sigue al desplazarlo. */
+  .lateral nav { overflow-x: auto; scrollbar-width: none; min-width: 0; -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 2rem), transparent); mask-image: linear-gradient(to right, #000 calc(100% - 2rem), transparent); }
+  .lateral ul { display: flex; }
+  .lateral nav a { white-space: nowrap; padding: 0.85rem 0.7rem 0.7rem; border-left: 0; border-bottom: 3px solid transparent; }
+  .lateral nav a[aria-current="page"] { border-bottom-color: var(--amarillo); }
+  .lateral-pie, .marca span { display: none; }
+  main { padding: 1.25rem 1rem 3rem; }
+}
+
+/* ---------- Bloques ---------- */
+
+.cabecera { margin: 0 0 1.25rem; }
+.cabecera-fila { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem 1.5rem; flex-wrap: wrap; }
+.sub { color: var(--grafito-2); max-width: 72ch; margin: 0; }
+.migas { font-size: 0.875rem; color: var(--grafito-2); margin-bottom: 0.75rem; }
+
+.tarjeta {
+  background: var(--ficha);
+  border: 1px solid var(--linea);
+  border-radius: var(--r-panel);
+  padding: 1.1rem 1.25rem;
+  margin-bottom: 1rem;
+}
+.tarjeta > h2:first-child { margin-bottom: 0.75rem; }
+.tarjeta-enlace { display: block; color: inherit; text-decoration: none; }
+.tarjeta-enlace:hover { border-color: var(--linea-fuerte); }
+.tarjeta-enlace:hover h2 { color: var(--azul); text-decoration: underline; text-underline-offset: 3px; }
+.nota { background: transparent; border-style: dashed; border-color: var(--linea-fuerte); }
+.nota ol { margin: 0 0 0.75rem; padding-left: 1.25rem; }
+.nota li { margin-bottom: 0.3rem; }
+
+.rejilla-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 540px), 1fr)); gap: 0 1rem; }
+
+.aviso-demo {
+  display: block; line-height: 1.7;
+  margin: 0 0 1.25rem; padding: 0.5rem 0.75rem;
+  background: var(--amarillo-suave); color: var(--grafito);
+  border-left: 4px solid var(--amarillo);
+  font-size: 0.9rem;
+}
+
+.aviso-demo .insignia { margin-right: 0.5rem; }
+
+.mensaje {
+  padding: 0.6rem 0.85rem; margin-bottom: 1rem;
+  border-left: 4px solid var(--azul); background: var(--azul-suave); color: var(--grafito);
+  max-width: 90ch;
+}
+.mensaje-error { border-left-color: var(--error); background: var(--error-suave); }
+.mensaje-aviso { border-left-color: var(--aviso); background: var(--aviso-suave); }
+.mensaje-ok { border-left-color: var(--ok); background: var(--ok-suave); }
+
+.vacio { padding: 1.75rem 1.5rem; }
+.vacio p { max-width: 70ch; }
+
+/* ---------- Insignias y chips ---------- */
+
+.insignia {
+  display: inline-block; padding: 0.05rem 0.45rem; border-radius: var(--r-insignia);
+  font-size: 0.8rem; font-weight: 600; line-height: 1.5; white-space: nowrap; vertical-align: middle;
+  background: var(--ficha-2); color: var(--grafito-2);
+}
+.insignia-demo { background: var(--amarillo); color: var(--sobre-amarillo); font-family: var(--letra-tecnica); }
+.insignia-ok { background: var(--ok-suave); color: var(--ok); }
+.insignia-aviso { background: var(--aviso-suave); color: var(--aviso); }
+.insignia-error { background: var(--error-suave); color: var(--error); }
+.insignia-ia { background: var(--ia-suave); color: var(--ia); }
+.insignia-tenue { background: transparent; color: var(--grafito-2); box-shadow: inset 0 0 0 1px var(--linea-fuerte); }
+.insignia-modo { background: transparent; color: var(--grafito); box-shadow: inset 0 0 0 1px var(--grafito); font-weight: 500; }
+
+/* La referencia OEM, estampada: letra técnica semicondensada, recuadro fino y aire entre caracteres. */
+.insignia-oem {
+  background: var(--ficha); color: var(--grafito);
+  box-shadow: inset 0 0 0 1px var(--grafito);
+  font: 600 0.95rem/1.4 var(--letra-tecnica); font-stretch: 87.5%; letter-spacing: 0.06em;
+  padding: 0.05rem 0.5rem;
+}
+
+.origen {
+  display: inline-block; margin-left: 0.25rem; padding: 0 0.3rem; border-radius: var(--r-insignia);
+  font-size: 0.75rem; font-weight: 600; vertical-align: middle; white-space: nowrap;
+}
+.origen-jsonld { background: var(--ok-suave); color: var(--ok); }
+.origen-perfil { background: var(--ficha-2); color: var(--grafito-2); }
+.origen-ia { background: var(--ia-suave); color: var(--ia); }
+
+.chips { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+.chip { position: relative; cursor: pointer; }
+.chip input { position: absolute; opacity: 0; inset: 0; cursor: pointer; }
+.chip span {
+  display: inline-block; padding: 0.3rem 0.7rem; border-radius: var(--r-control);
+  border: 1px solid var(--control); background: var(--ficha); font-size: 0.9rem;
+}
+.chip input:checked + span { background: var(--azul); border-color: var(--azul); color: var(--azul-tinta); }
+.chip input:focus-visible + span { outline: 2px solid var(--azul); outline-offset: 2px; }
+.chip-aviso span { color: var(--grafito-2); border-style: dashed; }
+.chip-enlace {
+  display: inline-block; padding: 0.1rem 0.5rem; margin: 0.1rem;
+  border: 1px solid var(--linea-fuerte); border-radius: var(--r-insignia);
+  color: var(--grafito); text-decoration: none;
+  font: 500 0.9rem var(--letra-tecnica); letter-spacing: 0.02em;
+}
+.chip-enlace:hover { border-color: var(--azul); color: var(--azul); }
+
+/* ---------- Formularios ---------- */
+
+input, select, button { font: inherit; color: inherit; }
+input[type="search"], input[type="text"], input[type="number"], input:not([type]), select {
+  width: 100%; padding: 0.5rem 0.65rem; border-radius: var(--r-control);
+  border: 1px solid var(--control); background: var(--ficha);
+}
+/* Foco siempre visible: contorno de 2 px, no solo un cambio de color del borde. */
+input:focus-visible, select:focus-visible { border-color: var(--azul); outline: 2px solid var(--azul); outline-offset: 1px; }
+
+.boton {
+  display: inline-flex; align-items: center; justify-content: center; gap: 0.4rem;
+  padding: 0.5rem 1rem; border-radius: var(--r-control); border: 1px solid transparent;
+  font-weight: 600; text-decoration: none; cursor: pointer; white-space: nowrap;
+}
+.boton-primario { background: var(--azul); color: var(--azul-tinta); }
+.boton-primario:hover { background: color-mix(in srgb, var(--azul) 86%, var(--grafito)); }
+.boton-secundario { background: var(--ficha); border-color: var(--control); color: var(--grafito); }
+.boton-secundario:hover { border-color: var(--azul); color: var(--azul); }
+.boton:disabled { opacity: 0.55; cursor: not-allowed; }
+.boton-pequeno { padding: 0.1rem 0.55rem; font-size: 0.85rem; }
+.acciones { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.75rem; }
+.en-linea { display: inline; }
+
+.buscador { padding: 1.25rem; }
+.buscador-fila { display: flex; gap: 0.5rem; }
+.buscador-fila input { font-size: 1.15rem; padding: 0.7rem 0.9rem; border-width: 2px; border-color: var(--grafito); }
+.buscador-fila .boton { padding-inline: 1.75rem; font-size: 1.05rem; }
+.ejemplos { margin: 0.75rem 0 0; color: var(--grafito-2); font-size: 0.9rem; }
+
+.opciones { margin-top: 1rem; border-top: 1px solid var(--linea); padding-top: 0.75rem; }
+details > summary { cursor: pointer; font-weight: 600; }
+details > summary:hover { color: var(--azul); }
+.opciones-rejilla { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 1.25rem 1.5rem; margin-top: 1rem; }
+.ancho-completo { grid-column: 1 / -1; }
+fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+legend { font-weight: 600; font-size: 0.95rem; margin-bottom: 0.5rem; padding: 0; }
+
+.segmentado { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--control); border-radius: var(--r-control); overflow: hidden; }
+.segmentado label { position: relative; cursor: pointer; }
+.segmentado input { position: absolute; opacity: 0; inset: 0; cursor: pointer; }
+.segmentado span { display: block; padding: 0.4rem 1rem; font-weight: 500; border-right: 1px solid var(--linea); }
+.segmentado label:last-child span { border-right: 0; }
+.segmentado input:checked + span { background: var(--grafito); color: var(--ficha); }
+.segmentado input:focus-visible + span { outline: 2px solid var(--azul); outline-offset: -2px; }
+
+.interruptor { display: grid; grid-template-columns: auto 1fr; gap: 0.1rem 0.6rem; align-items: center; margin-top: 1rem; cursor: pointer; }
+.interruptor input { width: 1.1rem; height: 1.1rem; margin: 0; accent-color: var(--azul); }
+.interruptor span { font-weight: 500; }
+.interruptor small { grid-column: 2; color: var(--grafito-2); max-width: 78ch; }
+
+.formulario label { display: grid; gap: 0.3rem; font-weight: 500; font-size: 0.95rem; }
+.campo-fila { display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: flex-end; margin-top: 0.75rem; }
+.campo-fila > label { flex: 1 1 180px; }
+.campo-fila > .crece { flex: 3 1 320px; }
+.campo-fila > .boton { flex: 0 0 auto; }
+.con-sufijo { display: flex; align-items: center; gap: 0.4rem; }
+.con-sufijo span { color: var(--grafito-2); }
+
+.opciones-tarjeta { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 0.6rem; }
+.opcion, .formulario .opcion { display: flex; gap: 0.6rem; align-items: flex-start; padding: 0.75rem; border: 1px solid var(--linea); border-radius: var(--r-control); cursor: pointer; }
+.opcion:has(input:checked) { border-color: var(--azul); box-shadow: inset 3px 0 0 var(--azul); }
+.opcion input { margin-top: 0.25rem; accent-color: var(--azul); }
+.opcion small { display: block; color: var(--grafito-2); font-weight: 400; margin-top: 0.2rem; }
+
+/* ---------- Carga (HTMX) ---------- */
+
+.cargando { display: none; align-items: center; gap: 0.6rem; color: var(--grafito-2); margin: 0.5rem 0 1rem; }
+.cargando.htmx-request { display: flex; }
+.girador { width: 16px; height: 16px; border: 2px solid var(--linea); border-top-color: var(--azul); border-radius: 50%; animation: girar 0.8s linear infinite; }
+@keyframes girar { to { transform: rotate(360deg); } }
+#resultados.htmx-swapping { opacity: 0.4; transition: opacity 0.15s; }
+
+/* ---------- Resumen de la búsqueda: una fila de cifras ---------- */
+
+.resumen { display: flex; flex-wrap: wrap; align-items: stretch; padding: 0; }
+.resumen-dato { display: grid; align-content: center; padding: 0.7rem 1.25rem; box-shadow: 1px 0 0 var(--linea); }
+.resumen-dato:last-child { border-right: 0; margin-left: auto; }
+.resumen-dato strong { font: 600 1.3rem/1.2 var(--letra-tecnica); }
+.resumen-dato > span { color: var(--grafito-2); font-size: 0.85rem; }
+.resumen-dato .ayuda-en-linea { font-size: 0.8rem; }
+
+/* ---------- Progreso por tienda ---------- */
+
+.progreso-lista { list-style: none; margin: 0.75rem 0 0; padding: 0; display: grid; gap: 0.6rem; }
+.progreso-lista > li { display: grid; grid-template-columns: 200px 1fr; gap: 0.75rem; align-items: start; padding-top: 0.6rem; border-top: 1px solid var(--linea); }
+.progreso-tienda { font-weight: 600; font-size: 0.95rem; overflow-wrap: anywhere; }
+.pasos { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.paso { display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.1rem 0.5rem; border-radius: var(--r-insignia); font-size: 0.85rem; background: var(--ficha-2); }
+/* El estado de cada paso se marca con una muesca de color; el texto del paso y su `title` lo dicen. */
+.paso-icono { width: 0.5rem; height: 0.5rem; flex: none; border-radius: 1px; background: var(--grafito-2); }
+.paso-detalle { color: var(--grafito-2); }
+.paso-ok .paso-icono { background: var(--ok); }
+.paso-ia { background: var(--ia-suave); }
+.paso-ia .paso-icono { background: var(--ia); }
+.paso-aviso { background: var(--aviso-suave); }
+.paso-aviso .paso-icono { background: var(--aviso); }
+.paso-error { background: var(--error-suave); }
+.paso-error .paso-icono { background: var(--error); }
+.paso-error .paso-detalle { color: var(--error); }
+.paso-omitido { background: transparent; box-shadow: inset 0 0 0 1px var(--linea-fuerte); }
+.paso-omitido .paso-icono { background: transparent; box-shadow: inset 0 0 0 1px var(--grafito-2); }
+
+/* ---------- Producto: ficha con banda de cabecera ---------- */
+
+.grupo { padding: 0; overflow: hidden; }
+.grupo-cabecera {
+  display: flex; justify-content: space-between; align-items: center; gap: 1rem 1.5rem; flex-wrap: wrap;
+  padding: 1rem 1.25rem; background: var(--ficha-2); border-bottom: 1px solid var(--linea);
+}
+.grupo-cabecera h2 { font-size: 1.25rem; margin-bottom: 0.4rem; }
+.grupo-meta { display: flex; gap: 0.4rem 0.75rem; align-items: center; flex-wrap: wrap; margin: 0; }
+.criterio { color: var(--grafito-2); font-size: 0.875rem; }
+.grupo .tabla-contenedor { margin: 0; padding: 0 0.5rem; }
+.grupo-pie { padding: 0.75rem 1.25rem; border-top: 1px solid var(--linea); }
+
+/* La etiqueta del mejor precio: amarilla, con el taladro del cordel. Es el único elemento llamativo. */
+.mejor {
+  position: relative; display: grid; justify-items: start; gap: 0.1rem;
+  min-width: 11rem; padding: 0.55rem 1rem 0.6rem 2.1rem;
+  background: var(--amarillo); color: var(--sobre-amarillo);
+  border-radius: var(--r-panel);
+  clip-path: polygon(0.9rem 0, 100% 0, 100% 100%, 0.9rem 100%, 0 calc(100% - 0.9rem), 0 0.9rem);
+}
+.mejor::before {
+  content: ""; position: absolute; left: 0.75rem; top: 50%;
+  width: 0.6rem; height: 0.6rem; margin-top: -0.3rem; border-radius: 50%;
+  background: var(--ficha-2); box-shadow: inset 0 0 0 1.5px rgb(30 35 40 / 55%);
+}
+.cabecera .mejor::before { background: var(--chapa); }
+.mejor-etiqueta { font-size: 0.85rem; font-weight: 600; }
+.mejor-precio { font: 700 1.85rem/1.1 var(--letra-tecnica); letter-spacing: 0.01em; }
+.mejor-tienda { font-size: 0.875rem; }
+.mejor .insignia { background: var(--sobre-amarillo); color: var(--amarillo); margin-top: 0.2rem; }
+
+/* ---------- Tablas ---------- */
+
+.tabla-contenedor { overflow-x: auto; }
+.tabla { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
+.tabla th {
+  text-align: left; font-size: 0.85rem; font-weight: 600; color: var(--grafito-2);
+  padding: 0.6rem 0.65rem 0.45rem; border-bottom: 1px solid var(--linea-fuerte); white-space: nowrap;
+}
+.tabla td { padding: 0.55rem 0.65rem; border-bottom: 1px solid var(--linea); vertical-align: middle; }
+.tabla tbody tr:last-child td { border-bottom: 0; }
+.tabla .num { text-align: right; white-space: nowrap; }
+.tabla-compacta td { padding: 0.35rem 0.65rem; }
+.tabla-compacta td:first-child, .tabla-compacta th:first-child { width: 9rem; }
+.celda-tienda { font-weight: 600; white-space: nowrap; }
+.precio { font: 600 1.1rem var(--letra-tecnica); }
+.fila-mejor td { background: color-mix(in srgb, var(--amarillo) 16%, var(--ficha)); }
+.fila-mejor td:first-child { box-shadow: inset 4px 0 0 var(--amarillo); }
+.fila-mejor .precio { font-weight: 700; }
+.fila-cambio td { background: var(--ia-suave); }
+.fila-vacia td { color: var(--grafito-2); }
+.no-anclado { color: var(--error); }
+
+/* Foto principal del artículo, enlazada desde la tienda. `font-size: 0` evita que el `alt` de una
+   imagen rota (antihotlinking) deforme la caja; el lector de pantalla lo sigue leyendo. */
+.producto-con-foto { display: flex; gap: 0.75rem; align-items: center; }
+.foto-miniatura, .foto-grupo { flex: none; object-fit: contain; background: #ffffff; border: 1px solid var(--linea); border-radius: var(--r-control); font-size: 0; }
+.foto-vacia { background: var(--ficha-2); border-style: dashed; }
+.foto-miniatura { width: 64px; height: 64px; }
+.foto-grupo { width: 96px; height: 96px; }
+
+.descartados summary { color: var(--grafito); }
+.descartados ul { margin: 0.75rem 0 0; padding-left: 1.25rem; }
+.descartados li { margin-bottom: 0.35rem; }
+.descartados em { font-style: normal; color: var(--grafito-2); }
+
+/* En móvil, cada oferta de la tabla de resultados se lee como una ficha. */
+@media (max-width: 640px) {
+  .tabla-apilable thead { display: none; }
+  .tabla-apilable, .tabla-apilable tbody, .tabla-apilable tr, .tabla-apilable td { display: block; width: 100%; }
+  .tabla-apilable tr { border-bottom: 1px solid var(--linea); padding: 0.65rem 0.25rem; }
+  .tabla-apilable tr:last-child { border-bottom: 0; }
+  .tabla-apilable td, .tabla-apilable td.num { border: 0; padding: 0.15rem 0.4rem; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.25rem 0.5rem; text-align: left; white-space: normal; }
+  .tabla-apilable td::before { content: attr(data-etiqueta); flex: 0 0 7rem; color: var(--grafito-2); font-size: 0.85rem; }
+  .tabla-apilable .celda-tienda::before, .tabla-apilable .celda-producto::before { content: none; }
+  .tabla-apilable .celda-producto { padding-bottom: 0.3rem; }
+  .tabla-apilable .producto-con-foto { width: 100%; }
+  .tabla-apilable .fila-mejor td:first-child { box-shadow: none; }
+  .tabla-apilable .fila-mejor { box-shadow: inset 4px 0 0 var(--amarillo); background: color-mix(in srgb, var(--amarillo) 16%, var(--ficha)); }
+}
+
+/* ---------- Tiendas ---------- */
+
+.rejilla-tiendas { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 290px), 1fr)); gap: 1rem; margin-bottom: 1rem; }
+.rejilla-tiendas .tarjeta { margin: 0; }
+.tienda header { display: flex; justify-content: space-between; align-items: flex-start; gap: 0.5rem; }
+.tienda h2 { margin: 0; }
+.datos { display: grid; gap: 0.35rem; margin: 0.75rem 0 0; }
+.datos div { display: grid; grid-template-columns: 9.5rem 1fr; gap: 0.5rem; }
+.datos dt { color: var(--grafito-2); font-size: 0.875rem; }
+.datos dd { margin: 0; font-size: 0.95rem; overflow-wrap: anywhere; }
+.datos-fila { grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr)); gap: 0.75rem 1.25rem; margin: 0 0 0.75rem; }
+.datos-fila div { grid-template-columns: 1fr; gap: 0; align-content: start; }
+
+.linea-tiempo { list-style: none; margin: 0; padding: 0; }
+.version header { display: flex; flex-wrap: wrap; gap: 0.5rem 0.9rem; align-items: center; margin-bottom: 0.5rem; }
+.version h3 { margin: 0; font-size: 1.2rem; }
+
+/* ---------- Producto: gráfica ---------- */
+
+.figura-grafica { margin: 0; }
+.grafica { width: 100%; height: auto; display: block; }
+.grafica .rejilla { stroke: var(--linea); stroke-width: 1; }
+.grafica .eje { fill: var(--grafito-2); font-size: 12px; font-family: var(--letra-tecnica); }
+.grafica .grafica-vacia { fill: var(--grafito-2); font-size: 14px; }
+.grafica .serie { fill: none; stroke-width: 2.25; stroke-linejoin: round; stroke-linecap: round; }
+.serie-0 { stroke: var(--s0); fill: var(--s0); background: var(--s0); }
+.serie-1 { stroke: var(--s1); fill: var(--s1); background: var(--s1); }
+.serie-2 { stroke: var(--s2); fill: var(--s2); background: var(--s2); }
+.serie-3 { stroke: var(--s3); fill: var(--s3); background: var(--s3); }
+.serie-4 { stroke: var(--s4); fill: var(--s4); background: var(--s4); }
+.serie-5 { stroke: var(--s5); fill: var(--s5); background: var(--s5); }
+.grafica polyline.serie, .muestra .serie { fill: none; }
+.serie.serie-1 { stroke-dasharray: 8 4; }
+.serie.serie-2 { stroke-dasharray: 2 3; }
+.serie.serie-3 { stroke-dasharray: 10 3 2 3; }
+.serie.serie-4 { stroke-dasharray: 4 4; }
+.serie.serie-5 { stroke-dasharray: 1 5; }
+.leyenda { list-style: none; display: flex; flex-wrap: wrap; gap: 0.4rem 1.5rem; padding: 0; margin: 0.75rem 0 0; font-size: 0.9rem; }
+.leyenda li { display: flex; align-items: center; gap: 0.45rem; }
+.muestra { width: 28px; height: 8px; flex: none; }
+.muestra .serie { stroke-width: 2.5; stroke-linecap: round; }
+
+.lista-alertas { list-style: none; margin: 0.75rem 0 0; padding: 0; display: grid; }
+.lista-alertas li { display: flex; flex-wrap: wrap; gap: 0.25rem 0.75rem; align-items: center; padding: 0.6rem 0; border-top: 1px solid var(--linea); }
+.lista-alertas strong { font: 600 1.05rem var(--letra-tecnica); }
+
+/* ---------- Registro de IA ---------- */
+
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr)); margin-bottom: 1rem; background: var(--ficha); border: 1px solid var(--linea); border-radius: var(--r-panel); }
+.kpis .tarjeta { margin: 0; border: 0; border-radius: 0; box-shadow: inset -1px 0 0 var(--linea); background: transparent; }
+.kpi { display: grid; gap: 0.2rem; align-content: start; }
+.kpi > span { color: var(--grafito-2); font-size: 0.875rem; }
+.kpi strong { font: 600 1.6rem/1.2 var(--letra-tecnica); }
+progress, meter { width: 100%; height: 0.5rem; accent-color: var(--azul); }
+.barras { list-style: none; padding: 0; margin: 0; display: grid; gap: 0.5rem; }
+.barras li { display: grid; grid-template-columns: minmax(140px, 240px) 1fr 2.5rem; gap: 0.75rem; align-items: center; font-size: 0.95rem; }
+.barras strong { text-align: right; font-family: var(--letra-tecnica); }
+.resultado-ia { display: inline-block; width: 0.5rem; height: 0.5rem; margin-right: 0.35rem; border-radius: 1px; vertical-align: middle; }
+.resultado-ok { background: var(--ok); }
+.resultado-aviso { background: var(--aviso); }
+
+/* ---------- Búsqueda en segundo plano (C1) ---------- */
+
+.busqueda-cabecera { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 0.75rem 1.5rem; }
+.busqueda-estado { margin: 0; font-weight: 600; flex-basis: 100%; }
+.estado-tiendas { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.35rem; flex: 1 1 18rem; }
+.estado-tiendas li { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+.estado-tienda-nombre { min-width: 0; overflow-wrap: anywhere; }
+.estado-tienda-detalle { flex-basis: 100%; font-size: 0.875rem; overflow-wrap: anywhere; }
+.busqueda-acciones { display: flex; gap: 0.5rem; align-items: flex-start; }
+.estado-en_cola, .estado-cancelada { background: var(--ficha-2); color: var(--grafito-2); }
+.estado-descargando, .estado-configurando { background: var(--azul-suave); color: var(--azul); }
+.estado-hecha { background: var(--ok-suave); color: var(--ok); }
+.estado-en_espera, .estado-plazo { background: var(--aviso-suave); color: var(--aviso); }
+.estado-bloqueada { background: var(--error-suave); color: var(--error); }
+
+/* ---------- Pantallas estrechas ---------- */
+
+@media (max-width: 640px) {
+  h1 { font-size: 1.5rem; }
+  .buscador { padding: 1rem; }
+  .buscador-fila { flex-direction: column; }
+  .progreso-lista > li { grid-template-columns: 1fr; gap: 0.3rem; }
+  .barras li { grid-template-columns: 1fr 2.5rem; }
+  .barras meter { grid-column: 1 / -1; grid-row: 2; }
+  .datos div { grid-template-columns: 1fr; gap: 0; }
+  .grupo-cabecera, .grupo-pie { padding-inline: 1rem; }
+  .mejor { width: 100%; }
+  .resumen-dato { padding: 0.55rem 0.9rem; }
+  .resumen-dato:last-child { margin-left: 0; }
+  .foto-grupo { width: 72px; height: 72px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+
+@media (forced-colors: active) {
+  .mejor { border: 2px solid CanvasText; clip-path: none; }
+  .paso-icono, .resultado-ia { border: 1px solid CanvasText; }
+}

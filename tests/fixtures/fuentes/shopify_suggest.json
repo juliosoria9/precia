@@ -1,0 +1,87 @@
+{
+  "resources": {
+    "results": {
+      "products": [
+        {
+          "available": true,
+          "body": "<p>Faro delantero izquierdo <b>usado</b> para VW Golf VI. Ref. original 5K1941005.</p>",
+          "compare_at_price_max": "0.00",
+          "compare_at_price_min": "0.00",
+          "compare_at_price_varies": false,
+          "handle": "faro-delantero-izquierdo-vw-golf-vi",
+          "id": 7712345678901,
+          "image": "https://cdn.shopify.com/s/files/1/0612/3456/7890/files/faro-golf.jpg?v=1712345678",
+          "price": "89.90",
+          "price_max": "89.90",
+          "price_min": "89.90",
+          "price_varies": false,
+          "tags": ["Golf VI", "Iluminación", "Usado"],
+          "title": "Faro delantero izquierdo VW Golf VI",
+          "type": "Faros",
+          "url": "/products/faro-delantero-izquierdo-vw-golf-vi?_pos=1&_sid=3f2a1b9c0&_ss=r",
+          "variants": [
+            {
+              "available": true,
+              "compare_at_price": null,
+              "featured_image": null,
+              "id": 42345678901234,
+              "image": null,
+              "price": "89.90",
+              "title": "Default Title",
+              "url": "/products/faro-delantero-izquierdo-vw-golf-vi?_pos=1&_sid=3f2a1b9c0&_ss=r&variant=42345678901234"
+            }
+          ],
+          "vendor": "Hella",
+          "featured_image": {
+            "alt": "Faro delantero izquierdo VW Golf VI",
+            "aspect_ratio": 1.0,
+            "height": 1000,
+            "url": "https://cdn.shopify.com/s/files/1/0612/3456/7890/files/faro-golf.jpg?v=1712345678",
+            "width": 1000
+          }
+        },
+        {
+          "available": false,
+          "body": "",
+          "compare_at_price_max": "0.00",
+          "compare_at_price_min": "0.00",
+          "compare_at_price_varies": false,
+          "handle": "faro-delantero-derecho-vw-golf-vi",
+          "id": 7712345678902,
+          "image": null,
+          "price": "95.00",
+          "price_max": "95.00",
+          "price_min": "95.00",
+          "price_varies": false,
+          "tags": [],
+          "title": "Faro delantero derecho VW Golf VI",
+          "type": "Faros",
+          "url": "/products/faro-delantero-derecho-vw-golf-vi?_pos=2&_sid=3f2a1b9c0&_ss=r",
+          "variants": [],
+          "vendor": "Recambios Rápidos",
+          "featured_image": {"alt": null, "aspect_ratio": null, "height": null, "url": null, "width": null}
+        },
+        {
+          "available": true,
+          "body": "<p>Enlace a un partner.</p>",
+          "handle": "externo",
+          "id": 7712345678903,
+          "image": null,
+          "price": "10.00",
+          "tags": [],
+          "title": "Producto de otra tienda",
+          "type": "",
+          "url": "https://otra-tienda.example/products/externo",
+          "variants": [],
+          "vendor": "Otra"
+        }
+      ],
+      "collections": [],
+      "pages": [],
+      "queries": [
+        {"styled_text": "<mark>faro</mark> golf", "text": "faro golf", "url": "/search?_pos=1&_sid=3f2a1b9c0&_ss=r&q=faro+golf"}
+      ],
+      "articles": []
+    }
+  }
+}

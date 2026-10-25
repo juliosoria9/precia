@@ -1,0 +1,6 @@
+# Sitemaps
+Sitemap: https://www.elcorteingles.es/sgfm/statics-front/front-msh3-eci-es/contents/sitemap-variants/sitemap.xml.gz
+Sitemap: https://www.elcorteingles.es/sgfm/SGFM/contents/sitemaps/empresas/sitemap-index-division-empresas.xml
+Sitemap: https://www.elcorteingles.es/entradas/sitemaps/sitemap.xml
+Sitemap: https://www.elcorteingles.es/contenidos/sitemap-index.xml
+Sitemap: https://www.elcorteingles.es/sicor/sitemap_index.xml

@@ -1,0 +1,7 @@
+{#- B5: cómo coincide una oferta con la referencia OEM buscada. Lo usan los resultados y la ficha del producto. -#}
+{%- macro coincidencia(o) -%}
+  {%- if o.coincidencia.value == "revision" -%}<span class="insignia insignia-aviso" title="La referencia de la ficha es la buscada con un sufijo de revisión: puede no ser intercambiable">revisión</span>
+  {%- elif o.coincidencia.value == "equivalente" -%}<span class="insignia insignia-aviso" title="La ficha cita la referencia buscada entre sus equivalencias; su referencia principal es otra. Compruébalo antes de comprar">equivalente</span>
+  {%- else -%}<span class="insignia insignia-ok" title="La ficha lleva la referencia buscada">exacta</span>
+  {%- endif -%}
+{%- endmacro -%}

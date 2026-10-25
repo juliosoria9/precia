@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{% block titulo %}{% if consulta %}{{ consulta.texto }}{% else %}Buscar{% endif %}{% endblock %}
+{#- C1: sin JavaScript no hay sondeo; la página de una búsqueda en curso se recarga sola. -#}
+{% block cabeza %}{% if tarea and tarea.activa %}<noscript><meta http-equiv="refresh" content="2"></noscript>{% endif %}{% endblock %}
+{% block contenido %}
+{% set c = consulta %}
+<section class="cabecera">
+  <h1>Buscar y comparar</h1>
+  <p class="sub">Escribe una referencia OEM o el nombre de la pieza. PrecIA la busca en tus tiendas y ordena las ofertas por precio.</p>
+</section>
+
+<form class="buscador tarjeta" action="/buscar" method="get"
+      hx-get="/buscar" hx-target="#resultados" hx-push-url="true" hx-indicator="#cargando">
+  <div class="buscador-fila">
+    <label class="oculto" for="texto">Producto o referencia OEM</label>
+    <input id="texto" name="texto" type="search" required maxlength="200" autocomplete="off"
+           placeholder="1K0698151 o pastillas de freno delanteras"
+           value="{{ c.texto if c else '' }}">
+    <button class="boton boton-primario" type="submit">Buscar</button>
+  </div>
+  {% if not tiendas %}
+  <p class="mensaje mensaje-aviso">Todavía no hay tiendas en las que buscar. <a href="/tiendas">Añade una tienda</a> y PrecIA preparará su perfil en la primera búsqueda.</p>
+  {% elif es_demo %}
+  <p class="ejemplos">Ejemplos:
+    {% for ejemplo in ["1K0698151", "pastillas freno", "disco freno", "filtro aceite", "escobillas"] %}
+    {#- Enlace normal (sin HTMX) para que el cuadro de búsqueda también muestre el ejemplo. -#}
+    <a class="chip-enlace" href="/buscar?texto={{ ejemplo | urlencode }}">{{ ejemplo }}</a>
+    {% endfor %}
+  </p>
+  {% endif %}
+
+  <details class="opciones"{% if c %} open{% endif %}>
+    <summary>Opciones de búsqueda</summary>
+    <div class="opciones-rejilla">
+      <fieldset>
+        <legend>Modo</legend>
+        <div class="segmentado">
+          {% for valor, nombre, ayuda in [("clasico", "Clásico", "Sin IA: JSON-LD y selectores. Coste 0."), ("auto", "Auto", "IA solo cuando falla la vía clásica."), ("ia", "IA", "IA para reparar, extraer y filtrar.")] %}
+          <label title="{{ ayuda }}">
+            <input type="radio" name="modo" value="{{ valor }}"{% if (c and c.modo.value == valor) or (not c and valor == "auto") %} checked{% endif %}>
+            <span>{{ nombre }}</span>
+          </label>
+          {% endfor %}
+        </div>
+        <p class="ayuda">Clásico no usa IA y no cuesta nada. Auto usa la IA solo cuando falla la vía clásica. IA la usa para reparar perfiles, extraer datos y filtrar.</p>
+      </fieldset>
+
+      <fieldset>
+        <legend>Campos que quieres</legend>
+        <div class="chips">
+          {% for campo in CAMPOS %}
+          <label class="chip">
+            <input type="checkbox" name="campos" value="{{ campo.clave }}"{% if (c and campo.clave in c.campos) or (not c and campo.clave in ("precio", "referencia_oem", "marca", "estado")) %} checked{% endif %}>
+            <span>{{ campo.etiqueta }}</span>
+          </label>
+          {% endfor %}
+        </div>
+      </fieldset>
+
+      <fieldset class="ancho-completo">
+        <legend>Tiendas <span class="ayuda-en-linea">(si no marcas ninguna, se busca en todas)</span></legend>
+        <div class="chips">
+          {% for t in tiendas %}
+          <label class="chip{% if not t.robots_permite %} chip-aviso{% endif %}">
+            <input type="checkbox" name="tiendas" value="{{ t.dominio }}"{% if c and t.dominio in c.tiendas %} checked{% endif %}>
+            <span>{{ t.nombre }}{% if not t.robots_permite %} · robots.txt lo prohíbe · se ignora{% endif %}</span>
+          </label>
+          {% endfor %}
+        </div>
+        <label class="interruptor">
+          <input type="checkbox" name="descubrir" value="on"{% if not google_activado %} disabled{% elif c and c.descubrir %} checked{% endif %}>
+          <span>Descubrir más tiendas con Google</span>
+          {% if google_activado %}
+          <small>Se para ante cualquier CAPTCHA y no evade protecciones.</small>
+          {% else %}
+          <small>Desactivado (ADR-006). Puedes activarlo en <a href="/ajustes">Ajustes</a>.</small>
+          {% endif %}
+        </label>
+      </fieldset>
+
+      <fieldset class="ancho-completo">
+        <legend><label for="filtro">Filtro en lenguaje natural <span class="ayuda-en-linea">(usa la IA: solo en modo Auto o IA)</span></label></legend>
+        <input id="filtro" name="filtro" type="text" maxlength="300" autocomplete="off"
+               placeholder="Solo piezas nuevas, sin kits"
+               value="{{ c.filtro if c else '' }}">
+      </fieldset>
+    </div>
+  </details>
+</form>
+
+<div id="cargando" class="cargando" role="status" aria-live="polite">
+  <span class="girador" aria-hidden="true"></span> Buscando en las tiendas…
+</div>
+
+<p id="anuncio" class="oculto" role="status" aria-live="polite"></p>
+<section id="resultados">
+  {% if tarea or perdida %}{% include "_busqueda.html" %}{% elif resultado or error %}{% include "_resultados.html" %}{% endif %}
+</section>
+{% endblock %}

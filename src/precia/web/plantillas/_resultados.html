@@ -1,0 +1,207 @@
+{%- macro origen(valor) -%}
+  {%- if valor.origen.value == "ia" -%}<span class="origen origen-ia" title="Extraído por el extractor de respaldo con IA">IA</span>
+  {%- elif valor.origen.value == "jsonld" -%}<span class="origen origen-jsonld" title="Datos estructurados schema.org/Product">JSON-LD</span>
+  {%- elif valor.origen.value == "metadatos" -%}<span class="origen origen-jsonld" title="Metadatos de la página (OpenGraph o microdatos)">Metadatos</span>
+  {%- elif valor.origen.value == "api" -%}<span class="origen origen-jsonld" title="API pública de la plataforma de la tienda">API tienda</span>
+  {%- else -%}<span class="origen origen-perfil" title="Selectores del perfil de la tienda">Perfil</span>
+  {%- endif -%}
+{%- endmacro -%}
+
+{%- from "_coincidencia.html" import coincidencia -%}
+{%- from "_foto.html" import foto -%}
+
+{%- set aviso_anclaje = "Descartado: el valor no aparece literalmente en la página (posible prompt injection)" -%}
+
+{% if error %}
+<div class="mensaje mensaje-error" role="alert">{{ error }}</div>
+{% elif resultado %}
+{% set r = resultado %}
+{#- C1: un parcial de una búsqueda en curso (o de una cancelada): sin el emparejado final ni el
+    histórico, que solo se hacen al terminar. -#}
+{#- A1: el parcial llega con cada ficha leída y aún no ha pasado la revisión con IA, que se hace
+    una vez al final. Las ofertas que esta descarte no se borran sin más: pasan a «Descartados»
+    con su motivo y el final dice cuántas de las que se veían ha retirado. -#}
+{% if r.provisional and tarea and not tarea.activa %}
+<p class="mensaje mensaje-aviso">Búsqueda sin terminar: se enseñan las ofertas leídas hasta entonces, sin revisar, sin el emparejado final y sin guardar nada en el histórico.</p>
+{% elif r.provisional %}
+<p class="mensaje mensaje-aviso">Resultados provisionales, sin revisar: faltan tiendas o fichas. La revisión, el emparejado final y el histórico llegan al terminar; si la revisión descarta alguna oferta, pasará a «Descartados» con su motivo.</p>
+{% elif tarea and tarea.retiradas %}
+{%- set n = tarea.retiradas %}
+<p class="mensaje mensaje-aviso">La revisión ha retirado {{ n }} {{ "oferta que se veía" if n == 1 else "ofertas que se veían" }} en los resultados provisionales: {{ "está" if n == 1 else "están" }} en <a href="#descartados-{{ "ia" if r.descartados | selectattr("origen", "equalto", "ia") | first else "regla" }}">«Descartados»</a>, con el motivo.</p>
+{% endif %}
+<div class="resumen tarjeta">
+  <div class="resumen-dato"><strong>{{ r.grupos | length }}</strong><span>productos</span></div>
+  <div class="resumen-dato"><strong>{{ r.grupos | map(attribute="ofertas") | map("length") | sum }}</strong><span>ofertas</span>
+    {%- set por_ia = r.descartados | selectattr("origen", "equalto", "ia") | list %}
+    {%- if por_ia and not r.provisional %} <a class="tenue" href="#descartados-ia">{{ por_ia | length }} {{ "descartada" if por_ia | length == 1 else "descartadas" }} por la IA</a>{% endif %}</div>
+  <div class="resumen-dato"><strong>{{ r.duracion_s | decimal }} s</strong><span>tiempo</span></div>
+  <div class="resumen-dato"><strong>{{ r.llamadas_ia }}</strong><span>llamadas a la IA</span>
+    {%- if r.llamadas_por_componente or r.ia_desde_cache %}
+    <span class="ayuda-en-linea">
+      {%- for c, n in r.llamadas_por_componente | dictsort %}{{ c }} {{ n }}{% if not loop.last %} · {% endif %}{% endfor %}
+      {%- if r.ia_desde_cache %}{% if r.llamadas_por_componente %} · {% endif %}{{ r.ia_desde_cache }} desde la caché{% endif -%}
+    </span>
+    {%- endif %}</div>
+  <div class="resumen-dato"><strong>{{ r.coste_ia_usd | dolares }}</strong><span>coste de IA</span></div>
+  <div class="resumen-dato"><span class="insignia insignia-modo">Modo {{ {"clasico": "clásico", "auto": "auto", "ia": "IA"}[r.consulta.modo.value] }}</span></div>
+</div>
+
+{#- Los desplegables solo en el resultado final: el sondeo los cerraría al repintar. -#}
+{% if not r.provisional %}
+<details class="progreso tarjeta">
+  <summary>Qué ha hecho en cada tienda <span class="ayuda-en-linea">({{ r.progreso | length }})</span></summary>
+  <ul class="progreso-lista">
+    {% for t in r.progreso %}
+    <li>
+      <span class="progreso-tienda">{{ t.tienda }}</span>
+      <ol class="pasos">
+        {% for p in t.pasos %}
+        <li class="paso paso-{{ p.estado.value }}" title="{{ p.detalle }}">
+          <span class="paso-icono" aria-hidden="true"></span>
+          <span class="paso-nombre">{{ p.nombre }}</span>
+          <span class="paso-detalle">{{ p.detalle }}</span>
+        </li>
+        {% endfor %}
+      </ol>
+    </li>
+    {% endfor %}
+  </ul>
+</details>
+{% endif %}
+
+{% if es_htmx and not r.provisional %}
+{#- Anuncio corto para lectores de pantalla (la región viva está fuera de #resultados). -#}
+<p id="anuncio" hx-swap-oob="innerHTML">{{ r.grupos | length }} productos y {{ r.grupos | map(attribute="ofertas") | map("length") | sum }} ofertas para «{{ r.consulta.texto }}»</p>
+{% endif %}
+
+{% for t in r.progreso %}{% for p in t.pasos if p.nombre == "descubrir" %}
+<p class="mensaje mensaje-aviso">Google: {{ p.detalle }}. Solo se ha buscado en las tiendas elegidas.</p>
+{% endfor %}{% endfor %}
+
+{#- A1: las tiendas saltadas porque su configuración falló hace poco, a la vista y no en el desplegable. -#}
+{% for t in r.progreso %}{% for p in t.pasos if p.nombre == "en espera" %}
+<p class="mensaje mensaje-aviso">{{ p.detalle }}. <a href="/tiendas">Ver tiendas</a></p>
+{% endfor %}{% endfor %}
+
+{#- Sin IA (no hay clave o ha fallado) el filtro no se aplica, aunque el modo sea Auto o IA. -#}
+{% set filtro = namespace(sin_ia="") %}
+{% for t in r.progreso %}{% for p in t.pasos if p.nombre == "filtro" %}{% set filtro.sin_ia = p.detalle %}{% endfor %}{% endfor %}
+{% if r.consulta.filtro and filtro.sin_ia %}
+<p class="mensaje mensaje-aviso">{{ filtro.sin_ia }}: «{{ r.consulta.filtro }}».</p>
+{% elif r.consulta.filtro and r.consulta.modo.value != "clasico" %}
+<p class="mensaje">Filtro aplicado con IA: «{{ r.consulta.filtro }}»</p>
+{% elif r.consulta.filtro %}
+<p class="mensaje mensaje-aviso">El filtro en lenguaje natural necesita la IA: en modo clásico no se aplica.</p>
+{% endif %}
+
+{% if not r.grupos and r.provisional %}
+<p class="tenue">Aún no hay ofertas de las tiendas que han terminado.</p>
+{% elif not r.grupos %}
+<div class="vacio tarjeta">
+  <h2>Sin resultados para «{{ r.consulta.texto }}»</h2>
+  {% if r.consulta.texto | con_referencia_oem %}
+  <p>En las tiendas consultadas, ninguna ficha lleva ni cita la referencia (exacta, con un sufijo de revisión o entre sus equivalencias). Comprueba cómo está escrita, prueba con todas las tiendas o busca por el nombre de la pieza.{% if not tiendas %} Todavía no hay tiendas: <a href="/tiendas">añade una</a>.{% endif %}</p>
+  {% else %}
+  <p>Prueba con una referencia OEM{% if es_demo %} (por ejemplo <a href="/buscar?texto=1K0698151">1K0698151</a>){% endif %}, con menos palabras o con todas las tiendas.{% if not tiendas %} Todavía no hay tiendas: <a href="/tiendas">añade una</a>.{% endif %}</p>
+  {% endif %}
+</div>
+{% endif %}
+
+{% set columnas = CAMPOS | selectattr("clave", "in", r.consulta.campos) | rejectattr("clave", "equalto", "precio") | list %}
+{% for g in r.grupos %}
+{% set mejor = g.mejor_oferta %}
+<article class="grupo tarjeta">
+  <header class="grupo-cabecera">
+    <div class="producto-con-foto">
+      {% if g.foto | foto_segura %}{{ foto(g.foto, g.nombre, "foto-grupo", 96) }}{% endif %}
+      <div>
+      <h2>{{ g.nombre }}</h2>
+      <p class="grupo-meta">
+        {% if g.referencia_oem %}<span class="insignia insignia-oem">OEM {{ g.referencia_oem }}</span>{% endif %}
+        <span class="criterio">Emparejado: {{ g.criterio }}</span>
+      </p>
+      </div>
+    </div>
+    {% if mejor %}
+    <div class="mejor">
+      <span class="mejor-etiqueta">Mejor precio</span>
+      <strong class="mejor-precio">{{ mejor.precio | euros }}</strong>
+      <span class="mejor-tienda">en {{ mejor.tienda }}</span>
+      {% if mejor.coincidencia.value != "exacta" %}{{ coincidencia(mejor) }}{% endif %}
+    </div>
+    {% endif %}
+  </header>
+  <div class="tabla-contenedor">
+    <table class="tabla tabla-apilable">
+      <thead>
+        <tr>
+          <th scope="col">Tienda</th>
+          <th scope="col">Producto</th>
+          {% if "precio" in r.consulta.campos %}<th scope="col" class="num">Precio</th>{% endif %}
+          {#- Solo los grupos por referencia OEM distinguen exacta, revisión y equivalente (B5). -#}
+          {% if g.referencia_oem %}<th scope="col">Coincidencia</th>{% endif %}
+          {% for campo in columnas %}<th scope="col">{{ campo.etiqueta }}</th>{% endfor %}
+          <th scope="col">Origen</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for o in g.ofertas | sort(attribute="precio") %}
+        {#- Origen principal de la fila (el del precio); las celdas con otro origen lo indican. -#}
+        {% set principal = o.campos.get("precio") or (o.campos.values() | first if o.campos else none) %}
+        <tr{% if mejor and o == mejor %} class="fila-mejor"{% endif %}>
+          <td class="celda-tienda" data-etiqueta="Tienda">{{ o.tienda }}</td>
+          <td class="celda-producto" data-etiqueta="Producto"><div class="producto-con-foto">{{ foto(o.foto, o.titulo) }}<a href="{{ o.url | url_segura }}" rel="noopener noreferrer nofollow" target="_blank">{{ o.titulo }}</a></div></td>
+          {% if "precio" in r.consulta.campos %}
+          <td class="num" data-etiqueta="Precio">
+            {% if o.precio_anclado %}<span class="precio">{{ o.precio | euros }}</span>
+            {% else %}<del class="no-anclado" title="{{ aviso_anclaje }}">{{ o.precio | euros }}</del> <span class="insignia insignia-error" title="{{ aviso_anclaje }}">no anclado</span>{% endif %}
+          </td>
+          {% endif %}
+          {% if g.referencia_oem %}<td data-etiqueta="Coincidencia">{{ coincidencia(o) }}</td>{% endif %}
+          {% for campo in columnas %}
+          {% set v = o.campos.get(campo.clave) %}
+          <td data-etiqueta="{{ campo.etiqueta }}">
+            {% if v and v.anclado %}{{ v.valor }}{% if principal and v.origen != principal.origen %} {{ origen(v) }}{% endif %}
+            {% elif v %}<del class="no-anclado" title="{{ aviso_anclaje }}">{{ v.valor }}</del> <span class="insignia insignia-error" title="{{ aviso_anclaje }}">no anclado</span>
+            {% else %}<span class="tenue" title="{{ 'Solo se obtiene con la IA' if r.consulta.modo.value == 'clasico' else 'Sin dato' }}">—</span>{% endif %}
+          </td>
+          {% endfor %}
+          <td data-etiqueta="Origen">{% if principal %}{{ origen(principal) }}{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <footer class="grupo-pie">
+    {#- Un precio no anclado nunca entra en el histórico: sin ninguno, el enlace daría un 404. -#}
+    {% if r.provisional %}
+    <span class="tenue">El histórico se guarda cuando termina la búsqueda.</span>
+    {% elif g.ofertas | selectattr("precio_anclado") | first %}
+    <a class="boton boton-secundario" href="/productos/{{ g.id }}">Histórico y alertas</a>
+    {% else %}
+    <span class="tenue">Ningún precio aparece en su página: no se guarda en el histórico.</span>
+    {% endif %}
+  </footer>
+</article>
+{% endfor %}
+
+{#- Revisión de los resultados (nota 05): lo descartado nunca se borra; se enseña plegado y
+    separado por quién lo ha descartado, con su motivo, para que se pueda comprobar. -#}
+{% if r.descartados and not r.provisional %}
+{% set secciones = [
+  ("ia", "Descartados por la IA", r.descartados | selectattr("origen", "equalto", "ia") | list),
+  ("regla", "Descartados por la regla del núcleo (sin IA)", r.descartados | selectattr("origen", "equalto", "regla") | list),
+  ("otros", "Descartados", r.descartados | rejectattr("origen", "in", ["ia", "regla"]) | list),
+] %}
+{% for clase, titulo, lista in secciones if lista %}
+<details class="descartados descartados-{{ clase }} tarjeta" id="descartados-{{ clase }}">
+  <summary>{{ titulo }} <span class="ayuda-en-linea">({{ lista | length }})</span></summary>
+  <ul>
+    {% for d in lista %}
+    <li><span class="tenue">{{ d.tienda }}</span>: {% if d.url %}<a href="{{ d.url | url_segura }}" rel="noopener noreferrer nofollow" target="_blank">{{ d.titulo }}</a>{% else %}{{ d.titulo }}{% endif %}{% if d.precio is not none %}, {{ d.precio | euros }}{% endif %}. <em>{{ d.motivo }}</em></li>
+    {% endfor %}
+  </ul>
+</details>
+{% endfor %}
+{% endif %}
+{% endif %}

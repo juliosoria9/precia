@@ -1,0 +1,2 @@
+# Páginas reales: se guardan byte a byte, como las entregó la web (sin convertir finales de línea).
+tests/fixtures/reales/** -text

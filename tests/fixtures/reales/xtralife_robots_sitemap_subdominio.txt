@@ -1,0 +1,12 @@
+# WEB
+User-agent: *
+Allow: /.js$
+Allow: /.css$
+Disallow: /mi-cuenta/
+Disallow: /catalogo/*
+Disallow: /buscar/*
+Disallow: /delivery*
+Disallow: /invoice*
+
+# SITEMAPS
+Sitemap: https://static.xtralife.com/sitemap.xml

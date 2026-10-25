@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title></title>
+    <style>
+        body { font-family: "Arial"; }
+        #captcha-container { margin: 2em auto; max-width: 30em; }
+    </style>
+    <script>
+        window.awsWafCookieDomainList = [];
+        window.gokuProps = {
+            "key":"AQIDAHjcYu/GjX+QlghicBgQ/7bFaQZ+m5FKCMDnO+vTbNg96AEJEMPLOEJEMPLO==",
+            "iv":"CgAHbVJ1ZXN0RUpFTVBMTw==",
+            "context":"EJEMPLOcontextoCifradoQueNoSeInterpretaNunca=="
+        };
+    </script>
+    <script src="https://a1b2c3d4e5f6.edge.sdk.awswaf.com/a1b2c3d4e5f6/0f1e2d3c4b5a/challenge.js"></script>
+    <script src="https://a1b2c3d4e5f6.edge.captcha-sdk.awswaf.com/a1b2c3d4e5f6/jsapi.js"></script>
+</head>
+<body>
+    <div id="captcha-container"></div>
+    <script>
+    AwsWafIntegration.saveReferrer();
+    window.addEventListener("load", function() {
+        const container = document.querySelector("#captcha-container");
+        CaptchaScript.renderCaptcha(container, async (voucher) => {
+            await ChallengeScript.submitCaptcha(voucher);
+            window.location.reload(true);
+        });
+    });
+    </script>
+    <noscript>
+        <h1>JavaScript is disabled</h1>
+        In order to continue, we need to verify that you're not a robot.
+        This requires JavaScript. Enable JavaScript and then reload the page.
+    </noscript>
+</body>
+</html>

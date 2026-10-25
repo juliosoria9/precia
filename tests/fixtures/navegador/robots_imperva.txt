@@ -1,0 +1,8 @@
+# robots.txt de una tienda detrás de Imperva (Incapsula)
+User-agent: *
+Disallow: /_Incapsula_Resource
+Disallow: /checkout/
+Disallow: /mi-cuenta/
+Disallow: /*?orderby=
+
+Sitemap: https://www.recambios-ejemplo.example/sitemap_index.xml
