@@ -79,6 +79,14 @@ _CENTIMOS_APARTE = re.compile(
 """Exactamente dos cifras entre fronteras de elementos en línea, seguidas de la moneda: los
 céntimos de `228<sup>96</sup>€` (causa R3-A2). Empieza por la marca, que se busca rápido; el
 entero de delante lo mira `_ENTERO_DELANTE`."""
+_SUPERINDICE = "\x01"
+"""Marca interna de `Nodo.texto` al abrir un `<sup>`; como `_FRONTERA`, nunca sale del texto."""
+_CENTIMOS_EN_SUP = re.compile(r"\x01[\s\x00]*(\d{2})([\s\x00]*)(?=[€$£]|(?i:euros?|eur)(?![a-z]))")
+"""Dos cifras al principio de un `<sup>`, con espacios de formato alrededor, y la moneda detrás:
+los céntimos de `<span>\\n 1\\n</span>\\n<sup>\\n 95\\n</sup>€` (Coolmod)."""
+_HUECO = re.compile(r"[\s\x00]*\Z")
+_VENTANA_HUECO = 200
+"""Espacios de formato que se miran como mucho alrededor del entero (la sangría del HTML)."""
 _ENTERO_DELANTE = re.compile(r"(?:\d{1,3}(?:\.\d{3}){1,2}|\d{1,3}(?:,\d{3}){1,2}|\d{1,7})\Z")
 _VENTANA_ENTERO = 12
 """Caracteres que se miran delante de los céntimos (el entero más largo, `123.456.789`, son 11)."""
@@ -156,7 +164,7 @@ class Nodo:
                 if actual == _FRONTERA:
                     if trozos and trozos[-1] != _FRONTERA:
                         trozos.append(_FRONTERA)
-                elif limpio := actual.replace(_FRONTERA, ""):
+                elif limpio := actual.replace(_FRONTERA, "").replace(_SUPERINDICE, ""):
                     trozos.append(limpio)
                 continue
             if invisible(actual) and not (pestanas and pestana_oculta(actual)):
@@ -170,9 +178,13 @@ class Nodo:
             else:
                 if trozos and trozos[-1] != _FRONTERA:
                     trozos.append(_FRONTERA)
+                if actual.etiqueta == "sup":
+                    trozos.append(_SUPERINDICE)
                 pila.append(_FRONTERA)
             pila.extend(reversed(actual.contenido))
         texto = "".join(trozos)
+        if _SUPERINDICE in texto:
+            texto = _centimos_en_superindice(texto).replace(_SUPERINDICE, "")
         if _FRONTERA in texto:
             texto = _centimos_con_coma(texto).replace(_FRONTERA, "")
         return _ESPACIOS.sub(" ", texto).strip()
@@ -188,6 +200,39 @@ class Nodo:
             else:
                 pila.extend(reversed(actual.contenido))
         return "".join(trozos)
+
+
+def _centimos_en_superindice(texto: str) -> str:
+    """`1` + `<sup>95</sup>` + `€` con espacios de formato en medio → `1,95 €`.
+
+    Si hay espacios entre el entero y el `<sup>`, el entero tiene que ir en su propio elemento
+    (con una frontera delante): «Talla 1 <sup>95</sup> €» no es un precio. Sin espacios, decide
+    después `_centimos_con_coma`, como siempre. Lineal: cada coincidencia mira una ventana fija.
+    """
+    partes: list[str] = []
+    hecho = 0
+    for centimos in _CENTIMOS_EN_SUP.finditer(texto):
+        hueco = _HUECO.search(
+            texto, max(hecho, centimos.start() - _VENTANA_HUECO), centimos.start()
+        )
+        fin = hueco.start() if hueco is not None else centimos.start()
+        if not texto[fin : centimos.start()].strip(_FRONTERA):
+            continue  # Sin espacios en medio: lo resuelve `_centimos_con_coma`.
+        entero = _ENTERO_DELANTE.search(texto, max(hecho, fin - _VENTANA_ENTERO), fin)
+        if entero is None:
+            continue
+        desde = max(hecho, entero.start() - _VENTANA_HUECO)
+        delante = texto[desde : entero.start()].rstrip()
+        if not (delante.endswith(_FRONTERA) or (not delante and desde == 0)):
+            continue
+        decimal = "." if "," in entero.group() else ","
+        espacio = " " if centimos.group(2).strip(_FRONTERA) else ""
+        partes += (texto[hecho : entero.end()], decimal, centimos.group(1), espacio)
+        hecho = centimos.end()
+    if not partes:
+        return texto
+    partes.append(texto[hecho:])
+    return "".join(partes)
 
 
 def _centimos_con_coma(texto: str) -> str:

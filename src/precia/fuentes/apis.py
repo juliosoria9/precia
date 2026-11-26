@@ -38,6 +38,7 @@ from urllib.parse import parse_qsl, quote_plus, urlencode, urlsplit, urlunsplit
 
 from precia.emparejado.referencias import es_referencia, normalizar_referencia, referencias_en
 from precia.extraccion.dom import analizar
+from precia.extraccion.estados import ESTADOS, FRASE_ESTADO
 from precia.extraccion.ficha import formatear_precio
 from precia.extraccion.imagenes import primera_foto
 from precia.extraccion.listado import dominio_normalizado, url_de_la_tienda
@@ -150,37 +151,6 @@ _FABRICANTE_PALABRAS = frozenset({"fabricante", "original", "originales", "manuf
 # Parámetros que añade el buscador predictivo de Shopify para sus estadísticas.
 _RASTREO_SHOPIFY = frozenset({"_pos", "_sid", "_ss", "_psq", "_fid", "_v"})
 
-_USADO, _NUEVO, _REACONDICIONADO = "Usado", "Nuevo", "Reacondicionado"
-_ESTADOS: dict[str, str] = {
-    "usado": _USADO,
-    "usada": _USADO,
-    "usados": _USADO,
-    "usadas": _USADO,
-    "segunda mano": _USADO,
-    "de segunda mano": _USADO,
-    "ocasion": _USADO,
-    "de ocasion": _USADO,
-    "como nuevo": _USADO,
-    "como nueva": _USADO,
-    "seminuevo": _USADO,
-    "seminueva": _USADO,
-    "used": _USADO,
-    "nuevo": _NUEVO,
-    "nueva": _NUEVO,
-    "nuevos": _NUEVO,
-    "nuevas": _NUEVO,
-    "new": _NUEVO,
-    "reacondicionado": _REACONDICIONADO,
-    "reacondicionada": _REACONDICIONADO,
-    "reconstruido": _REACONDICIONADO,
-    "reconstruida": _REACONDICIONADO,
-    "remanufacturado": _REACONDICIONADO,
-    "remanufacturada": _REACONDICIONADO,
-    "refurbished": _REACONDICIONADO,
-}
-# Frases literales, de la más larga a la más corta («como nuevo» antes que «nuevo»): sin
-# cuantificadores anidados, el coste es lineal.
-_FRASE_ESTADO = re.compile(r"\b(?:" + "|".join(sorted(_ESTADOS, key=len, reverse=True)) + r")\b")
 _NOMBRES_ESTADO = frozenset({"estado", "condicion", "condition", "estado de la pieza"})
 _NOMBRES_MARCA = frozenset(
     {"marca", "brand", "fabricante", "marca fabricante", "marca del fabricante"}
@@ -725,13 +695,13 @@ def _estado(atributos: list[tuple[str, list[object]]], etiquetas: Iterable[objec
     for valor in _valores(atributos, _NOMBRES_ESTADO):
         if isinstance(valor, str) and len(valor) <= MAX_VALOR_ESTADO:
             encontrados.update(
-                _ESTADOS[m.group()] for m in _FRASE_ESTADO.finditer(_normalizar(valor))
+                ESTADOS[m.group()] for m in FRASE_ESTADO.finditer(_normalizar(valor))
             )
     if not encontrados:
         for etiqueta in etiquetas:
             if not isinstance(etiqueta, str) or len(etiqueta) > MAX_VALOR_ESTADO:
                 continue
-            if (estado := _ESTADOS.get(_normalizar(etiqueta))) is not None:
+            if (estado := ESTADOS.get(_normalizar(etiqueta))) is not None:
                 encontrados.add(estado)
     return encontrados.pop() if len(encontrados) == 1 else None
 

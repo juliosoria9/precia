@@ -71,7 +71,8 @@ def _sintetica(cuerpo: str, **selectores: str) -> FichaExtraida:
 
 def test_el_estado_de_dli_es_la_fila_estado_y_no_la_primera() -> None:
     ficha = _dli(estado=FILAS)
-    assert ficha.campos["estado"].valor == "Estado: Material de segunda mano"
+    # La fila es «Estado: Material de segunda mano»; se guarda con el vocabulario común.
+    assert ficha.campos["estado"].valor == "Usado"
     assert ficha.campos["estado"].origen is OrigenDato.PERFIL
     assert "estado" not in ficha.sin_forma
 
@@ -109,7 +110,8 @@ def test_la_fila_condicion_cuenta_como_estado() -> None:
         "<dl><div class='f'>Color: Negro</div><div class='f'>Condición: Nuevo</div></dl>",
         estado="div.f",
     )
-    assert ficha.campos["estado"].valor == "Condición: Nuevo"
+    # La fila es «Condición: Nuevo»; se guarda con el vocabulario común.
+    assert ficha.campos["estado"].valor == "Nuevo"
 
 
 def test_varios_nodos_sin_etiqueta_se_queda_el_primero_como_antes() -> None:
