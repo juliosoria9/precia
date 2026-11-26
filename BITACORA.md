@@ -30,6 +30,7 @@ Alimenta la memoria §3 («método de validación del código generado»).
 
 | Fecha | Qué hizo mal la IA | Cómo se detectó | Corrección |
 |---|---|---|---|
+| 2026-11-26 | Presentó la medida de DuckDuckGo del 25-11 (una sola muestra, 10 tiendas de 10) como base para integrarlo y dar a la entrega final un avance «contundente» | Al ir a integrarlo, 24 h después, DuckDuckGo pedía un CAPTCHA por todas las vías, también por el proxy residencial | No se integra; la memoria lo cuenta como límite y no como continuación segura |
 | 2026-11-25 | En el borrador de la memoria final escribió «26 decisiones registradas» sin haberlo contado, y dos casos de la tabla de seguridad (correo sin cifrado rechazado, códigos 400 o 403) que no correspondían a ningún test | Al comprobar cada cifra contra el vault y los nombres de los tests antes de generar el PDF | Cifra quitada y las dos filas cambiadas por casos que sí tienen test (cabeceras inyectadas en el correo; CSRF, XSS y `Host` ajeno) |
 | 2026-11-25 | Escribió un `Dockerfile` sobre `python:3.13-slim` sin `libatomic1`, que necesita el Node de Playwright | `docker build` real (exit 127) | `apt-get install libatomic1` antes de `pip install`; imagen construida y contenedor probado |
 | 2026-11-25 | En el banco de evaluación escribió los tests del CLI y de la fuente junto con su implementación, sin verlos antes en rojo (segunda vez en la sesión) | La propia IA, al apuntar el diario | Señalado para la revisión de Julio |
@@ -2052,3 +2053,23 @@ Alimenta la memoria §3 («método de validación del código generado»).
 - **Qué se hizo:** lo redactó la IA en primera persona de Julio a partir de la bitácora, `USO-IA.md` y el vault. **Pendiente de revisión:** la valoración crítica del uso de la IA y el papel de Julio en cada tarea son un borrador. La memoria reconoce que la revisión manual del código no está completa y que el banco solo ha medido el modo sin IA. Bloqueante que queda: el código de S06 sigue sin commit ni push, así que el apartado del repositorio todavía no es cierto.
 - **Lección:** al verificar el borrador hubo que quitar una cifra que la IA había escrito sin respaldo («26 decisiones registradas») y cambiar dos casos de prueba que no correspondían a tests reales.
 - **Para la memoria:** §3 (uso de IA en el desarrollo) · S06
+
+### 2026-11-26 11:06 · ❌ Fallo · DuckDuckGo también bloquea: no hay buscador que sirva para descubrir tiendas
+- **Qué pasó:** al ir a integrar DuckDuckGo (aprobado por Julio el 26-11), su versión HTML pidió un CAPTCHA («Select all squares containing a duck») por GET y por POST, en `html.` y en `lite.`, y también por el proxy residencial; la versión con JavaScript, con Chromium, dio «Unexpected error». Una petición a cada alternativa con la referencia `1K0698151`: Bing devuelve resultados envenenados (letras de canciones), Brave HTTP 429, Mojeek y Startpage páginas de bloqueo.
+- **Causa / contexto:** el día anterior DuckDuckGo había devuelto 10 tiendas válidas de 10 en una sola muestra. Los buscadores detectan el acceso automatizado por el cliente y no solo por la IP (el proxy no cambió nada).
+- **Qué se hizo:** no se integra ni se escribe el ADR; unas 12 peticiones en total. La alternativa limpia sería una API oficial de búsqueda con clave (por ejemplo, la de Brave), que necesitaría una cuenta y un ADR de Julio.
+- **Lección:** una muestra de un día no basta para apoyar una funcionalidad en un servicio que se defiende de los bots; hay que repetir la medida antes de comprometerse.
+- **Para la memoria:** §5 (limitaciones y continuidad) · §3 (errores de la IA) · S06
+
+### 2026-11-26 11:06 · 🔧 Solución · La CI usa una versión de ruff más nueva que la local
+- **Qué pasó:** la PR #2 falló en la CI por SIM102 en `fuentes/sitemap.py`, un fichero sin cambios: la CI instala `ruff` 0.17.6 (`ruff>=0.6` en `pyproject.toml`) y el entorno local tenía 0.17.1.
+- **Qué se hizo:** unir los dos `if` e igualar `ruff` y `mypy` locales a los de la CI; puertas y 5034 tests en verde.
+- **Lección:** con versiones sin fijar, «en local pasa» no garantiza la CI; conviene repetir las puertas con las versiones de la CI antes del push.
+- **Para la memoria:** §2 (pruebas y validación) · S06
+
+### 2026-11-26 11:11 · 📏 Medida · El banco con IA: más campos leídos, algo menos de exactitud
+- **Qué pasó:** 25 fichas guardadas, modos clásico y API (Claude Haiku 5.5). Clásico: cobertura 67 %, exactitud 98 %. API: cobertura 94 %, exactitud 87 %, 0 inventados en los dos, 0,0001 $ y 1,45 s por ficha (23 llamadas, 0,0035 $ en total).
+- **Causa / contexto:** era el dato que le faltaba a la memoria: cuánto aporta la IA. Julio autorizó gastar hasta 0,50 $.
+- **Qué se hizo:** mirar los 8 incorrectos de la IA: 5 son el mismo dato escrito de otra forma (la comparación del banco es estricta) y 3 son errores reales; uno, «95» en lugar de «1,95», pasa el anclaje porque «95» está en la página.
+- **Lección:** la IA conviene como respaldo de los campos que faltan, no como sustituta de lo que se lee sin ella; y el anclaje literal no basta para los números cortos.
+- **Para la memoria:** §2.4 (banco) · §4.4 (riesgos residuales) · S06
