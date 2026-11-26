@@ -284,11 +284,15 @@ def _entradas(
                     return entradas, True
                 loc = lastmod = None
                 vistos.clear()
-        elif profundidad == 1 and en_entrada and nombre not in vistos:
-            if nombre in (nombre_loc, nombre_lastmod):
-                vistos.add(nombre)
-                if not vacio:
-                    campo = _Campo("loc" if nombre == nombre_loc else "lastmod")
+        elif (
+            profundidad == 1
+            and en_entrada
+            and nombre not in vistos
+            and nombre in (nombre_loc, nombre_lastmod)
+        ):
+            vistos.add(nombre)
+            if not vacio:
+                campo = _Campo("loc" if nombre == nombre_loc else "lastmod")
         if not vacio:
             pila.append(nombre)
     return entradas, True  # Se acabó el texto sin cerrar la raíz.
