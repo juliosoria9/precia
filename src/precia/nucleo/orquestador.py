@@ -101,6 +101,7 @@ from precia.almacen.sqlite import (
     Almacen,
     DatoNoValido,
     ErrorAlmacen,
+    TiendaDuplicada,
 )
 from precia.emparejado.agrupador import InformeRevision, agrupar
 from precia.emparejado.nucleo_nominal import pieza_de
@@ -114,6 +115,8 @@ from precia.extraccion.listado import extraer_listado
 from precia.extraccion.tipos import FichaExtraida, ResultadoListado, SelectorNoValido
 from precia.fuentes.apis import AVISO_AGOTADO
 from precia.fuentes.apis import MAX_FICHAS as MAX_FICHAS_API
+from precia.fuentes.descubridor import PASO_FALLO as PASO_GOOGLE
+from precia.fuentes.descubridor import descubrir
 from precia.fuentes.sitemap import (
     MAX_HIJOS_BUSQUEDA,
     es_listado,
@@ -180,6 +183,14 @@ from precia.perfiles.validador import (
 
 MAX_FICHAS = 5
 PLAZO_TIENDA_S = 120.0
+PLAZO_DESCUBRIR_S = 90.0
+"""Lo que puede tardar el descubrimiento con Google (H5): dos páginas de resultados y, como
+mucho, las `fuentes.descubridor.MAX_PAGINAS` páginas descubiertas."""
+GOOGLE = "Google"
+"""Nombre de la entrada del progreso con los pasos del descubrimiento."""
+GOOGLE_DESACTIVADO = (
+    "El descubrimiento con Google está desactivado en Ajustes (ADR-006): no se consulta"
+)
 """Lo que puede tardar una tienda en una búsqueda (C1): luego cuenta con las fichas leídas.
 
 Configurar una tienda nueva con la consulta genérica (A1) tiene su propio plazo, y si sale bien
@@ -516,6 +527,8 @@ class Orquestador:
         plazo_tienda_s: float = PLAZO_TIENDA_S,
         revisar_resultados: bool = False,
         turnos_perfil: TurnosDePerfil | None = None,
+        google_activado: bool = False,
+        plazo_descubrir_s: float = PLAZO_DESCUBRIR_S,
     ) -> None:
         """`servicio_ia` es `None` si no hay IA (sin clave): Auto e IA van como el clásico.
 
@@ -528,11 +541,14 @@ class Orquestador:
         `consultas_configuracion` son las consultas de prueba del configurador (A1).
         `plazo_tienda_s` es lo que puede tardar cada tienda (C1), y otro tanto la búsqueda si
         antes ha habido que configurarla (R5-D).
+        `google_activado` es el ajuste del mismo nombre (desactivado por defecto, ADR-006): sin
+        él, una búsqueda con «descubrir» avisa y no consulta Google. `plazo_descubrir_s` es lo
+        que puede tardar el descubrimiento entero (H5).
         """
         if max_fichas < 1 or max_ofertas < 1:
             raise ValueError("max_fichas y max_ofertas tienen que ser al menos 1")
-        if plazo_tienda_s <= 0:
-            raise ValueError("El plazo por tienda tiene que ser positivo")
+        if plazo_tienda_s <= 0 or plazo_descubrir_s <= 0:
+            raise ValueError("Los plazos tienen que ser positivos")
         if not consultas_configuracion or not all(c.strip() for c in consultas_configuracion):
             raise ValueError("consultas_configuracion necesita al menos una consulta no vacía")
         self._almacen = almacen
@@ -551,6 +567,8 @@ class Orquestador:
         self._revisar = revisar_resultados
         self._cache_revisiones = _CacheRevisiones(almacen)
         self._turnos_perfil = turnos_perfil if turnos_perfil is not None else TurnosDePerfil()
+        self._google_activado = google_activado
+        self._plazo_descubrir_s = plazo_descubrir_s
 
     async def buscar(
         self, consulta: ConsultaBusqueda, *, seguimiento: Seguimiento | None = None
@@ -582,7 +600,11 @@ class Orquestador:
         if sesion is not None:
             with contextlib.suppress(ErrorAlmacen):
                 self._almacen.borrar_revisiones_ia(max_edad_s=TTL_REVISIONES_IA_S)
-        tiendas = self._tiendas(consulta, generales)
+        progreso_google: ProgresoTienda | None = None
+        descubiertas: tuple[str, ...] = ()
+        if consulta.descubrir:
+            progreso_google, descubiertas = await self._descubrir(consulta, sesion)
+        tiendas = self._tiendas(consulta, generales, descubiertas)
         hechas: dict[int, _Salida] = {}
         en_tiendas: list[_EnTienda] = []
 
@@ -636,20 +658,8 @@ class Orquestador:
         progreso = [s.progreso for s in salidas]
         if generales:
             progreso.insert(0, ProgresoTienda(GENERAL, tuple(generales)))
-        if consulta.descubrir:
-            progreso.insert(
-                0,
-                ProgresoTienda(
-                    "Google",
-                    (
-                        Paso(
-                            "descubrir",
-                            EstadoPaso.AVISO,
-                            "El descubrimiento con Google aún no está disponible: no se consulta",
-                        ),
-                    ),
-                ),
-            )
+        if progreso_google is not None:
+            progreso.insert(0, progreso_google)
         llamadas = sesion.llamadas if sesion is not None else 0
         coste = sesion.coste_usd if sesion is not None else Decimal(0)
         duracion = max(self._cronometro() - inicio, 0.0)
@@ -703,14 +713,62 @@ class Orquestador:
             provisional=True,
         )
 
-    def _tiendas(self, consulta: ConsultaBusqueda, generales: list[Paso]) -> list[Tienda]:
-        """Solo tiendas dadas de alta: un dominio cualquiera de la consulta no se visita nunca."""
+    async def _descubrir(
+        self, consulta: ConsultaBusqueda, sesion: SesionIA | None
+    ) -> tuple[ProgresoTienda, tuple[str, ...]]:
+        """Descubre tiendas con Google (H5) y las da de alta. Devuelve su progreso y los
+        dominios nuevos, que entran en esta misma búsqueda.
+
+        Nunca para la búsqueda: si Google bloquea, falla o tarda más de su plazo, se dice en
+        el progreso y se sigue con las tiendas ya dadas de alta.
+        """
+        if not self._google_activado:
+            aviso = Paso(PASO_GOOGLE, EstadoPaso.AVISO, GOOGLE_DESACTIVADO)
+            return ProgresoTienda(GOOGLE, (aviso,)), ()
+        conocidas = {t.dominio for t in self._almacen.tiendas()}
+        try:
+            async with asyncio.timeout(self._plazo_descubrir_s):
+                hallazgo = await descubrir(
+                    consulta.texto, self._navegador, sesion=sesion, conocidas=conocidas
+                )
+        except TimeoutError:
+            fallo = Paso(
+                PASO_GOOGLE,
+                EstadoPaso.ERROR,
+                f"Plazo de {self._plazo_descubrir_s:g} s agotado al consultar Google",
+            )
+            return ProgresoTienda(GOOGLE, (fallo,)), ()
+        pasos = list(hallazgo.pasos)
+        nuevas: list[str] = []
+        for tienda in hallazgo.tiendas:
+            try:
+                self._almacen.alta_tienda(tienda.dominio, tienda.dominio)
+            except TiendaDuplicada:
+                pass  # Otra búsqueda simultánea la acaba de dar de alta: se busca igual.
+            except ErrorAlmacen:
+                pasos.append(
+                    Paso("alta", EstadoPaso.AVISO, f"No se pudo dar de alta {tienda.dominio}")
+                )
+                continue
+            nuevas.append(tienda.dominio)
+        if nuevas:
+            detalle = f"Dadas de alta y buscadas ahora: {', '.join(nuevas)}"
+            if consulta.modo is Modo.CLASICO:
+                detalle += ". En modo clásico no se les crea perfil con IA: busca en modo Auto o IA"
+            pasos.append(Paso("tiendas nuevas", EstadoPaso.OK, _recortar(detalle)))
+        return ProgresoTienda(GOOGLE, tuple(pasos)), tuple(nuevas)
+
+    def _tiendas(
+        self, consulta: ConsultaBusqueda, generales: list[Paso], descubiertas: Sequence[str] = ()
+    ) -> list[Tienda]:
+        """Solo tiendas dadas de alta: un dominio cualquiera de la consulta no se visita nunca.
+        Las `descubiertas` con Google (H5) ya lo están y entran aunque se hayan elegido otras."""
         todas = self._almacen.tiendas()
         if not consulta.tiendas:
             return todas
         pedidas = {normalizar_dominio(t) for t in consulta.tiendas}
-        elegidas = [t for t in todas if t.dominio in pedidas]
-        if len(elegidas) < len(set(consulta.tiendas)):
+        elegidas = [t for t in todas if t.dominio in pedidas or t.dominio in descubiertas]
+        if len([t for t in elegidas if t.dominio in pedidas]) < len(set(consulta.tiendas)):
             generales.append(
                 Paso(
                     "tiendas",

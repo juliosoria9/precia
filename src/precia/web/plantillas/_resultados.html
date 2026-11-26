@@ -75,7 +75,7 @@
 {% endif %}
 
 {% for t in r.progreso %}{% for p in t.pasos if p.nombre == "descubrir" %}
-<p class="mensaje mensaje-aviso">Google: {{ p.detalle }}. Solo se ha buscado en las tiendas elegidas.</p>
+<p class="mensaje mensaje-aviso">{{ p.detalle }}. Solo se ha buscado en las tiendas ya dadas de alta.</p>
 {% endfor %}{% endfor %}
 
 {#- A1: las tiendas saltadas porque su configuración falló hace poco, a la vista y no en el desplegable. -#}

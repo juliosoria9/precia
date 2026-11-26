@@ -16,6 +16,7 @@ from precia.nucleo.modelos import (
     ConsultaBusqueda,
     EstadoProxy,
     GrupoProducto,
+    InformeAlertas,
     ResultadoBusqueda,
     ResultadoEvaluacion,
     ResumenIA,
@@ -59,6 +60,10 @@ def entrada_normalizada(dominio: str, texto: str | None) -> str | None:
         return normalizar_entrada(dominio, texto or "")
     except EntradaNoValida as error:
         raise URLEntradaNoValida(str(error)) from error
+
+
+class AlertaNoExiste(ErrorFuente):
+    """No hay ninguna alerta con ese identificador."""
 
 
 class FuenteDatos(Protocol):
@@ -115,6 +120,23 @@ class FuenteDatos(Protocol):
         self, id_producto: str, umbral: Decimal, canal: str, *, solo_exactas: bool = True
     ) -> Alerta:
         """Con `solo_exactas` (por defecto), no cuentan equivalentes ni revisiones (B5)."""
+        ...
+
+    def cambiar_alerta(self, id_alerta: int, *, activa: bool) -> None:
+        """Pausa o reanuda la alerta (al reanudarla, vuelve a poder avisar). `AlertaNoExiste`."""
+        ...
+
+    def borrar_alerta(self, id_alerta: int) -> None:
+        """`AlertaNoExiste` si no existe."""
+        ...
+
+    async def comprobar_alertas(self) -> InformeAlertas:
+        """Vuelve a mirar los precios de los productos con alertas activas y envía los avisos
+        que toquen (H7). Lo llama el planificador y el botón «Comprobar ahora»."""
+        ...
+
+    def canales_aviso(self) -> dict[str, str]:
+        """Por cada canal de aviso, "" si está configurado o qué le falta (sin secretos)."""
         ...
 
     def resumen_ia(self) -> ResumenIA: ...

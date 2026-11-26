@@ -19,6 +19,7 @@ from decimal import Decimal
 from precia.navegador.url import validar_url
 from precia.nucleo.dominios import dominio_de_tienda, normalizar_dominio
 from precia.nucleo.fuente_datos import (
+    AlertaNoExiste,
     RevisionNoValida,
     TiendaNoExiste,
     TiendaYaExiste,
@@ -34,6 +35,7 @@ from precia.nucleo.modelos import (
     EstadoProxy,
     EstadoTienda,
     GrupoProducto,
+    InformeAlertas,
     LlamadaIA,
     Modo,
     Oferta,
@@ -528,7 +530,7 @@ class FuenteDemo:
             aviso = (
                 "En la demo no se consulta Google"
                 if self._ajustes.google_activado
-                else "Desactivado en ajustes (ADR-006): no se consulta"
+                else "El descubrimiento con Google está desactivado en Ajustes (ADR-006)"
             )
             progreso.insert(
                 0, ProgresoTienda("Google", (Paso("descubrir", EstadoPaso.AVISO, aviso),))
@@ -736,7 +738,7 @@ class FuenteDemo:
         if producto is None:
             raise KeyError(id_producto)
         alerta = Alerta(
-            len(self._alertas) + 1,
+            max((a.id for a in self._alertas), default=0) + 1,
             id_producto,
             producto.nombre,
             umbral,
@@ -745,6 +747,33 @@ class FuenteDemo:
         )
         self._alertas.append(alerta)
         return alerta
+
+    def _posicion_alerta(self, id_alerta: int) -> int:
+        for posicion, alerta in enumerate(self._alertas):
+            if alerta.id == id_alerta:
+                return posicion
+        raise AlertaNoExiste("La alerta ya no existe.")
+
+    def cambiar_alerta(self, id_alerta: int, *, activa: bool) -> None:
+        posicion = self._posicion_alerta(id_alerta)
+        actual = self._alertas[posicion]
+        self._alertas[posicion] = replace(
+            actual,
+            activa=activa,
+            avisada=False if activa else actual.avisada,
+            ultimo_error="" if activa else actual.ultimo_error,
+        )
+
+    def borrar_alerta(self, id_alerta: int) -> None:
+        del self._alertas[self._posicion_alerta(id_alerta)]
+
+    async def comprobar_alertas(self) -> InformeAlertas:
+        """La demo no visita tiendas ni envía nada: solo dice cuántas alertas miraría."""
+        activas = sum(1 for a in self._alertas if a.activa)
+        return InformeAlertas(fecha=datetime.now(), comprobadas=activas, avisos=0)
+
+    def canales_aviso(self) -> dict[str, str]:
+        return {"email": "", "telegram": ""}
 
     def resumen_ia(self) -> ResumenIA:
         llamadas = tuple(sorted(_LLAMADAS, key=lambda c: c.fecha, reverse=True))
