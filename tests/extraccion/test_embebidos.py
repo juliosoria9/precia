@@ -495,8 +495,10 @@ def test_miles_de_objetos_que_no_son_fichas_no_tardan(objeto: dict[str, str]) ->
     html = scripts(objeto)
     neutro = scripts({f"x{n}": valor for n, valor in enumerate(objeto.values())})
     _sin_resultados(html)
+    # Seis intentos y no tres: en la CI llegó a dar 2,509 con el mismo código que en la otra
+    # ejecución pasaba. Más intentos no tapan una regresión, que cuesta 3,8 veces o más en todos.
     proporcion = proporcion_de_cpu(
-        lambda: _sin_resultados(html), lambda: _sin_resultados(neutro), 2.5
+        lambda: _sin_resultados(html), lambda: _sin_resultados(neutro), 2.5, intentos=6
     )
     assert proporcion < 2.5
 

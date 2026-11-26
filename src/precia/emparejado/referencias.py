@@ -1,8 +1,10 @@
 """Referencias OEM: normalización y detección de candidatas en títulos y campos.
 
-Una referencia candidata es alfanumérica, tiene al menos 5 caracteres y al menos un dígito
-una vez quitados espacios y separadores. Las tiendas la escriben de muchas formas
-(«1K0 698 151», «1K0-698-151», «REF.1K0698151»), así que se normaliza antes de comparar.
+Una referencia candidata es alfanumérica, tiene al menos 5 caracteres y al menos 2 cifras
+una vez quitados espacios y separadores. Con una sola cifra es el nombre de una tecnología
+(«DLSS4», «GDDR6X», «PCIe5»), que sale en los títulos de productos distintos (bug 36).
+Las tiendas la escriben de muchas formas («1K0 698 151», «1K0-698-151», «REF.1K0698151»),
+así que se normaliza antes de comparar.
 
 Una referencia escrita por grupos conserva su sufijo de revisión de una o dos letras
 («1K0 941 005 E» → 1K0941005E): sin él, una revisión pasaría por la referencia exacta.
@@ -14,6 +16,8 @@ MAX_TEXTO = 10_000
 """Solo se analiza este prefijo del texto: los datos vienen de webs no confiables."""
 
 LONGITUD_MINIMA = 5
+MIN_CIFRAS = 2
+"""Cifras que lleva como mínimo una referencia: «DLSS4» o «WiFi6E» no lo son (bug 36)."""
 MIN_DIGITOS_REFERENCIA = 8
 """Un número suelto de una URL con menos cifras es un id («/123-faro.html», «/p/123456»);
 con 8 o más se conserva, porque puede ser una referencia numérica (Bosch «0986494104») o un
@@ -84,7 +88,7 @@ def es_referencia(texto: str) -> bool:
         len(texto) >= LONGITUD_MINIMA
         and texto.isascii()
         and texto.isalnum()
-        and any(c.isdigit() for c in texto)
+        and sum(c.isdigit() for c in texto) >= MIN_CIFRAS
     )
 
 

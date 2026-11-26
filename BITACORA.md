@@ -2105,3 +2105,15 @@ Alimenta la memoria §3 («método de validación del código generado»).
 - **Causa / contexto:** compara dos tiempos de CPU. Medido en local, cinco veces: de 1,6 a 2,4 con el código nuevo y de 1,7 a 2,0 con el anterior a cambiar `dom.py`; el ruido es mayor que la diferencia.
 - **Qué se hizo:** relanzar el trabajo y anotarlo. No se ha subido el tope ni se ha cambiado el test: queda para decidir si se mide con más repeticiones.
 - **Para la memoria:** §2 (pruebas y validación) · S06
+
+### 2026-11-26 19:29 · 🔧 Solución · Bug 36: «DLSS4» ya no pasa por referencia OEM
+- **Qué pasó:** en una búsqueda de tarjetas gráficas, «DLSS4» se tomaba como referencia OEM y juntaba como «exactas» cinco tarjetas distintas.
+- **Causa / contexto:** `es_referencia` aceptaba cualquier texto de 5 caracteres con un dígito. Los nombres de tecnologías («DLSS4», «GDDR6X», «PCIe5», «WiFi6E») salen en los títulos de productos distintos y, sin referencia en la consulta, el agrupador junta las ofertas que comparten una.
+- **Qué se hizo:** exigir al menos 2 cifras. Comprobado antes que ninguna referencia real del banco ni de los tests tiene menos. Test con el caso de las tarjetas; el banco clásico no cambia.
+- **Lección:** el campo de pruebas de la campaña no miraba la agrupación fuera de recambios; el fallo lo vio Julio en una captura.
+- **Para la memoria:** §3.3 (errores de la IA) · §5.1 · S06
+
+### 2026-11-26 19:29 · 🔧 Solución · Test de rendimiento con más intentos
+- **Qué pasó:** `test_miles_de_objetos_que_no_son_fichas_no_tardan` falló una vez en la CI (2,509 con tope 2,5).
+- **Qué se hizo:** de 3 a 6 intentos, mismo tope. Una regresión real cuesta 3,8 veces o más en todos los intentos; el ruido tiene más ocasiones de bajar.
+- **Para la memoria:** §2 (pruebas) · S06

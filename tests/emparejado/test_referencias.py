@@ -164,3 +164,24 @@ def test_una_a_suelta_da_la_referencia_con_y_sin_sufijo() -> None:
 )
 def test_es_revision(referencia: str, buscada: str, esperado: bool) -> None:
     assert es_revision(referencia, buscada) is esperado
+
+
+# --- Nombres de tecnologías con un solo dígito (bug 36, «DLSS4») ---------------------------------
+# En una búsqueda de tarjetas gráficas, «DLSS4» (una tecnología de NVIDIA que sale en todos los
+# títulos) pasaba por referencia OEM y juntaba como «exactas» cinco tarjetas distintas. Una
+# referencia de fabricante real lleva varias cifras; con una sola es un nombre de tecnología.
+
+
+@pytest.mark.parametrize("texto", ["DLSS4", "GDDR6X", "PCIE5", "WIFI6E", "PLANETAHUERTOB2C"])
+def test_un_solo_digito_no_es_una_referencia(texto: str) -> None:
+    assert not es_referencia(texto)
+
+
+def test_las_tecnologias_del_titulo_de_una_grafica_no_son_referencias() -> None:
+    titulo = "MSI GeForce RTX 5070 Ventus 2X OC 12GB GDDR7 DLSS4 PCIe5 WiFi6E"
+    assert referencias_en(titulo) == set()
+
+
+@pytest.mark.parametrize("texto", ["1K0698151", "A1668207259", "P85020", "5K0941005E", "LR061388"])
+def test_las_referencias_reales_llevan_varias_cifras(texto: str) -> None:
+    assert es_referencia(texto)
