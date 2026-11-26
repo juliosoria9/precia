@@ -288,6 +288,15 @@ MIGRACIONES: tuple[str, ...] = (
     ) STRICT;
     CREATE INDEX revisiones_ia_por_fecha ON revisiones_ia (creado);
     """,
+    # 13: estado de cada alerta (H7): si ya se avisó de la bajada actual (no se repite hasta
+    # que el precio vuelva a subir), por qué falló la última vez y cuándo se comprobó. Las
+    # alertas guardadas quedan sin avisar: antes no se enviaba nada.
+    """
+    ALTER TABLE alertas ADD COLUMN avisada INTEGER NOT NULL DEFAULT 0
+        CHECK (avisada IN (0, 1));
+    ALTER TABLE alertas ADD COLUMN ultimo_error TEXT NOT NULL DEFAULT '';
+    ALTER TABLE alertas ADD COLUMN ultima_comprobacion TEXT;
+    """,
 )
 
 # Solo para diagnóstico y tests: los nombres de PRAGMA no se pueden parametrizar.
@@ -304,6 +313,8 @@ MAX_PRODUCTO_ID = 200
 MAX_NOMBRE_PRODUCTO = 500
 MAX_REFERENCIA = 100
 MAX_CANAL = 50
+MAX_ERROR_ALERTA = 500
+"""Caracteres del último error de una alerta: lo que pase se recorta."""
 MAX_ETIQUETA_IA = 100
 MAX_RESULTADO_IA = 500
 MAX_AJUSTE_TEXTO = 500
@@ -379,6 +390,10 @@ class TiendaNoEncontrada(ErrorAlmacen, LookupError):
 
 class PerfilNoEncontrado(ErrorAlmacen, LookupError):
     """La tienda no tiene esa versión de perfil."""
+
+
+class AlertaNoEncontrada(ErrorAlmacen, LookupError):
+    """No hay ninguna alerta con ese identificador."""
 
 
 class ProductoNoEncontrado(ErrorAlmacen, LookupError):
@@ -1508,7 +1523,8 @@ class Almacen:
     def alertas(self) -> list[Alerta]:
         filas = self._consultar(
             "SELECT a.id, a.producto_id, p.nombre, a.umbral, a.canal, a.activa,"
-            " a.ultima_activacion, a.solo_exactas"
+            " a.ultima_activacion, a.solo_exactas, a.avisada, a.ultimo_error,"
+            " a.ultima_comprobacion"
             " FROM alertas a JOIN productos p ON p.id = a.producto_id"
             " ORDER BY a.id"
         )
@@ -1522,9 +1538,82 @@ class Almacen:
                 activa=bool(f["activa"]),
                 ultima_activacion=_leer_fecha(f["ultima_activacion"]),
                 solo_exactas=bool(f["solo_exactas"]),
+                avisada=bool(f["avisada"]),
+                ultimo_error=f["ultimo_error"],
+                ultima_comprobacion=_leer_fecha(f["ultima_comprobacion"]),
             )
             for f in filas
         ]
+
+    def anotar_alerta(
+        self,
+        id_alerta: int,
+        *,
+        comprobada: datetime,
+        avisada: bool | None = None,
+        error: str = "",
+    ) -> None:
+        """Apunta una comprobación de la alerta (H7).
+
+        `avisada=True`: se acaba de enviar el aviso (queda también como última activación).
+        `avisada=False`: el precio volvió a subir y la alerta se rearma. `None`: no cambia.
+        `error` es el motivo de un fallo ("" si fue bien); se recorta a `MAX_ERROR_ALERTA`.
+        """
+        instante = _fecha(comprobada, "comprobada")
+        if not isinstance(error, str):
+            raise DatoNoValido("error: se espera un texto")
+        texto = error[:MAX_ERROR_ALERTA]
+        fila = self._id_alerta(id_alerta)
+        with self._transaccion() as con:
+            if avisada is None:
+                cursor = con.execute(
+                    "UPDATE alertas SET ultima_comprobacion = ?, ultimo_error = ? WHERE id = ?",
+                    (instante, texto, fila),
+                )
+            elif avisada:
+                cursor = con.execute(
+                    "UPDATE alertas SET ultima_comprobacion = ?1, ultimo_error = ?2,"
+                    " avisada = 1, ultima_activacion = ?1 WHERE id = ?3",
+                    (instante, texto, fila),
+                )
+            else:
+                cursor = con.execute(
+                    "UPDATE alertas SET ultima_comprobacion = ?, ultimo_error = ?, avisada = 0"
+                    " WHERE id = ?",
+                    (instante, texto, fila),
+                )
+            if cursor.rowcount == 0:
+                raise AlertaNoEncontrada(id_alerta)
+
+    def cambiar_alerta(self, id_alerta: int, *, activa: bool) -> None:
+        """Pausa o reanuda la alerta. Al reanudarla se rearma: vuelve a avisar aunque el precio
+        siga por debajo, que es lo que espera quien la reactiva."""
+        fila = self._id_alerta(id_alerta)
+        with self._transaccion() as con:
+            if activa:
+                cursor = con.execute(
+                    "UPDATE alertas SET activa = 1, avisada = 0, ultimo_error = '' WHERE id = ?",
+                    (fila,),
+                )
+            else:
+                cursor = con.execute("UPDATE alertas SET activa = 0 WHERE id = ?", (fila,))
+            if cursor.rowcount == 0:
+                raise AlertaNoEncontrada(id_alerta)
+
+    def borrar_alerta(self, id_alerta: int) -> None:
+        fila = self._id_alerta(id_alerta)
+        with self._transaccion() as con:
+            if con.execute("DELETE FROM alertas WHERE id = ?", (fila,)).rowcount == 0:
+                raise AlertaNoEncontrada(id_alerta)
+
+    @staticmethod
+    def _id_alerta(id_alerta: object) -> int:
+        """El id como entero de SQLite; uno imposible (negativo, enorme) no existe."""
+        if isinstance(id_alerta, bool) or not isinstance(id_alerta, int):
+            raise AlertaNoEncontrada(id_alerta)
+        if not 1 <= id_alerta <= MAX_ENTERO:
+            raise AlertaNoEncontrada(id_alerta)
+        return id_alerta
 
     # --- Ajustes ---
 

@@ -496,6 +496,10 @@ legend { font-weight: 600; font-size: 0.95rem; margin-bottom: 0.5rem; padding: 0
 .lista-alertas { list-style: none; margin: 0.75rem 0 0; padding: 0; display: grid; }
 .lista-alertas li { display: flex; flex-wrap: wrap; gap: 0.25rem 0.75rem; align-items: center; padding: 0.6rem 0; border-top: 1px solid var(--linea); }
 .lista-alertas strong { font: 600 1.05rem var(--letra-tecnica); }
+.lista-alertas .acciones-alerta { display: flex; gap: 0.4rem; margin-left: auto; }
+.lista-alertas .detalle-alerta { flex-basis: 100%; font-size: 0.875rem; }
+.errores-alertas { margin: 0.25rem 0 0.75rem; padding-left: 1.25rem; font-size: 0.9rem; }
+.datos + .tenue { margin-top: 0.75rem; }
 
 /* ---------- Registro de IA ---------- */
 
