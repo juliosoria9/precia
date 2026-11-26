@@ -515,3 +515,24 @@ def test_modo_ia_clasifica_tambien_las_equivalentes() -> None:
     (grupo,) = grupos
     assert grupo.criterio == CRITERIO_OEM_AMPLIADO
     assert len(grupo.ofertas) == 4
+
+
+# --- Bug 36: «DLSS4» agrupaba tarjetas gráficas distintas -----------------------------------------
+
+
+def test_tarjetas_graficas_distintas_no_se_agrupan_por_dlss4() -> None:
+    graficas = [
+        candidata(
+            "pccomponentes.example", "Palit GeForce RTX 5070 Infinity 3 12GB GDDR7 DLSS4", "575.95"
+        ),
+        candidata(
+            "pccomponentes.example", "MSI GeForce RTX 5070 Ti Ventus 3X 16GB GDDR7 DLSS4", "859.99"
+        ),
+        candidata(
+            "pccomponentes.example", "Zotac Gaming RTX 5080 Solid 16GB GDDR7 DLSS4", "1129.90"
+        ),
+        candidata("pccomponentes.example", "ASUS TUF RTX 5080 OC 16GB GDDR7 DLSS4", "1501.97"),
+    ]
+    grupos, _ = ejecutar("tarjeta grafica rtx", graficas)
+    assert not any(g.id == "oem-dlss4" for g in grupos)
+    assert all(g.referencia_oem is None for g in grupos)
