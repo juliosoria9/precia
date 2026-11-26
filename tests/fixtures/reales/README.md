@@ -176,3 +176,20 @@ Las dos `dli_busqueda_faro_*` **no son resultados de «faro»**: DesguacesDLI re
 La misma `amazon_ficha_titulo_lejos_del_precio_chromium.html`, sin cambios, sirve también para el test de la causa R9-P (`tests/extraccion/test_precio_partido.py`, sesión S03, ronda 9): su `#corePriceDisplay_desktop_feature_div` conserva byte a byte el `span.priceToPay` con el precio partido en `span.a-price-whole` («22,»), `span.a-price-fraction` («95») y `span.a-price-symbol` («€»), y el precio recomendado tachado de al lado (26,95 €). La IA del configurador propuso como selector de precio el de la parte entera, que no se leía como precio. Uso añadido por la IA (Claude Code), **pendiente de que Julio lo confirme**.
 
 `mediamarkt_ficha_precio_partido_recorte.html` es un **recorte** de una ficha de MediaMarkt que guardó la campaña multi-sector (ronda 3, sesión S03, `ronda_3/html/mediamarkt.es/03_ficha_…`, 888.792 bytes): se queda, byte a byte, el bloque `div[data-test="cofr-price mms-branded-price"]` con el precio partido (el entero «49,» en `span[data-test=branded-price-whole-value]`, los céntimos «99» dentro de un `<div>` y la moneda aparte) y el texto accesible «49,99€» de al lado; solo se añade un envoltorio mínimo (`<!doctype html>`, `<head>` con el charset y `<body>`). Sirve para `test_precio_partido.py` (revisión del arreglo R9-P): como los céntimos van en un bloque, `Nodo.texto` lee el contenedor como «49, 99 €», que antes se leía 99 €. Script del recorte: `scratchpad/rev3/recortar_mm.py` de la sesión. **Pendiente de que Julio confirme el recorte.**
+
+## Google (S06, 2026-11-24)
+
+Carpeta `google/`. Son las respuestas de Google a la búsqueda
+`https://www.google.com/search?q=pastillas+de+freno+1K0698151&hl=es&gl=es&num=20` pedida con los
+descargadores de PrecIA. Google no dio resultados por ninguna vía, así que **no hay página de
+resultados real**: la de `tests/fixtures/fuentes/google_resultados_sintetico.html` es sintética
+y lo dice en su cabecera.
+
+| Fichero | Vía | Estado | Descargada (UTC) | Caracteres | Qué es |
+|---|---|---|---|---|---|
+| `google/sorry_captcha.html` | Chromium (headless shell), conexión directa | 200 en `google.com/sorry/index` | 2026-11-24T22:46 | 5 437 | Página «tráfico inusual» con reCAPTCHA |
+| `google/habilita_javascript.html` | `curl` con la huella de Chrome | 200 | 2026-11-24T22:46 | 93 810 | Página «habilita JavaScript», sin ningún resultado |
+
+Único retoque: en `sorry_captcha.html` la dirección IP pública desde la que se pidió se ha
+sustituido por `203.0.113.7` (rango de documentación), para no subirla al repositorio.
+
