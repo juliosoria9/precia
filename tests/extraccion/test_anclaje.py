@@ -128,3 +128,23 @@ def test_no_se_ancla_dentro_de_otra_palabra(valor: str, pagina: str) -> None:
 )
 def test_se_ancla_con_fronteras(valor: str, pagina: str) -> None:
     assert anclado(valor, pagina)
+
+
+# --- Precio partido en superíndice con el HTML indentado (banco de evaluación, S06) -------------
+# En la ficha real de Coolmod, la IA devolvía «95» y se anclaba porque el texto quedaba «1 95 €».
+
+
+def test_en_la_ficha_real_de_coolmod_se_ancla_1_95_y_no_95() -> None:
+    from pathlib import Path
+
+    from precia.extraccion.dom import analizar
+
+    ruta = (
+        Path(__file__).parent.parent
+        / "fixtures"
+        / "reales"
+        / "coolmod_ficha_marca_seis_niveles.html"
+    )
+    texto = analizar(ruta.read_text(encoding="utf-8")).texto()
+    assert precio_anclado(Decimal("1.95"), texto)
+    assert not precio_anclado(Decimal("95"), texto)

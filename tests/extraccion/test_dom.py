@@ -473,6 +473,76 @@ def test_sin_moneda_detras_o_con_separador_el_texto_no_cambia(html: str, esperad
     assert analizar(html).texto() == esperado
 
 
+# --- Céntimos en superíndice con el HTML indentado (banco de evaluación, S06) ---------------------
+# Coolmod pinta `<span class="int_price">\n 1\n</span>\n<sup>\n<span>\n 95\n</span><span>€</span>
+# </sup>`: los espacios de formato impedían juntar los céntimos y el texto quedaba «1 95 €», así
+# que la IA y el anclaje daban por bueno un precio de 95 €. En un `<sup>` los céntimos se juntan
+# aunque haya espacios alrededor, siempre que el entero vaya en su propio elemento.
+
+COOLMOD_1_95 = (
+    '<div class="block">\n    <span class="product_price int_price">\n        1\n    </span>\n'
+    '    <sup class="text-sm">\n        <span class="dec_price">\n            95\n        </span>\n'
+    '        <span class="currency_symbol">&euro;</span>\n    </sup>\n</div>'
+)
+
+
+@pytest.mark.parametrize(
+    ("html", "esperado"),
+    [
+        (COOLMOD_1_95, "1,95 €"),
+        ("<span>12</span> <sup>99</sup>€", "12,99€"),
+        ("<span> 1.228 </span>\n<sup> 96 </sup> €", "1.228,96 €"),
+        ("<p>Precio <b>\n 7 \n</b><sup>\n05\n</sup>\nEUR</p>", "Precio 7,05 EUR"),
+        # Sangría larga, como en la página real.
+        (
+            "<div>"
+            + " " * 40
+            + "<span>"
+            + " " * 40
+            + "3"
+            + " " * 40
+            + "</span>"
+            + " " * 40
+            + "<sup>"
+            + " " * 40
+            + "49"
+            + " " * 40
+            + "</sup>€</div>",
+            "3,49 €",
+        ),
+    ],
+)
+def test_centimos_en_superindice_se_juntan_aunque_haya_espacios_de_formato(
+    html: str, esperado: str
+) -> None:
+    assert analizar(html).texto() == esperado
+
+
+@pytest.mark.parametrize(
+    ("html", "esperado"),
+    [
+        # El entero no va en su propio elemento: puede ser una talla o una cantidad.
+        ("Talla 1 <sup>95</sup> €", "Talla 1 95 €"),
+        ("Pack de 2 <sup> 12 </sup> €", "Pack de 2 12 €"),
+        # Sin moneda detrás, tres cifras o una sola: no son céntimos.
+        ("<span>12</span> <sup>99</sup>", "12 99"),
+        ("<span>12</span> <sup>995</sup> €", "12 995 €"),
+        ("<span>12</span> <sup>9</sup> €", "12 9 €"),
+        # Entero pegado a una letra: una referencia.
+        ("<span>1K0</span> <sup>61</sup> €", "1K0 61 €"),
+        # Sin superíndice, un espacio en medio sigue separando.
+        ("<span>12</span> <span>99</span>€", "12 99€"),
+    ],
+)
+def test_superindice_que_no_son_centimos_no_cambia(html: str, esperado: str) -> None:
+    assert analizar(html).texto() == esperado
+
+
+def test_el_texto_nunca_lleva_la_marca_de_superindice() -> None:
+    texto = analizar("<p>a\x01b<span>1</span> <sup>99</sup>€</p>").texto()
+    assert "\x01" not in texto and "\x00" not in texto
+
+
 def test_centimos_en_un_elemento_aparte_tambien_sin_tachados() -> None:
     raiz = analizar("<p><s>316,54 €</s>" + BRICO_228_96 + "</p>")
     assert raiz.texto() == "316,54 € 228,96€"
