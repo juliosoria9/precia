@@ -54,6 +54,11 @@ _CLAVE_NO_PRECIO = re.compile(
     re.IGNORECASE,
 )
 _ESPACIOS = re.compile(r"\s+")
+_CLASE_SUFIJO = re.compile(r"(?:^|[-_])price[-_]suffix$", re.IGNORECASE)
+"""Clase del sufijo de un precio: `woocommerce-price-suffix`, donde WooCommerce suele poner el
+precio sin IVA al lado del precio principal."""
+MAX_SUFIJOS = 50
+"""Sufijos de precio que se miran como mucho en una página (cota ante un HTML hostil)."""
 # Etiqueta que anuncia el precio antiguo de una oferta, justo delante del importe o detrás.
 _ANTIGUO_DELANTE = re.compile(
     r"(?<![a-z])(?:antes|precio\s+(?:anterior|antiguo|original|habitual|de\s+referencia"
@@ -404,3 +409,29 @@ def _precedido_de_clave(texto: str, candidato: _Candidato) -> bool:
     return (
         _CLAVE_NO_PRECIO.search(texto, max(0, candidato.inicio - 24), candidato.inicio) is not None
     )
+
+
+def precio_principal_del_sufijo(raiz: Nodo, importe: Decimal, texto_pagina: str) -> Precio | None:
+    """El precio principal si `importe` solo aparece en el sufijo de un precio, o `None`.
+
+    WooCommerce puede enseñar el precio sin IVA en `<small class="woocommerce-price-suffix">`,
+    al lado del precio con IVA. En el texto quedan los dos seguidos («544,50 € 450,00 €») y quien
+    lee el texto, como la IA, no sabe cuál es el principal. Si `importe` está en un sufijo y en
+    ningún otro sitio de `texto_pagina`, se devuelve el único otro importe del elemento que
+    contiene ese sufijo. Si aparece también fuera, o al lado hay más de un importe, no se decide.
+    """
+    sufijos = [n for n in raiz.descendientes() if any(_CLASE_SUFIJO.search(c) for c in n.clases)]
+    if not sufijos:
+        return None
+    en_pagina = sum(1 for p in buscar_precios(texto_pagina) if p.importe == importe)
+    en_sufijos = 0
+    contenedor: Nodo | None = None
+    for sufijo in sufijos[:MAX_SUFIJOS]:
+        coincidencias = sum(1 for p in buscar_precios(sufijo.texto()) if p.importe == importe)
+        if coincidencias and contenedor is None:
+            contenedor = sufijo.padre
+        en_sufijos += coincidencias
+    if contenedor is None or en_sufijos < en_pagina:
+        return None
+    otros = {p.importe: p for p in buscar_precios(contenedor.texto()) if p.importe != importe}
+    return next(iter(otros.values())) if len(otros) == 1 else None

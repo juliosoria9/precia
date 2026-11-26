@@ -1407,3 +1407,68 @@ def test_el_id_de_la_url_en_los_metadatos_tambien_se_descarta() -> None:
     )
     ficha = _extraer(_pagina(html, "https://t.es/recambios/faro-402519/"), ("referencia_oem",))
     assert "referencia_oem" not in ficha.campos
+
+
+# --- Estado con el vocabulario común (banco de evaluación, S06) ---------------------------------
+
+
+def test_el_estado_de_la_ia_se_guarda_con_el_vocabulario_comun() -> None:
+    html = "<h1>Faro</h1><p>12,00 €</p><p>Material de segunda mano</p>"
+    ia = ExtractorFalso({"estado": "Material de segunda mano"})
+    ficha = _extraer(_pagina(html), ("precio", "estado"), extractor_ia=ia)
+    assert ficha.campos["estado"].valor == "Usado"
+    assert ficha.campos["estado"].anclado
+
+
+def test_un_estado_no_anclado_o_sin_vocabulario_se_queda_como_esta() -> None:
+    html = "<h1>Faro</h1><p>12,00 €</p><p>Estado: probado</p>"
+    ia = ExtractorFalso({"estado": "Nuevo"})
+    ficha = _extraer(_pagina(html), ("precio", "estado"), extractor_ia=ia)
+    assert ficha.campos["estado"].valor == "Nuevo"
+    assert not ficha.campos["estado"].anclado
+    ia = ExtractorFalso({"estado": "probado"})
+    ficha = _extraer(_pagina(html), ("precio", "estado"), extractor_ia=ia)
+    assert ficha.campos["estado"].valor == "probado"
+
+
+# --- Precio sin IVA en el sufijo de WooCommerce (banco de evaluación, S06) ----------------------
+# Desguaces DLI enseña `544,50 €` y, en `<small class="woocommerce-price-suffix">`, `450,00 €`
+# (sin IVA). En el texto solo queda «544,50 € 450,00 €» y la IA eligió el segundo.
+
+WOO_CON_SUFIJO = (
+    "<h1>Faro</h1><div><span class='woocommerce-Price-amount amount'>544,50&nbsp;"
+    "<span class='woocommerce-Price-currencySymbol'>€</span></span> "
+    "<small class='woocommerce-price-suffix'><span class='woocommerce-Price-amount amount'>"
+    "450,00&nbsp;<span class='woocommerce-Price-currencySymbol'>€</span></span></small></div>"
+)
+
+
+def test_el_precio_de_la_ia_en_el_sufijo_se_cambia_por_el_principal() -> None:
+    ia = ExtractorFalso({"precio": "450,00 €"})
+    ficha = _extraer(_pagina(WOO_CON_SUFIJO), ("precio",), extractor_ia=ia)
+    assert ficha.precio is not None and ficha.precio.importe == Decimal("544.50")
+    assert ficha.campos["precio"].anclado
+    assert any("sufijo" in aviso for aviso in ficha.avisos)
+
+
+def test_el_precio_principal_de_la_ia_no_cambia_aunque_haya_sufijo() -> None:
+    ia = ExtractorFalso({"precio": "544,50 €"})
+    ficha = _extraer(_pagina(WOO_CON_SUFIJO), ("precio",), extractor_ia=ia)
+    assert ficha.precio is not None and ficha.precio.importe == Decimal("544.50")
+
+
+def test_si_el_importe_del_sufijo_tambien_esta_fuera_no_se_cambia() -> None:
+    html = WOO_CON_SUFIJO + "<p>Envío gratis a partir de 450,00 €</p>"
+    ia = ExtractorFalso({"precio": "450,00 €"})
+    ficha = _extraer(_pagina(html), ("precio",), extractor_ia=ia)
+    assert ficha.precio is not None and ficha.precio.importe == Decimal("450.00")
+
+
+def test_en_la_ficha_real_de_desguaces_dli_el_precio_sin_iva_de_la_ia_se_corrige() -> None:
+    ia = ExtractorFalso({"precio": "450,00 €"})
+    ficha = _extraer(
+        _fixture("../reales/desguacesdli_ficha_filas_etiqueta_valor.html"),
+        ("precio",),
+        extractor_ia=ia,
+    )
+    assert ficha.precio is not None and ficha.precio.importe == Decimal("544.50")

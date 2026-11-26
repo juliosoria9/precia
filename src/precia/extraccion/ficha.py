@@ -51,10 +51,17 @@ from precia.emparejado.referencias import (
 )
 from precia.extraccion.anclaje import anclado
 from precia.extraccion.dom import Nodo, analizar
+from precia.extraccion.estados import estado_canonico
 from precia.extraccion.imagenes import anclada_en_html, candidatas_de_imagen, foto_valida
 from precia.extraccion.jsonld import bloques_jsonld, productos_de_arbol
 from precia.extraccion.metadatos import producto_metadatos
-from precia.extraccion.precios import MAX_IMPORTE, buscar_precios, leer_precio, texto_de_precio
+from precia.extraccion.precios import (
+    MAX_IMPORTE,
+    buscar_precios,
+    leer_precio,
+    precio_principal_del_sufijo,
+    texto_de_precio,
+)
 from precia.extraccion.selectores import (
     dividir_selector,
     extraer_valor,
@@ -320,6 +327,9 @@ class _Extraccion:
 
     def anotar(self, campo: str, valor: str, origen: OrigenDato, es_anclado: bool) -> None:
         confianza = CONFIANZA[origen] if es_anclado else CONFIANZA_NO_ANCLADO
+        if campo == "estado" and es_anclado:
+            # Ya anclado con las palabras de la página: se guarda con el vocabulario común.
+            valor = estado_canonico(valor) or valor
         self.valores[campo] = ValorCampo(valor, origen, es_anclado, confianza)
 
     # --- 1. JSON-LD -------------------------------------------------------------------------
@@ -607,6 +617,14 @@ class _Extraccion:
             self.avisos.append("La IA devolvió un precio que no se puede leer.")
             return
         es_anclado = self.precio_en_pagina(precio.importe)
+        if es_anclado and (
+            principal := precio_principal_del_sufijo(self.raiz, precio.importe, self.texto)
+        ):
+            self.avisos.append(
+                f"El precio de la IA ({formatear_precio(precio)}) es el del sufijo de otro precio "
+                f"(suele ser sin IVA): se usa el principal ({formatear_precio(principal)})."
+            )
+            precio = principal
         texto = formatear_precio(precio)
         if es_anclado:
             self.precio = precio
