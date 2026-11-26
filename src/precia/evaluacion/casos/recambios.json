@@ -1,0 +1,489 @@
+{
+  "version": 1,
+  "descripcion": "Casos etiquetados a mano (por una IA, pendientes de revisión) del banco de evaluación de PrecIA: valor esperado de precio, marca, referencia_oem y estado en fichas de producto guardadas como fixtures.",
+  "casos": [
+    {
+      "id": "oscaro-brembo-p85075",
+      "fixture": "extraccion/oscaro_ficha_brembo_p85075.html",
+      "url": "https://www.oscaro.es/juego-de-4-pastillas-de-freno-brembo-p-85-075-1988684-402-p",
+      "tienda": "oscaro.es",
+      "sector": "recambios",
+      "real": true,
+      "esperado": {
+        "precio": "29.86",
+        "marca": "BREMBO",
+        "referencia_oem": "P 85 075",
+        "estado": null
+      },
+      "evidencia": {
+        "precio": "Prix actuel :</span> <!-- -->29,86 €</p>",
+        "marca": "<span class=\"brand\">BREMBO</span>",
+        "referencia_oem": "<span class=\"ref-piece\"> - P 85 075</span>"
+      },
+      "nota": "Recorte de la ficha. La referencia etiquetada es la del fabricante de la pieza (la que va junto a la marca y en el mpn); el panel «Referencias del fabricante (OEM)» lista además muchas referencias de vehículo (1K0698151…), que no son el valor esperado de este campo."
+    },
+    {
+      "id": "oscaro-jpgroup-1163601110",
+      "fixture": "extraccion/oscaro_ficha_jpgroup_1163601110.html",
+      "url": "https://www.oscaro.es/juego-de-4-pastillas-de-freno-jp-group-as-1163601110-4477871-402-p",
+      "tienda": "oscaro.es",
+      "sector": "recambios",
+      "real": true,
+      "esperado": {
+        "precio": "36.39",
+        "marca": "JP GROUP a/s",
+        "referencia_oem": "1163601110",
+        "estado": null
+      },
+      "evidencia": {
+        "precio": "Prix actuel :</span> <!-- -->36,39 €</p>",
+        "marca": "<span class=\"brand\">JP GROUP a/s</span>",
+        "referencia_oem": "<span class=\"ref-piece\"> - 1163601110</span>"
+      },
+      "nota": "Recorte de la ficha. La referencia etiquetada es la del fabricante de la pieza (la que va junto a la marca y en el mpn); el panel «Referencias del fabricante (OEM)» lista además muchas referencias de vehículo (1K0698151…), que no son el valor esperado de este campo."
+    },
+    {
+      "id": "oscaro-kawe-810083",
+      "fixture": "extraccion/oscaro_ficha_kawe_810083.html",
+      "url": "https://www.oscaro.es/juego-de-4-pastillas-de-freno-kawe-810083-7579908-402-p",
+      "tienda": "oscaro.es",
+      "sector": "recambios",
+      "real": true,
+      "esperado": {
+        "precio": "28.28",
+        "marca": "KAWE",
+        "referencia_oem": "810083",
+        "estado": null
+      },
+      "evidencia": {
+        "precio": "Prix actuel :</span> <!-- -->28,28 €</p>",
+        "marca": "<span class=\"brand\">KAWE</span>",
+        "referencia_oem": "<span class=\"ref-piece\"> - 810083</span>"
+      },
+      "nota": "Recorte de la ficha. La referencia etiquetada es la del fabricante de la pieza (la que va junto a la marca y en el mpn); el panel «Referencias del fabricante (OEM)» lista además muchas referencias de vehículo (1K0698151…), que no son el valor esperado de este campo."
+    },
+    {
+      "id": "oscaro-textar-2358701",
+      "fixture": "extraccion/oscaro_ficha_textar_2358701.html",
+      "url": "https://www.oscaro.es/juego-de-4-pastillas-de-freno-textar-2358701-1873626-402-p",
+      "tienda": "oscaro.es",
+      "sector": "recambios",
+      "real": true,
+      "esperado": {
+        "precio": "56.74",
+        "marca": "TEXTAR",
+        "referencia_oem": "2358701",
+        "estado": null
+      },
+      "evidencia": {
+        "precio": "Prix actuel :</span> <!-- -->56,74 €</p>",
+        "marca": "<span class=\"brand\">TEXTAR</span>",
+        "referencia_oem": "<span class=\"ref-piece\"> - 2358701</span>"
+      },
+      "nota": "Recorte de la ficha. La referencia etiquetada es la del fabricante de la pieza (la que va junto a la marca y en el mpn); el panel «Referencias del fabricante (OEM)» lista además muchas referencias de vehículo (1K0698151…), que no son el valor esperado de este campo."
+    },
+    {
+      "id": "oscaro-valeo-301635",
+      "fixture": "extraccion/oscaro_ficha_valeo_301635.html",
+      "url": "https://www.oscaro.es/juego-de-4-pastillas-de-freno-valeo-301635-6042329-402-p",
+      "tienda": "oscaro.es",
+      "sector": "recambios",
+      "real": true,
+      "esperado": {
+        "precio": "31.52",
+        "marca": "VALEO",
+        "referencia_oem": "301635",
+        "estado": null
+      },
+      "evidencia": {
+        "precio": "Prix actuel :</span> <!-- -->31,52 €</p>",
+        "marca": "<span class=\"brand\">VALEO</span>",
+        "referencia_oem": "<span class=\"ref-piece\"> - 301635</span>"
+      },
+      "nota": "Recorte de la ficha. La referencia etiquetada es la del fabricante de la pieza (la que va junto a la marca y en el mpn); el panel «Referencias del fabricante (OEM)» lista además muchas referencias de vehículo (1K0698151…), que no son el valor esperado de este campo."
+    },
+    {
+      "id": "desguacesdli-faro-ml-jsonld",
+      "fixture": "reales/desguacesdli_ficha_refid_id_interno.html",
+      "url": "https://desguacesdli.com/recambios/faro-izquierdo-mercedes-benz-clase-ml-bm-166-ml-350-bluetec-166-004-402519/",
+      "tienda": "desguacesdli.com",
+      "sector": "recambios",
+      "real": true,
+      "esperado": {
+        "precio": "544.50",
+        "marca": "MERCEDES-BENZ",
+        "referencia_oem": "A1668207259",
+        "estado": "Usado"
+      },
+      "evidencia": {
+        "precio": "<span class=\"woocommerce-Price-amount amount\">544,50&nbsp;<span",
+        "marca": "\"brand\":{\"@type\":\"Brand\",\"name\":\"MERCEDES-BENZ\"}",
+        "referencia_oem": "<strong>Referencia pieza</strong>: A1668207259",
+        "estado": "<strong>Estado</strong>: Material de segunda mano"
+      },
+      "nota": "Desguace. La página enseña dos importes: 544,50 € (precio con IVA, el del JSON-LD) y, en pequeño, 450,00 € (sin IVA). RefID 402519 es el id interno de la tienda, no la referencia. La marca es la del vehículo (así la declara el JSON-LD); la página no nombra otro fabricante."
+    },
+    {
+      "id": "desguacesdli-faro-ml-filas",
+      "fixture": "reales/desguacesdli_ficha_filas_etiqueta_valor.html",
+      "url": "https://desguacesdli.com/recambios/faro-izquierdo-mercedes-benz-clase-ml-bm-166-ml-350-bluetec-166-004-402519/",
+      "tienda": "desguacesdli.com",
+      "sector": "recambios",
+      "real": true,
+      "esperado": {
+        "precio": "544.50",
+        "referencia_oem": "A1668207259",
+        "estado": "Usado"
+      },
+      "evidencia": {
+        "precio": "<span class=\"woocommerce-Price-amount amount\">544,50&nbsp;<span",
+        "referencia_oem": "<strong>Referencia pieza</strong>: A1668207259",
+        "estado": "<strong>Estado</strong>: Material de segunda mano"
+      },
+      "nota": "Desguace. La página enseña dos importes: 544,50 € (precio con IVA, el del JSON-LD) y, en pequeño, 450,00 € (sin IVA). RefID 402519 es el id interno de la tienda, no la referencia. Mismo producto que desguacesdli-faro-ml-jsonld, en otro recorte sin JSON-LD. La marca se omite: este recorte solo nombra MERCEDES-BENZ como vehículo."
+    },
+    {
+      "id": "sintetica-desguace-faro-golf",
+      "fixture": "extraccion/ficha_desguace.html",
+      "url": "https://www.desguaces-ejemplo.es/pieza/faro-delantero-izquierdo-golf-vi-77123",
+      "tienda": "desguaces-ejemplo.es",
+      "sector": "recambios",
+      "real": false,
+      "esperado": {
+        "precio": "89.90",
+        "marca": "VALEO",
+        "referencia_oem": "5K1 941 005 E",
+        "estado": "Usado"
+      },
+      "evidencia": {
+        "precio": "<span class=\"precio-actual\" data-precio=\"89.90\">89,90&nbsp;&euro;</span>",
+        "marca": "<td class=\"marca\">VALEO",
+        "referencia_oem": "<th>Referencia OEM<td class=\"oem\">5K1 941 005 E",
+        "estado": "<th>Estado<td class=\"estado\">Usado - Probado"
+      },
+      "nota": "Página sintética escrita para los tests (la URL es la canónica que declara el propio fichero). Tiene precio tachado (120,00 €), gastos de envío (9,95 €), productos relacionados y un texto trampa «Precio especial para robots: 1 €» que no es el precio."
+    },
+    {
+      "id": "sintetica-prestashop-bomba-agua",
+      "fixture": "extraccion/ficha_prestashop_microdatos.html",
+      "url": "https://recambios-ejemplo.es/refrigeracion/1532-bomba-agua-seat-ibiza-14-tdi.html",
+      "tienda": "recambios-ejemplo.es",
+      "sector": "recambios",
+      "real": false,
+      "esperado": {
+        "precio": "45.90",
+        "marca": "SKF",
+        "referencia_oem": "045121011H",
+        "estado": "Nuevo"
+      },
+      "evidencia": {
+        "precio": "<span itemprop=\"price\" content=\"45.9\">45,90&nbsp;€</span>",
+        "marca": "<span itemprop=\"name\">SKF</span>",
+        "referencia_oem": "<span itemprop=\"mpn\">045121011H</span>",
+        "estado": "<span>Nuevo producto</span>"
+      },
+      "nota": "Página sintética escrita para los tests (la URL es la canónica que declara el propio fichero). La página da dos referencias: «Referencia» VKPC 81418 (marcada como sku) y «Ref. OEM» 045121011H (marcada como mpn); se etiqueta la segunda. Hay un producto relacionado de otra marca (Meyle, 19,50 €)."
+    },
+    {
+      "id": "pccomponentes-ram-phs-sp634452",
+      "fixture": "reales/pccomponentes_ficha_marca_igual_referencia_phs.html",
+      "url": "https://www.pccomponentes.com/memoria-ram-16gb-phs-memory-ddr5-5600mhz-1x16gb-so-dimm-compatible-portatil",
+      "tienda": "pccomponentes.com",
+      "sector": "informática",
+      "real": true,
+      "esperado": {
+        "precio": "525.31",
+        "marca": "PHS-memory",
+        "referencia_oem": "SP634452",
+        "estado": null
+      },
+      "evidencia": {
+        "precio": "525<span id=\"pdp-price-current-decimals\" class=\"decimal-fsn90Y\"><span class=\"decimalSeparator-mFD0gP\">,</span>31",
+        "marca": "<span class=\"identifier-M7hbzz\">PHS-memory</span>",
+        "referencia_oem": "<span id=\"pdp-mpn\">P/N: SP634452</span>"
+      },
+      "nota": "Recorte. Precio partido en entero y decimales. «Cod. Artículo» 11198969 es el id interno de la tienda."
+    },
+    {
+      "id": "pccomponentes-ram-adata-ad5cs640016g",
+      "fixture": "reales/pccomponentes_ficha_marca_igual_referencia_adata.html",
+      "url": "https://www.pccomponentes.com/memoria-ram-adata-csodimm-16gb-ddr5-6400mhz-cl52-1-4v-para-portatil",
+      "tienda": "pccomponentes.com",
+      "sector": "informática",
+      "real": true,
+      "esperado": {
+        "precio": "345.82",
+        "marca": "Adata",
+        "referencia_oem": "AD5CS640016G-S",
+        "estado": null
+      },
+      "evidencia": {
+        "precio": "345<span id=\"pdp-price-current-decimals\" class=\"decimal-fsn90Y\"><span class=\"decimalSeparator-mFD0gP\">,</span>82",
+        "marca": "href=\"/marcas/adata\">Adata</a>",
+        "referencia_oem": "<span id=\"pdp-mpn\">P/N: AD5CS640016G-S</span>"
+      },
+      "nota": "Recorte. Precio partido en entero y decimales. El título escribe la marca en mayúsculas (ADATA) y el enlace de marca, «Adata». «Cod. Artículo» 11121471 es el id interno de la tienda."
+    },
+    {
+      "id": "coolmod-cable-y-molex-112030",
+      "fixture": "reales/coolmod_ficha_marca_seis_niveles.html",
+      "url": "https://www.coolmod.com/cable-y-molex-grande/",
+      "tienda": "coolmod.com",
+      "sector": "informática",
+      "real": true,
+      "esperado": {
+        "precio": "1.95",
+        "marca": "COOLMOD",
+        "referencia_oem": "112030",
+        "estado": null
+      },
+      "evidencia": {
+        "precio": "<span class=\"product_price int_price\">\n                    1\n            </span>",
+        "marca": "<a href=\"/fabricante/coolmod/\">\n                            COOLMOD\n                        </a>",
+        "referencia_oem": "<span class=\"copy-product-info\">112030</span>"
+      },
+      "nota": "Recorte. El precio va partido: la evidencia es el entero («1»); los céntimos («95») están justo después, en <span class=\"dec_price\">. «Código» PROD-000003 es interno y el EAN no es la referencia."
+    },
+    {
+      "id": "webscraper-packard-255-g2",
+      "fixture": "reales/webscraper_ficha_31.html",
+      "url": "https://webscraper.io/test-sites/e-commerce/static/product/31",
+      "tienda": "webscraper.io",
+      "sector": "informática",
+      "real": true,
+      "moneda": "USD",
+      "esperado": {
+        "precio": "416.99",
+        "referencia_oem": null,
+        "estado": null
+      },
+      "evidencia": {
+        "precio": "<span itemprop=\"price\">$416.99</span>"
+      },
+      "nota": "Página real de un sitio de pruebas de scraping (catálogo ficticio), en dólares. La marca se omite: la página no tiene campo de marca, solo el nombre «Packard 255 G2»."
+    },
+    {
+      "id": "amazon-brita-on-tap-v-mf",
+      "fixture": "reales/amazon_ficha_titulo_lejos_del_precio_chromium.html",
+      "url": "https://www.amazon.es/BRITA-recambio-sistemas-bacterias-micropart%C3%ADculas/dp/B07YG63BQJ",
+      "tienda": "amazon.es",
+      "sector": "hogar",
+      "real": true,
+      "esperado": {
+        "precio": "22.95",
+        "marca": "BRITA"
+      },
+      "evidencia": {
+        "precio": "22,95&nbsp;€ con un ahorro del 15&nbsp;%",
+        "marca": "<span class=\"a-size-base po-break-word\">BRITA<"
+      },
+      "nota": "Recorte grande renderizado con Chromium. 22,95 € es el precio a pagar; 26,95 € es el recomendado (tachado) y 22,49 € es «otros vendedores desde». Referencia y estado omitidos: el recorte no trae número de modelo (solo un GTIN y «V-MF» dentro del nombre) y «Nueva & De segunda mano (25)» habla de otras ofertas."
+    },
+    {
+      "id": "bricodepot-taladro-bosch-060119c801",
+      "fixture": "reales/bricodepot_ficha_jsonld_precio_tachado.html",
+      "url": "https://www.bricodepot.es/taladro-percutor-1100w-gsb-24-2-en-caja-l-case-bosch-060119c801-48da9018",
+      "tienda": "bricodepot.es",
+      "sector": "bricolaje",
+      "real": true,
+      "esperado": {
+        "precio": "228.96",
+        "marca": "Bosch",
+        "referencia_oem": "060119c801",
+        "estado": null
+      },
+      "evidencia": {
+        "precio": "<span>228</span><span><span class=\"price-top\">96</span><span class=\"price-bottom\">€</span>",
+        "marca": "Perforador gsb24-2 1100w - Bosch - con maletín - 060119c801",
+        "referencia_oem": "Perforador gsb24-2 1100w - Bosch - con maletín - 060119c801"
+      },
+      "nota": "Recorte. Precio en oferta partido en entero y céntimos; 316,54 € es el precio tachado. Marca y referencia solo aparecen dentro del nombre del producto (y «Marca : BOSCH» en la descripción del JSON-LD)."
+    },
+    {
+      "id": "bricodepot-filtro-carbono-13-2",
+      "fixture": "reales/bricodepot_ficha_precio_centimos_en_span.html",
+      "url": "https://www.bricodepot.es/filtro-de-carbono-o-13-2-cm-3663602843092",
+      "tienda": "bricodepot.es",
+      "sector": "bricolaje",
+      "real": true,
+      "esperado": {
+        "precio": "14.95",
+        "referencia_oem": null,
+        "estado": null
+      },
+      "evidencia": {
+        "precio": "<span>14</span><span><span class=\"price-top\">95</span><span class=\"price-bottom\">€</span>"
+      },
+      "nota": "Recorte. Precio partido en entero y céntimos. Solo hay un EAN (gtin13), que no es referencia de fabricante. La marca se omite: el JSON-LD la da como identificador interno («cooke_lewis»), no como se escribiría."
+    },
+    {
+      "id": "carrefour-gel-greenatural",
+      "fixture": "reales/carrefour_ficha_marca_jsonld_del_vendedor.html",
+      "url": "https://carrefour.es/gel-de-bano-delicado-aloe-vera-y-aceite-de-oliva-greenatural-1-l/8052400932582/p",
+      "tienda": "carrefour.es",
+      "sector": "droguería",
+      "real": true,
+      "esperado": {
+        "precio": "19.33",
+        "marca": "Greenatural",
+        "referencia_oem": null,
+        "estado": null
+      },
+      "evidencia": {
+        "precio": "19,33 €",
+        "marca": "Gel De Baño Delicado Aloe Vera Y Aceite De Oliva Greenatural 1 L"
+      },
+      "nota": "Recorte. El JSON-LD pone como brand al vendedor del marketplace (PLANETA HUERTO B2C), que no es la marca; la marca solo se lee en el nombre del producto. Solo hay EAN, no referencia de fabricante."
+    },
+    {
+      "id": "dia-aceite-almazara-del-olivar",
+      "fixture": "reales/dia_ficha_marca_bloque_responsable.html",
+      "url": "https://www.dia.es/aceites-salsas-y-especias/aceites/p/112529",
+      "tienda": "dia.es",
+      "sector": "alimentación",
+      "real": true,
+      "esperado": {
+        "precio": "4.35",
+        "referencia_oem": null,
+        "estado": null
+      },
+      "evidencia": {
+        "precio": "data-test-id=\"buy-box-active-price\">4,35 €</p>"
+      },
+      "nota": "Recorte. «(4,35 €/LITRO)» es el precio por unidad de medida, que aquí coincide. La marca se omite: no hay campo de marca y el nombre («Dia La Almazara del Olivar») admite más de una lectura."
+    },
+    {
+      "id": "zalando-nike-club-tee",
+      "fixture": "reales/zalando_ficha_referencia_lee_material_nike.html",
+      "url": "https://www.zalando.es/nike-sportswear-club-tee-camiseta-basica-ni122o0ce-a12.html",
+      "tienda": "zalando.es",
+      "sector": "moda",
+      "real": true,
+      "esperado": {
+        "precio": "16.95",
+        "marca": "Nike Sportswear",
+        "referencia_oem": null,
+        "estado": null
+      },
+      "evidencia": {
+        "precio": "16,95 €</span>",
+        "marca": "data-testid=\"product_title-brand-name\">Nike Sportswear</span>"
+      },
+      "nota": "Recorte. «Número de artículo» NI122O0CE-A12 es el código de artículo de Zalando (id de la tienda), por eso la referencia esperada es null."
+    },
+    {
+      "id": "footlocker-nike-zoom-vomero-18",
+      "fixture": "reales/footlocker_ficha_variantes_jsonld.html",
+      "url": "https://www.footlocker.es/es/product/nike-zoom-vomero-18-hombre-zapatillas/314218739804.html",
+      "tienda": "footlocker.es",
+      "sector": "moda",
+      "real": true,
+      "esperado": {
+        "precio": "100.00",
+        "marca": "Nike",
+        "referencia_oem": null,
+        "estado": "Nuevo"
+      },
+      "evidencia": {
+        "precio": "aria-hidden=\"true\">€ 100,00</span>",
+        "marca": "\"name\": \"Nike\"",
+        "estado": "\"itemCondition\": \"NewCondition\""
+      },
+      "nota": "Recorte. Ficha con variantes de color: la de esta URL (sku 314218739804) cuesta 100,00 €; otras variantes del JSON-LD tienen otros precios (p. ej. 115 €) y 149,99 € es el precio original tachado. El sku es el número de producto de la tienda."
+    },
+    {
+      "id": "kiwoko-hills-puppy-medium-18kg",
+      "fixture": "reales/kiwoko_ficha_variantes_seleccionada.html",
+      "url": "https://www.kiwoko.com/perros/especial-cachorro/pienso-para-cachorros/hill_s-science-plan-pienso-pollo-para-cachorros-de-razas-medianas/HIL5224DA_M.html",
+      "tienda": "kiwoko.com",
+      "sector": "mascotas",
+      "real": true,
+      "esperado": {
+        "precio": "83.99",
+        "marca": "Hill's",
+        "referencia_oem": null,
+        "estado": "Nuevo"
+      },
+      "evidencia": {
+        "precio": "aria-label=\"Selecci&oacute;n actual, 18 kg, 83.99&euro;",
+        "marca": "\"brand\":{\"@type\":\"Brand\",\"name\":\"Hill's\"}",
+        "estado": "\"itemCondition\":\"http://schema.org/NewCondition\""
+      },
+      "nota": "Recorte. Cuatro formatos con precios de 18,79 € a 164,62 €; el seleccionado es el de 18 kg. El mpn del JSON-LD (HIL5224DA_M) es igual al sku y al productID: es el código de la tienda, no del fabricante."
+    },
+    {
+      "id": "tiendanimal-hills-mature-large-18kg",
+      "fixture": "reales/tiendanimal_ficha_variantes_seleccionada.html",
+      "url": "https://www.tiendanimal.es/hills-science-plan-pienso-pollo-para-perros-mayores-de-razas-grandes/HIL9274M_M.html",
+      "tienda": "tiendanimal.es",
+      "sector": "mascotas",
+      "real": true,
+      "esperado": {
+        "precio": "84.49",
+        "marca": "Hill's",
+        "referencia_oem": null,
+        "estado": "Nuevo"
+      },
+      "evidencia": {
+        "precio": "aria-label=\"Selecci&oacute;n actual, 18 kg, 84.49&euro;",
+        "marca": "\"brand\":{\"@type\":\"Brand\",\"name\":\"Hill's\"}",
+        "estado": "\"itemCondition\":\"http://schema.org/NewCondition\""
+      },
+      "nota": "Recorte. Cuatro formatos con precios de 70,29 € a 165,60 €; el seleccionado es el de 18 kg. El mpn del JSON-LD (HIL9274M_M) es igual al sku y al productID: es el código de la tienda, no del fabricante."
+    },
+    {
+      "id": "tutete-silla-paseo-teresa",
+      "fixture": "reales/tutete_ficha_mpn_id_interno.html",
+      "url": "https://www.tutete.com/tienda/es/117_baneras-bebe/217_silletas/101507_silla-paseo-grande-con-bolsa-teresa.html",
+      "tienda": "tutete.com",
+      "sector": "bebé",
+      "real": true,
+      "esperado": {
+        "precio": "34.90",
+        "marca": "Así",
+        "referencia_oem": null,
+        "estado": "Nuevo"
+      },
+      "evidencia": {
+        "precio": "<h3 class=\"precio-producto\" style=\"line-height:inherit;\">34.90&euro;</h3>",
+        "marca": "itemprop=\"brand\">Así</a>",
+        "estado": "\"itemCondition\": \"https://schema.org/NewCondition\""
+      },
+      "nota": "Recorte. El mpn del JSON-LD (101507) es el id del producto en la URL de la tienda y el sku es un EAN; ninguno es referencia de fabricante. 3,5 € del JSON-LD son gastos de envío."
+    },
+    {
+      "id": "todostuslibros-la-puerta-de-no-retorno",
+      "fixture": "reales/todostuslibros_ficha_jsonld_book.html",
+      "url": "https://www.todostuslibros.com/libros/la-puerta-de-no-retorno_978-84-8393-395-4",
+      "tienda": "todostuslibros.com",
+      "sector": "libros",
+      "real": true,
+      "esperado": {
+        "precio": "20.00",
+        "estado": "Nuevo"
+      },
+      "evidencia": {
+        "precio": "<strong class=\"js-main-book-price-final\">20,00€</strong>",
+        "estado": "\"itemCondition\": \"http://schema.org/NewCondition\""
+      },
+      "nota": "Recorte. Libro: marca y referencia omitidas (no está claro si la editorial y el ISBN cuentan como tales). El «20,00€» tachado está oculto con display:none y vale lo mismo."
+    },
+    {
+      "id": "casadellibro-clasicos-sin-filtros",
+      "fixture": "reales/casadellibro_audiolibro_jsonld.html",
+      "url": "https://www.casadellibro.com/audiolibro-clasicos-sin-filtros-audiolibro/9788491999133/18238326",
+      "tienda": "casadellibro.com",
+      "sector": "libros",
+      "real": true,
+      "esperado": {
+        "precio": "18.04",
+        "estado": "Nuevo"
+      },
+      "evidencia": {
+        "precio": "aria-label=\"precio final 18,04 €\"",
+        "estado": "\"itemCondition\":\"http://schema.org/NewCondition\""
+      },
+      "nota": "Recorte. Audiolibro: 18,99 € es el precio anterior tachado. Marca y referencia omitidas (no está claro si la editorial y el ISBN cuentan como tales)."
+    }
+  ]
+}

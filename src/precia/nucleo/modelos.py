@@ -343,11 +343,29 @@ class Alerta:
     ultima_activacion: datetime | None = None
     solo_exactas: bool = True
     """Solo cuentan las ofertas con la referencia exacta (por defecto, decisión de Julio)."""
+    avisada: bool = False
+    """Ya se envió el aviso de esta bajada: no se repite hasta que el precio vuelva a subir."""
+    ultimo_error: str = ""
+    """Por qué no se pudo avisar o comprobar la última vez ("" si fue bien). Sin secretos."""
+    ultima_comprobacion: datetime | None = None
 
     @property
     def coincidencias(self) -> frozenset[Coincidencia]:
         """Las ofertas que cuentan para esta alerta (para `GrupoProducto.mejor_oferta_de`)."""
         return SOLO_EXACTAS if self.solo_exactas else frozenset(Coincidencia)
+
+
+@dataclass(frozen=True, slots=True)
+class InformeAlertas:
+    """Resultado de una comprobación de las alertas (H7)."""
+
+    fecha: datetime
+    comprobadas: int
+    """Alertas activas que se han mirado."""
+    avisos: int
+    """Avisos enviados."""
+    errores: tuple[str, ...] = ()
+    """Lo que ha fallado (búsqueda o envío), en frases para la web. Sin secretos."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,6 +417,10 @@ class ResultadoEvaluacion:
     coste_usd: Decimal
     tiempo_s: float
     tasa_bloqueo: float
+    casos: int = 0
+    """Casos etiquetados con que se midió (0 si no se sabe)."""
+    detalle: str = ""
+    """Cuándo se midió y con qué modelo, para enseñarlo junto a la fila."""
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,6 +1,7 @@
 """Arranque de la web: demo o datos reales según la configuración, y cierre de la fuente."""
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -148,3 +149,24 @@ def test_apagar_cancela_las_busquedas_antes_de_cerrar_la_fuente() -> None:
 
     asyncio.run(escenario())
     assert fuente.orden == ["cancelada", "cerrar"]
+
+
+def test_main_escucha_donde_dice_la_configuracion_en_un_contenedor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    falso = Uvicorn()
+    monkeypatch.setattr(uvicorn, "run", falso)
+    config = replace(configuracion(tmp_path, demo=True), host="0.0.0.0")
+    monkeypatch.setattr(Config, "cargar", classmethod(lambda cls: config))
+    with caplog.at_level("WARNING"):
+        principal.main([])
+    ((app, opciones),) = falso.llamadas
+    assert opciones["host"] == "0.0.0.0"
+    assert opciones.get("proxy_headers") is False
+    # Aviso de que no hay autenticación: solo vale detrás de un puerto publicado en local.
+    assert "0.0.0.0" in caplog.text and "túnel" in caplog.text
+    # Aunque escuche en todas las interfaces, la web solo responde con el Host local.
+    assert ClienteASGI(app, host="203.0.113.7:8000").get("/").estado == 400
+    assert ClienteASGI(app, host="precia.example").get("/").estado == 400
+    assert ClienteASGI(app).get("/").estado == 200
+    asyncio.run(app.state.fuente.cerrar())

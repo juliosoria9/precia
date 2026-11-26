@@ -1,0 +1,27 @@
+# Despliegue de PrecIA en un VPS (H9): `docker compose up -d --build`.
+# Entrar desde el portátil: `ssh -L 8000:127.0.0.1:8000 usuario@servidor` y abrir
+# http://127.0.0.1:8000. No publiques el puerto en 0.0.0.0: la web no tiene autenticación.
+services:
+  precia:
+    build: .
+    image: precia:local
+    restart: unless-stopped
+    # Claves y avisos (ANTHROPIC_API_KEY, PRECIA_SMTP_*, PRECIA_TELEGRAM_*...). No se sube a git.
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - precia-datos:/app/datos
+      - precia-cache:/app/cache
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Chromium necesita más memoria compartida que los 64 MB por defecto.
+    shm_size: "512m"
+
+volumes:
+  precia-datos:
+  precia-cache:

@@ -17,14 +17,22 @@ no se consiguen, se avisa (sin secretos), se sigue sin proxy y «Ajustes» ense�
 """
 
 import asyncio
+import contextlib
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
 
-from precia.almacen.sqlite import Almacen, DatoNoValido, TiendaDuplicada, TiendaNoEncontrada
+from precia.almacen.sqlite import (
+    AlertaNoEncontrada,
+    Almacen,
+    DatoNoValido,
+    TiendaDuplicada,
+    TiendaNoEncontrada,
+)
 from precia.emparejado.agrupador import componente_revision
+from precia.evaluacion.informe import leer_resultados
 from precia.ia.claude import ProveedorClaude
 from precia.ia.ollama import ProveedorOllama
 from precia.ia.servicio import LlamadasEnVuelo, ServicioIA
@@ -57,6 +65,7 @@ from precia.navegador.url import Validador, validar_url
 from precia.nucleo.config import Config
 from precia.nucleo.dominios import dominio_de_tienda, normalizar_dominio
 from precia.nucleo.fuente_datos import (
+    AlertaNoExiste,
     ErrorFuente,
     RevisionNoValida,
     TiendaNoExiste,
@@ -71,6 +80,7 @@ from precia.nucleo.modelos import (
     ConsultaBusqueda,
     EstadoProxy,
     GrupoProducto,
+    InformeAlertas,
     ResultadoBusqueda,
     ResultadoEvaluacion,
     ResumenIA,
@@ -86,6 +96,8 @@ from precia.nucleo.orquestador import (
     TurnosDePerfil,
     estado_de,
 )
+from precia.seguimiento.alertas import comprobar
+from precia.seguimiento.avisos import Canal, canales_desde
 
 registro = logging.getLogger(__name__)
 
@@ -99,6 +111,8 @@ ESPERA_IA_AL_CERRAR_S = 60.0
 """Lo que `cerrar` espera como mucho a las llamadas de IA en vuelo: el timeout de la API de
 Claude (`ProveedorClaude`), así que en la práctica espera a que terminen."""
 MAX_LLAMADAS_RESUMEN = 500
+FICHERO_EVALUACION = "evaluacion.json"
+"""Donde `python -m precia.evaluacion` deja sus resultados, junto a la base de datos."""
 MAX_NOMBRE_TIENDA = 200
 COMPONENTES = {
     "configurador": "Configurador de perfiles",
@@ -180,6 +194,7 @@ class FuenteReal:
         max_fichas: int = MAX_FICHAS,
         credenciales_evomi: CredencialesEvomi = credenciales_evomi,
         consultas_configuracion: Sequence[str] = CONSULTAS_CONFIGURACION,
+        canales: Mapping[str, Canal] | None = None,
     ) -> None:
         """`validador` es el anti-SSRF de todo el flujo; solo se cambia en los tests.
 
@@ -188,6 +203,9 @@ class FuenteReal:
 
         El proxy solo se usa con los descargadores reales: con `crear_descargadores` inyectado
         (tests, demo) no se interpreta ni se piden credenciales.
+
+        `canales` son los canales de aviso de las alertas (H7); por defecto, los que estén
+        configurados en el entorno o en `.env` (`config.avisos`).
         """
         self._config = config
         self._validador = validador
@@ -220,6 +238,10 @@ class FuenteReal:
         """Compartidos por las búsquedas simultáneas: una tienda no se configura ni se repara
         dos veces a la vez (B6)."""
         self._candado = asyncio.Lock()
+        self._motivos_canal: Mapping[str, str] = {}
+        if canales is None:
+            canales, self._motivos_canal = canales_desde(config.avisos.get)
+        self._canales = canales
         self.plazo_tienda_s = PLAZO_TIENDA_S
         """Lo que puede tardar cada tienda en una búsqueda (C1); los tests lo acortan."""
 
@@ -275,6 +297,7 @@ class FuenteReal:
             plazo_tienda_s=self.plazo_tienda_s,
             revisar_resultados=ajustes.revisar_resultados,
             turnos_perfil=self._turnos_perfil,
+            google_activado=ajustes.google_activado,
         )
         return await orquestador.buscar(consulta, seguimiento=seguimiento)
 
@@ -523,6 +546,55 @@ class FuenteReal:
     ) -> Alerta:
         return self._almacen.crear_alerta(id_producto, umbral, canal, solo_exactas=solo_exactas)
 
+    def cambiar_alerta(self, id_alerta: int, *, activa: bool) -> None:
+        try:
+            self._almacen.cambiar_alerta(id_alerta, activa=activa)
+        except AlertaNoEncontrada as error:
+            raise AlertaNoExiste("La alerta ya no existe.") from error
+
+    def borrar_alerta(self, id_alerta: int) -> None:
+        try:
+            self._almacen.borrar_alerta(id_alerta)
+        except AlertaNoEncontrada as error:
+            raise AlertaNoExiste("La alerta ya no existe.") from error
+
+    async def comprobar_alertas(self) -> InformeAlertas:
+        """Repite, en modo clásico, la búsqueda de cada producto con alertas activas y avisa.
+
+        Las búsquedas pasan por `buscar`: mismo navegador, misma cortesía por dominio y los
+        precios quedan en el histórico. Sin IA: no gasta presupuesto.
+        """
+
+        def anotar(
+            id_alerta: int,
+            *,
+            comprobada: datetime,
+            avisada: bool | None = None,
+            error: str = "",
+        ) -> None:
+            # Si la borraron mientras se comprobaba, no hay nada que apuntar.
+            with contextlib.suppress(AlertaNoEncontrada):
+                self._almacen.anotar_alerta(
+                    id_alerta, comprobada=comprobada, avisada=avisada, error=error
+                )
+
+        return await comprobar(
+            self._almacen.alertas(),
+            producto=self._almacen.producto,
+            buscar=self.buscar,
+            canales=self._canales,
+            motivos=self._motivos_canal,
+            anotar=anotar,
+            reloj=self._reloj,
+        )
+
+    def canales_aviso(self) -> dict[str, str]:
+        estado: dict[str, str] = {}
+        for canal in ("email", "telegram"):
+            falta = self._motivos_canal.get(canal, "Sin configurar.")
+            estado[canal] = "" if canal in self._canales else falta
+        return estado
+
     # --- IA, ajustes y evaluación -----------------------------------------------------------
 
     def resumen_ia(self) -> ResumenIA:
@@ -553,4 +625,11 @@ class FuenteReal:
         self._almacen.guardar_ajustes(ajustes)
 
     def evaluacion(self) -> list[ResultadoEvaluacion]:
-        return []
+        """Lo último que midió el banco (`python -m precia.evaluacion`), que lo guarda junto a
+        la base de datos. La tasa de bloqueo no la mide el banco: es la de las tiendas dadas de
+        alta que han devuelto algún bloqueo en las búsquedas reales."""
+        tiendas = self._almacen.tiendas()
+        bloqueadas = sum(1 for t in tiendas if t.bloqueos > 0)
+        tasa = bloqueadas / len(tiendas) if tiendas else 0.0
+        ruta = self._config.ruta_bd.parent / FICHERO_EVALUACION
+        return leer_resultados(ruta, tasa_bloqueo=tasa)

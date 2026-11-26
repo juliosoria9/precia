@@ -6,6 +6,7 @@
   <p class="sub">Mide con datos lo que aporta la IA: los mismos casos etiquetados se resuelven en cada modo y se comparan cobertura, exactitud, coste, tiempo y tasa de bloqueo.</p>
 </section>
 
+{% set medidos = resultados | map(attribute="modo") | list %}
 <section class="tarjeta">
   <div class="tabla-contenedor">
     <table class="tabla">
@@ -15,31 +16,32 @@
       <tbody>
         {% for e in resultados %}
         <tr>
-          <td>{{ e.modo }}</td>
+          <td>{{ e.modo }}{% if e.casos or e.detalle %}<br><small class="tenue">{% if e.casos %}{{ e.casos }} casos{% endif %}{% if e.casos and e.detalle %}, {% endif %}{{ e.detalle }}</small>{% endif %}</td>
           <td class="num">{{ (e.cobertura * 100) | decimal(0) }} %</td>
           <td class="num">{{ (e.exactitud * 100) | decimal(0) }} %</td>
           <td class="num">{{ e.coste_usd | dolares }}</td>
-          <td class="num">{{ e.tiempo_s | decimal }} s</td>
+          <td class="num">{{ e.tiempo_s | decimal(3 if e.tiempo_s < 1 else 1) }} s</td>
           <td class="num">{{ (e.tasa_bloqueo * 100) | decimal(0) }} %</td>
         </tr>
-        {% else %}
-        {% for modo in ["Clásico (sin IA)", "IA local (Ollama)", "IA por API (Claude)", "Línea base: Crawl4AI"] %}
-        <tr class="fila-vacia"><td>{{ modo }}</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td></tr>
         {% endfor %}
+        {% for modo in ["Clásico (sin IA)", "IA local (Ollama)", "IA por API (Claude)", "Línea base: Crawl4AI"] if modo not in medidos %}
+        <tr class="fila-vacia"><td>{{ modo }}</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td></tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
-  {% if not resultados %}<p class="tenue">Sin mediciones todavía: el banco de evaluación se ejecuta en el hito H8.</p>{% endif %}
+  {% if not resultados %}<p class="tenue">Sin mediciones todavía (hito H8). El banco se lanza desde la terminal con <code>python -m precia.evaluacion</code>.</p>
+  {% else %}<p class="tenue">Para repetir la medición o medir los modos que faltan: <code>python -m precia.evaluacion --modos clasico api local</code>. El modo <code>api</code> gasta de la clave de Claude; la línea base con Crawl4AI no se ha medido.</p>{% endif %}
 </section>
 
 <section class="tarjeta nota">
   <h2>Métricas</h2>
   <dl class="datos">
-    <div><dt>Cobertura</dt><dd>% de fichas de las que se obtiene el campo pedido.</dd></div>
-    <div><dt>Exactitud</dt><dd>% de valores que coinciden con la etiqueta manual.</dd></div>
-    <div><dt>Coste</dt><dd>$ por búsqueda, a partir del registro de IA.</dd></div>
-    <div><dt>Bloqueos</dt><dd>% de dominios que devuelven CAPTCHA o bloqueo.</dd></div>
+    <div><dt>Cobertura</dt><dd>% de los campos que la página tiene, según la etiqueta manual, que se obtienen.</dd></div>
+    <div><dt>Exactitud</dt><dd>% de los valores obtenidos que coinciden con la etiqueta; un valor sacado de una página que no lo tiene cuenta como fallo.</dd></div>
+    <div><dt>Coste</dt><dd>$ por ficha, del registro de IA de la ejecución del banco.</dd></div>
+    <div><dt>Tiempo</dt><dd>Segundos por ficha, sin contar la descarga: las páginas están guardadas.</dd></div>
+    <div><dt>Bloqueos</dt><dd>% de las tiendas dadas de alta que han devuelto algún CAPTCHA o bloqueo. No lo mide el banco: sale de las búsquedas reales.</dd></div>
   </dl>
 </section>
 {% endblock %}

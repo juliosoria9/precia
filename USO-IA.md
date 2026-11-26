@@ -269,3 +269,28 @@ También están en la tabla «Errores de la IA detectados» de `BITACORA.md`.
 **Errores de la IA detectados:** tests mal montados y un escape perdido en un heredoc al implementar la foto; con 3 búsquedas a la vez se podía romper la cortesía (robots.txt fuera del turno, filas distintas para `www.` y sin `www.`); un `sed -i` y tres tests mal montados en la tanda 3; el primer arreglo del precio partido aceptaba otro importe. Todos están en la tabla «Errores de la IA detectados» de `BITACORA.md`.
 
 **Validación:** medida real antes y después (BITACORA 2026-10-24 23:44): dos búsquedas sobre 4 tiendas pasan de 23,3 s una tras otra a 11,2 s a la vez, sin solapes de peticiones al mismo host y sin ningún 429 ni 403; amazon.es se configura sola en la ronda 10 con 5 ofertas y el precio vigente anclado, por 0,014 USD.
+
+### S06: alertas, Google, banco de evaluación y Docker (2026-11-24/25, rama `h7/envio-alertas`, sin commit)
+
+**Herramienta:** Claude Code (modelo Claude Fable 5.2), con un subagente para etiquetar los casos del banco.
+
+**Petición de Julio:** «hay que terminarlo».
+
+**Qué generó la IA (todo pendiente de revisión de Julio):**
+- **H7:** `seguimiento/avisos.py` (email con `smtplib` y Telegram con `urllib`), `seguimiento/alertas.py`, `seguimiento/planificador.py`, la migración 13 del almacén, las rutas y la pantalla de Alertas, y sus tests.
+- **H5:** `fuentes/google.py`, `fuentes/clasificador.py`, `fuentes/descubridor.py` y su integración en el orquestador, con sus tests y un fixture de resultados de Google **sintético**.
+- **H8:** el paquete `evaluacion/` (métricas, casos, banco, informe y CLI), la pantalla de Evaluación y los 25 casos etiquetados de `evaluacion/casos/recambios.json` (etiquetas puestas por un subagente leyendo el HTML guardado, sin usar el extractor de PrecIA).
+- **H9:** `Dockerfile`, `docker-compose.yml`, `.dockerignore` y el ajuste `PRECIA_HOST`.
+- Documentación: README, `.env.example`, bitácora, diario y notas del vault.
+
+**Decisiones que tomó la IA y debe confirmar Julio:** alerta con el precio estrictamente por debajo del objetivo; 12 h entre comprobaciones; «Borrar» sin confirmación; topes del descubrimiento (8 páginas y 3 tiendas nuevas por búsqueda) y su lista negra; que el banco mida la extracción de fichas guardadas y no búsquedas completas; el diseño del despliegue (puerto solo en el `127.0.0.1` del servidor y túnel SSH).
+
+**Lo que la IA no hizo, y por qué:** no resolvió el CAPTCHA de Google (bloqueó las tres vías); no guardó una página real de resultados de Google (el permiso para usar un navegador externo se denegó y no se rodeó); no ejecutó el banco en modo `api` (gasta dinero de la clave) ni en modo `local`; no desplegó en el VPS; no probó un envío real de email ni de Telegram (no hay credenciales); no hizo commit ni push.
+
+**Errores de la IA detectados:** dos veces escribió tests e implementación seguidos sin ver antes el test en rojo (`avisos.py` y el CLI del banco); un `Dockerfile` que no se construía (faltaba `libatomic1`); un import que faltaba en el orquestador (lo vieron `ruff` y `mypy`). Están en la tabla «Errores de la IA detectados» de la bitácora.
+
+**Validación:** `ruff check .`, `ruff format --check .` (269 ficheros), `mypy` (263 ficheros) y `pytest` completo: **5034 passed** en 353,6 s. Pruebas reales: pantalla de Alertas en el navegador (modo demo), medición de Google (0 de 3 vías), banco en modo clásico (cobertura 67 %, exactitud 98 %) y contenedor de Docker construido y arrancado.
+
+**Entrega final (2026-11-25).** A partir del enunciado que pegó Julio, Claude Code midió Bing y DuckDuckGo como alternativa a Google (a petición de Julio: «sobre todo con bing»), buscó credenciales en el repositorio, repitió las puertas y redactó en `../memoria-entrega-final/` el borrador de la memoria final (con su PDF y las evidencias) y una presentación de 9 diapositivas con notas. **Todo pendiente de revisión de Julio**; la exposición y el vídeo los hace él. Error de la IA detectado al verificar el borrador: una cifra sin respaldo y dos casos de prueba que no correspondían a tests (en la tabla de la bitácora).
+
+**Cierre de la entrega final (2026-11-26).** Julio preguntó si la entrega tenía un avance «contundente» y aprobó el plan que propuso Claude Code («vale pues hazlo»). La IA hizo cinco commits por bloques del trabajo de S06, los subió y abrió la PR #2; arregló un aviso de `ruff` que solo salía con la versión de la CI; ejecutó el banco en modo API (cobertura 94 % frente a 67 %, exactitud 87 % frente a 98 %, 0,0035 $) y actualizó la memoria y la presentación. **No integró DuckDuckGo:** el día anterior había dado 10 tiendas de 10 y ahora pedía un CAPTCHA por todas las vías; fue un error de la IA apoyar la propuesta en una sola muestra (en la tabla de la bitácora). No se pudo enviar un aviso real (no hay Telegram ni correo configurados) ni fusionar la PR (permiso denegado): quedan para Julio.

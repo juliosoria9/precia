@@ -30,6 +30,11 @@ Alimenta la memoria §3 («método de validación del código generado»).
 
 | Fecha | Qué hizo mal la IA | Cómo se detectó | Corrección |
 |---|---|---|---|
+| 2026-11-26 | Presentó la medida de DuckDuckGo del 25-11 (una sola muestra, 10 tiendas de 10) como base para integrarlo y dar a la entrega final un avance «contundente» | Al ir a integrarlo, 24 h después, DuckDuckGo pedía un CAPTCHA por todas las vías, también por el proxy residencial | No se integra; la memoria lo cuenta como límite y no como continuación segura |
+| 2026-11-25 | En el borrador de la memoria final escribió «26 decisiones registradas» sin haberlo contado, y dos casos de la tabla de seguridad (correo sin cifrado rechazado, códigos 400 o 403) que no correspondían a ningún test | Al comprobar cada cifra contra el vault y los nombres de los tests antes de generar el PDF | Cifra quitada y las dos filas cambiadas por casos que sí tienen test (cabeceras inyectadas en el correo; CSRF, XSS y `Host` ajeno) |
+| 2026-11-25 | Escribió un `Dockerfile` sobre `python:3.13-slim` sin `libatomic1`, que necesita el Node de Playwright | `docker build` real (exit 127) | `apt-get install libatomic1` antes de `pip install`; imagen construida y contenedor probado |
+| 2026-11-25 | En el banco de evaluación escribió los tests del CLI y de la fuente junto con su implementación, sin verlos antes en rojo (segunda vez en la sesión) | La propia IA, al apuntar el diario | Señalado para la revisión de Julio |
+| 2026-11-24 | En `seguimiento/avisos.py` (H7) escribió tests e implementación seguidos y los ejecutó juntos, sin ver antes los tests en rojo (regla de TDD del proyecto) | La propia IA, al apuntar la entrada del diario | El resto de H7 se hizo con el test en rojo primero; los 49 tests de `avisos.py` quedan señalados para la revisión de Julio |
 | 2026-10-25 | Al quitar la opción de respetar el robots.txt, borró también la fila «robots.txt» de Tiendas y de la ficha de la tienda (parte del aviso que Julio pidió conservar) y no vio que un robots.txt con un 5xx, un 429 o un error de red seguía contando como «lo prohíbe»: sin la opción, su único efecto era un aviso falso «Lo prohíbe; se ignora» | Revisor escéptico | Fila devuelta y `ServicioRobots.ilegible`; el navegador no anota como ignorado un robots.txt que no se pudo leer (TDD) |
 | 2026-10-25 | Al quitar `respetar_robots`, no vio que `Navegador` lo tenía a `True` por defecto y se le pasó un test que dependía de eso (`test_bloqueo_en_robots_no_va_por_chromium`, sin la palabra «respetar»); además pasó `ruff format` a todo `src` y `tests` en vez de solo a los ficheros tocados | `pytest` de los paquetes afectados (1 fallo: «DID NOT RAISE Bloqueado»); lo de `ruff format` se vio al repasar el comando | Test reescrito con el comportamiento nuevo (la página se pide por HTTP y Chromium no se usa). De la primera pasada de `ruff format` no se sabe qué ficheros cambió, porque su salida se descartó; la segunda cambió uno, ya tocado en la tarea. Hay que mirarlo en el diff antes del commit |
 | 2026-10-25 | Interpretó al revés «quita lo de si lo prohibe robots.txt»: empezó a quitar el aviso informativo en vez de la opción de no visitar la tienda si el robots.txt lo prohíbe | Julio rechazó la edición y lo aclaró | Se deshicieron los dos cambios escritos y se quitó la opción respetar_robots (ADR-017, enmienda) |
@@ -1974,3 +1979,97 @@ Alimenta la memoria §3 («método de validación del código generado»).
 ### 2026-10-25 12:20 · 🔧 Solución · El aviso del robots.txt vuelve a Tiendas y solo sale si se ha leído una regla
 - **Qué se hizo:** con TDD, vuelve la fila «robots.txt» en Tiendas y en la ficha. `ServicioRobots.ilegible(url)` marca los orígenes cuyo robots.txt no se pudo leer y el navegador no los anota como ignorados. En la demo, una tienda sin perfil (no se visita) ya no enseña el paso del robots.txt. Se descartó revertir que AutoDescuento deje de salir omitida, porque salía omitida solo por el robots.txt. 4751 tests en verde, ruff y mypy sin errores.
 - **Para la memoria:** §4 (el robots.txt) · §3 · S03
+
+### 2026-11-24 23:44 · ✅ Avance · Las alertas ya avisan: email, Telegram y comprobación periódica (H7)
+- **Qué pasó:** H7 tenía las alertas a medias: se creaban y se listaban, pero no se enviaba nada. Ahora PrecIA repite cada 12 horas (configurable) la búsqueda de cada producto con alerta, en modo clásico y sin IA, y avisa por email (`smtplib`) o Telegram (`urllib`) cuando el mejor precio queda por debajo del objetivo. Avisa una sola vez por bajada y se rearma cuando el precio vuelve a subir. La pantalla de Alertas enseña el estado de cada una, deja pausar, reanudar, borrar y «Comprobar ahora», y dice qué canal falta por configurar.
+- **Causa / contexto:** petición «hay que terminarlo» (S06). Todo con librería estándar: ninguna dependencia nueva.
+- **Qué se hizo:** `seguimiento/avisos.py`, `seguimiento/alertas.py`, `seguimiento/planificador.py`, migración 13 del almacén (estado de cada alerta) y rutas nuevas en la web. Seguridad: el aviso es texto plano (el nombre del producto viene de una web ajena y no puede inyectar cabeceras de correo ni formato de Telegram), el correo solo sale cifrado, un precio no anclado en la página nunca dispara una alerta y los secretos van en `.env` y no aparecen en ningún error.
+- **Lección:** la alerta se decide con el precio de la búsqueda repetida y no con el guardado; si no, una tienda que hoy no responde podría disparar un aviso con un precio de hace semanas.
+- **Para la memoria:** §5 (flujo: salida) · §6 (H7) · §4 (riesgos: dato no confiable en los avisos) · S06
+
+### 2026-11-24 23:44 · 📏 Medida · Tests tras H7
+- **Qué pasó:** `pytest` completo: 4884 en verde en 199,6 s (4744 al cerrar S03). `ruff check`, `ruff format --check` (252 ficheros) y `mypy` (247 ficheros) sin errores.
+- **Para la memoria:** §6 · Eval · S06
+
+### 2026-11-24 23:44 · ❌ Fallo · La IA se saltó el «test en rojo» en el primer módulo de H7
+- **Qué pasó:** en `seguimiento/avisos.py`, Claude escribió los tests y la implementación seguidos y los ejecutó juntos: nunca vio fallar esos 49 tests, así que no hay prueba de que cada uno pueda fallar.
+- **Causa / contexto:** prisa por avanzar; la regla del proyecto es test que falla, luego implementación.
+- **Qué se hizo:** en el resto de H7 (almacén, comprobación, planificador, fuentes y web) los tests se ejecutaron primero en rojo. Los de `avisos.py` quedan marcados para la revisión de Julio.
+- **Para la memoria:** §3 (validación del código generado) · S06
+
+### 2026-11-24 23:56 · ❌ Fallo · Google bloquea a PrecIA por las tres vías (H5)
+- **Qué pasó:** antes de escribir el módulo propio de Google se midió si Google deja pasar al cliente. La misma búsqueda, por las tres vías que tiene PrecIA: con Chromium, Google redirige a `google.com/sorry` (reCAPTCHA, «tráfico inusual»); con `curl` y la huella de Chrome devuelve la página «habilita JavaScript», sin resultados; y con el navegador completo de la aplicación, tras el bloqueo directo y el reintento por el proxy residencial, otra vez reCAPTCHA. **0 de 3.** No se resuelve el CAPTCHA.
+- **Causa / contexto:** Google exige JavaScript para enseñar resultados y detecta el navegador automatizado. Es justo el riesgo que anunciaba el estado del arte, que recomendaba una API en lugar de leer la página de resultados; el proyecto se apartó de esa recomendación a sabiendas (ADR-006).
+- **Qué se hizo:** el módulo se ha hecho igual (`fuentes/google.py`, `fuentes/clasificador.py`, `fuentes/descubridor.py`), con la detección del bloqueo probada con las dos páginas reales capturadas. Cuando Google bloquea, la búsqueda lo dice («no se intenta resolver») y sigue con las tiendas dadas de alta. La lectura de resultados solo está probada con una página **sintética**: no se pudo guardar una real. **Sin resolver:** en la práctica el descubrimiento no trae tiendas; decide Julio si se cambia de buscador, se usa una API o se deja como resultado negativo documentado.
+- **Lección:** medir la fuente antes de construir sobre ella. Diez minutos de prueba real han evitado dar por bueno un módulo que en producción no devuelve nada.
+- **Para la memoria:** §1 (estado del arte: se confirma su conclusión) · §4 (riesgos) · §6 (H5) · S06
+
+### 2026-11-24 23:56 · ✅ Avance · Descubrimiento de tiendas y clasificador de fichas (H5)
+- **Qué pasó:** una búsqueda con «Descubrir más tiendas con Google» (y el ajuste activado) pide los resultados orgánicos y los de Shopping, abre como mucho 8 páginas de webs nuevas, decide si cada una es la ficha de un producto y da de alta hasta 3 tiendas, que se buscan en esa misma búsqueda. El clasificador decide primero con los datos estructurados (JSON-LD, microdatos, OpenGraph) y solo si queda la duda pregunta a la IA, que devuelve un único sí o no.
+- **Causa / contexto:** petición «hay que terminarlo» (S06); H5 de la memoria.
+- **Qué se hizo:** TDD con 81 tests nuevos sin red. La IA nunca elige URL: las URL salen del HTML de Google, pasan por el anti-SSRF del navegador y se descartan las de la lista negra (redes sociales, comparadores y venta entre particulares, por los datos personales).
+- **Para la memoria:** §4 (componente «clasificador de resultados») · §5 (flujo: fuente Google) · §6 (H5) · S06
+
+### 2026-11-25 00:23 · ✅ Avance · Banco de evaluación con 25 fichas etiquetadas (H8)
+- **Qué pasó:** `python -m precia.evaluacion` resuelve los mismos casos en cada modo y mide cobertura, exactitud, inventados, coste y tiempo. Los casos son 25 fichas guardadas (23 reales, de 18 tiendas y 10 sectores) con su etiqueta: lo que una persona lee en la página.
+- **Causa / contexto:** petición «hay que terminarlo» (S06); es lo que convierte «la IA aporta valor» en un resultado medido (memoria §2).
+- **Qué se hizo:** paquete `evaluacion/` con TDD. Las etiquetas las puso un subagente de IA leyendo el HTML, **sin usar el extractor de PrecIA** (si no, el banco se mediría contra sí mismo), y con una comprobación de que cada valor aparece literalmente en la página. Están **pendientes de la revisión de Julio**: hasta entonces las cifras son provisionales.
+- **Lección:** un valor que la IA devuelve y no está en la página no cuenta como obtenido, igual que en la aplicación; y un valor sacado de una página que no lo tiene se cuenta aparte, como inventado.
+- **Para la memoria:** Eval · §2 · §6 (H8) · S06
+
+### 2026-11-25 00:23 · 📏 Medida · Primera ejecución del banco: modo clásico
+- **Qué pasó:** modo clásico (sin IA, sin perfil de tienda: solo JSON-LD, microdatos y OpenGraph) sobre los 25 casos: **cobertura 67 %, exactitud 98 %, 0 inventados**, 0,013 s por ficha y 0 $. Por campo: precio 76 % (19 de 25, todos correctos), marca 58 % (10 correctos, 1 incorrecto y 8 ausentes de 19), referencia 54 % (7 de 13) y estado 80 % (8 de 10). El único fallo: en Carrefour, la marca del JSON-LD es el vendedor del marketplace («PLANETA HUERTO B2C») y no la del producto.
+- **Causa / contexto:** es la línea base para medir lo que añade la IA. Los modos `api` y `local` **no se han ejecutado**: el primero gasta dinero de la clave de Julio y espera su permiso; del segundo no se ha comprobado que Ollama esté en marcha. La línea base con Crawl4AI tampoco: la dependencia sigue sin aprobar.
+- **Para la memoria:** Eval · S06
+
+### 2026-11-25 00:23 · ✅ Avance · PrecIA arranca en un contenedor de Docker (H9, parte local)
+- **Qué pasó:** `Dockerfile`, `docker-compose.yml` y `.dockerignore`. La imagen (1,4 GB, con el Chromium de Playwright) se construye y el contenedor responde en modo demo.
+- **Causa / contexto:** H9 pide el despliegue en el VPS. La web no tiene autenticación, así que el diseño es: el contenedor escucha en `0.0.0.0` (`PRECIA_HOST`, nuevo, que solo admite ese valor o `127.0.0.1`), el servidor publica el puerto solo en su `127.0.0.1` y se entra por un túnel SSH. La web sigue respondiendo únicamente a los Host locales.
+- **Qué se hizo:** comprobado en este equipo: `/alertas` da 200 con el Host local y 400 con otro Host; el proceso corre con el uid 10001, sin *capabilities*; Chromium arranca dentro del contenedor. **No se ha desplegado en el VPS:** no hay acceso desde esta sesión y es una acción de Julio.
+- **Para la memoria:** §6 (H9) · §7 (Docker) · §8 (hardware) · S06
+
+### 2026-11-25 00:23 · ❌ Fallo · La primera imagen de Docker no se construía
+- **Qué pasó:** `playwright install` falló dentro de `python:3.13-slim` con «libatomic.so.1: cannot open shared object file»: el Node que trae Playwright necesita `libatomic1` y la imagen «slim» no lo incluye.
+- **Qué se hizo:** instalar `libatomic1` con `apt-get` antes de `pip install`. Segunda construcción correcta.
+- **Lección:** el Dockerfile lo escribió la IA de memoria; solo construir la imagen de verdad enseñó el fallo.
+- **Para la memoria:** §3 (validación del código generado) · S06
+
+### 2026-11-25 21:47 · 📏 Medida · Bing y DuckDuckGo como alternativa a Google
+- **Qué pasó:** misma búsqueda (`pastillas de freno 1K0698151`) con los descargadores de PrecIA. **Bing** responde sin CAPTCHA por `curl` y por Chromium, pero sus resultados no tienen que ver con la consulta (farmacias y definiciones de «pastilla»): ninguna tienda de recambios en 3 peticiones. **DuckDuckGo** (`html.duckduckgo.com/html/`, por `curl`, sin JavaScript) responde sin CAPTCHA y sus 10 resultados son tiendas que venden esa referencia.
+- **Causa / contexto:** Google bloquea a PrecIA por las tres vías (entrada del 2026-11-25). Julio preguntó qué buscador podía servir y pidió probar «sobre todo con bing».
+- **Qué se hizo:** solo medir, 4 peticiones. **No se ha integrado:** cambiar de buscador modifica ADR-006 y lo decide Julio. Una sola muestra por buscador: no dice cuánto aguanta DuckDuckGo con uso repetido.
+- **Lección:** que un buscador no bloquee no quiere decir que sirva; hubo que mirar a qué webs llevaban los enlaces.
+- **Para la memoria:** §5 (limitaciones y continuidad) · §2 (pruebas) · S06
+
+### 2026-11-25 21:47 · 📏 Medida · Puertas y búsqueda de credenciales para la entrega final
+- **Qué pasó:** `pytest -q` completo: **5034 passed in 146.92s**; `ruff check .` sin avisos; `ruff format --check .` 269 ficheros; `mypy` sin errores en 263. Búsqueda de credenciales: 0 coincidencias de patrones de claves en el historial de todas las ramas, `.env` nunca en el historial, 0 valores del `.env` local en ficheros no ignorados; las 3 coincidencias del árbol son claves falsas de tests.
+- **Causa / contexto:** el enunciado de la entrega final pide un repositorio sin credenciales y evidencias de las pruebas.
+- **Qué se hizo:** salidas guardadas en `../memoria-entrega-final/evidencias/`. La búsqueda hay que repetirla sobre los commits nuevos antes del push.
+- **Para la memoria:** §2 (pruebas) · §7 (repositorio) · S06
+
+### 2026-11-25 21:47 · ✅ Avance · Borrador de la memoria final y de la presentación
+- **Qué pasó:** `../memoria-entrega-final/memoria.md` y su PDF (18 páginas) con los seis puntos del enunciado, evidencias y capturas nuevas; presentación de 9 diapositivas con notas del orador.
+- **Causa / contexto:** Julio pegó el enunciado de la entrega final.
+- **Qué se hizo:** lo redactó la IA en primera persona de Julio a partir de la bitácora, `USO-IA.md` y el vault. **Pendiente de revisión:** la valoración crítica del uso de la IA y el papel de Julio en cada tarea son un borrador. La memoria reconoce que la revisión manual del código no está completa y que el banco solo ha medido el modo sin IA. Bloqueante que queda: el código de S06 sigue sin commit ni push, así que el apartado del repositorio todavía no es cierto.
+- **Lección:** al verificar el borrador hubo que quitar una cifra que la IA había escrito sin respaldo («26 decisiones registradas») y cambiar dos casos de prueba que no correspondían a tests reales.
+- **Para la memoria:** §3 (uso de IA en el desarrollo) · S06
+
+### 2026-11-26 11:06 · ❌ Fallo · DuckDuckGo también bloquea: no hay buscador que sirva para descubrir tiendas
+- **Qué pasó:** al ir a integrar DuckDuckGo (aprobado por Julio el 26-11), su versión HTML pidió un CAPTCHA («Select all squares containing a duck») por GET y por POST, en `html.` y en `lite.`, y también por el proxy residencial; la versión con JavaScript, con Chromium, dio «Unexpected error». Una petición a cada alternativa con la referencia `1K0698151`: Bing devuelve resultados envenenados (letras de canciones), Brave HTTP 429, Mojeek y Startpage páginas de bloqueo.
+- **Causa / contexto:** el día anterior DuckDuckGo había devuelto 10 tiendas válidas de 10 en una sola muestra. Los buscadores detectan el acceso automatizado por el cliente y no solo por la IP (el proxy no cambió nada).
+- **Qué se hizo:** no se integra ni se escribe el ADR; unas 12 peticiones en total. La alternativa limpia sería una API oficial de búsqueda con clave (por ejemplo, la de Brave), que necesitaría una cuenta y un ADR de Julio.
+- **Lección:** una muestra de un día no basta para apoyar una funcionalidad en un servicio que se defiende de los bots; hay que repetir la medida antes de comprometerse.
+- **Para la memoria:** §5 (limitaciones y continuidad) · §3 (errores de la IA) · S06
+
+### 2026-11-26 11:06 · 🔧 Solución · La CI usa una versión de ruff más nueva que la local
+- **Qué pasó:** la PR #2 falló en la CI por SIM102 en `fuentes/sitemap.py`, un fichero sin cambios: la CI instala `ruff` 0.17.6 (`ruff>=0.6` en `pyproject.toml`) y el entorno local tenía 0.17.1.
+- **Qué se hizo:** unir los dos `if` e igualar `ruff` y `mypy` locales a los de la CI; puertas y 5034 tests en verde.
+- **Lección:** con versiones sin fijar, «en local pasa» no garantiza la CI; conviene repetir las puertas con las versiones de la CI antes del push.
+- **Para la memoria:** §2 (pruebas y validación) · S06
+
+### 2026-11-26 11:11 · 📏 Medida · El banco con IA: más campos leídos, algo menos de exactitud
+- **Qué pasó:** 25 fichas guardadas, modos clásico y API (Claude Haiku 5.5). Clásico: cobertura 67 %, exactitud 98 %. API: cobertura 94 %, exactitud 87 %, 0 inventados en los dos, 0,0001 $ y 1,45 s por ficha (23 llamadas, 0,0035 $ en total).
+- **Causa / contexto:** era el dato que le faltaba a la memoria: cuánto aporta la IA. Julio autorizó gastar hasta 0,50 $.
+- **Qué se hizo:** mirar los 8 incorrectos de la IA: 5 son el mismo dato escrito de otra forma (la comparación del banco es estricta) y 3 son errores reales; uno, «95» en lugar de «1,95», pasa el anclaje porque «95» está en la página.
+- **Lección:** la IA conviene como respaldo de los campos que faltan, no como sustituta de lo que se lee sin ella; y el anclaje literal no basta para los números cortos.
+- **Para la memoria:** §2.4 (banco) · §4.4 (riesgos residuales) · S06

@@ -1,0 +1,17 @@
+# Nada de esto entra en la imagen: secretos, datos locales, entorno y tests.
+.env
+.env.*
+!.env.example
+.git
+.github
+.venv
+datos
+cache
+tests
+**/__pycache__
+.mypy_cache
+.pytest_cache
+.ruff_cache
+*.egg-info
+BITACORA.md
+USO-IA.md

@@ -4,8 +4,22 @@
   {% for a in alertas %}
   <li>
     <span class="insignia {{ 'insignia-ok' if a.activa else 'insignia-tenue' }}">{{ "Activa" if a.activa else "Pausada" }}</span>
+    {% if a.avisada %}<span class="insignia insignia-aviso" title="Ya se envió el aviso: no se repite hasta que el precio vuelva a subir">Avisada</span>{% endif %}
     <span><a href="/productos/{{ a.producto_id }}">{{ a.producto_nombre }}</a> por debajo de <strong>{{ a.umbral | euros }}</strong></span>
-    <span class="tenue">{{ "Telegram" if a.canal == "telegram" else "Email" }}{% if not a.solo_exactas %}, incluye equivalentes y revisiones{% endif %}{% if a.ultima_activacion %}, saltó el {{ a.ultima_activacion | fecha_corta }}{% endif %}</span>
+    <span class="tenue">{{ "Telegram" if a.canal == "telegram" else "Email" }}{% if not a.solo_exactas %}, incluye equivalentes y revisiones{% endif %}{% if a.ultima_activacion %}, saltó el {{ a.ultima_activacion | fecha_corta }}{% endif %}{% if a.ultima_comprobacion %}, comprobada el {{ a.ultima_comprobacion | fecha_hora }}{% endif %}</span>
+    {% if con_acciones %}
+    <span class="acciones-alerta">
+      <form method="post" action="/alertas/{{ a.id }}/{{ 'pausar' if a.activa else 'reanudar' }}">
+        <input type="hidden" name="ok" value="1">
+        <button class="boton boton-secundario boton-pequeno" type="submit">{{ "Pausar" if a.activa else "Reanudar" }}</button>
+      </form>
+      <form method="post" action="/alertas/{{ a.id }}/borrar">
+        <input type="hidden" name="ok" value="1">
+        <button class="boton boton-secundario boton-pequeno" type="submit">Borrar</button>
+      </form>
+    </span>
+    {% endif %}
+    {% if a.ultimo_error %}<span class="detalle-alerta texto-error">{{ a.ultimo_error }}</span>{% endif %}
   </li>
   {% endfor %}
 </ul>

@@ -33,12 +33,20 @@ from precia import __version__
 from precia.emparejado.referencias import referencias_en
 from precia.nucleo import formato
 from precia.nucleo.config import Config
-from precia.nucleo.fuente_datos import ErrorFuente, FuenteDatos
+from precia.nucleo.fuente_datos import AlertaNoExiste, ErrorFuente, FuenteDatos
 from precia.nucleo.fuente_demo import FuenteDemo
 from precia.nucleo.fuente_real import FuenteReal
-from precia.nucleo.modelos import CAMPOS, TRANSPORTES_HTTP, Ajustes, EstadoTienda, Modo
+from precia.nucleo.modelos import (
+    CAMPOS,
+    TRANSPORTES_HTTP,
+    Ajustes,
+    EstadoTienda,
+    InformeAlertas,
+    Modo,
+)
 from precia.nucleo.tareas import DemasiadasBusquedas, GestorBusquedas, TareaBusqueda
 from precia.seguimiento.graficas import grafica_historico
+from precia.seguimiento.planificador import Planificador
 from precia.web.formularios import (
     ErrorFormulario,
     Parametros,
@@ -69,6 +77,9 @@ ESPERA_INICIAL_S = 0.5
 """Lo que espera `GET /buscar` a que termine la búsqueda antes de enseñar el progreso (C1): la
 demo, la caché o una búsqueda repetida salen ya terminadas, sin pasar por el sondeo."""
 _ID_BUSQUEDA = re.compile(r"[0-9a-f]{16}")
+_ID_ALERTA = re.compile(r"[1-9][0-9]{0,17}")
+"""Un entero positivo que cabe en el INTEGER de SQLite; lo demás es un 404."""
+ACCIONES_ALERTA = ("pausar", "reanudar", "borrar")
 ETIQUETAS_ESTADO = {
     EstadoTienda.EN_COLA: "En cola",
     EstadoTienda.DESCARGANDO: "Descargando",
@@ -166,28 +177,40 @@ def crear_app(
     espera_inicial_s: float = ESPERA_INICIAL_S,
     gestor: GestorBusquedas | None = None,
     reloj: Callable[[], datetime] = _ahora,
+    cada_alertas_s: float = 0.0,
 ) -> FastAPI:
     """`gestor` lleva las búsquedas en segundo plano (C1); por defecto, uno sobre `fuente`.
+
+    `cada_alertas_s` es cada cuánto comprueba las alertas el planificador (H7); con 0 solo se
+    comprueban con el botón «Comprobar ahora».
 
     `reloj` da el `ahora` de las plantillas: con él se ve si la espera de una configuración
     fallida (A1) sigue en pie o ya ha vencido.
     """
     datos: FuenteDatos = fuente if fuente is not None else FuenteDemo()
     busquedas = gestor if gestor is not None else GestorBusquedas(datos)
+    planificador: Planificador[InformeAlertas] = Planificador(
+        datos.comprobar_alertas, cada_alertas_s
+    )
     plantillas = Jinja2Templates(env=_entorno())
 
     @asynccontextmanager
     async def ciclo_de_vida(_: FastAPI) -> AsyncIterator[None]:
         # Al apagar se cancelan las búsquedas en marcha y luego se cierran el navegador
         # (Chromium) y la base de datos de la fuente real: en ese orden, para que ninguna
-        # búsqueda siga usando un navegador cerrado.
+        # búsqueda siga usando un navegador cerrado. Antes que nada se para el planificador de
+        # las alertas (H7), que también busca.
+        planificador.arrancar()
         try:
             yield
         finally:
             try:
-                await busquedas.cerrar()
+                await planificador.cerrar()
             finally:
-                await datos.cerrar()
+                try:
+                    await busquedas.cerrar()
+                finally:
+                    await datos.cerrar()
 
     app = FastAPI(
         title="PrecIA",
@@ -199,6 +222,7 @@ def crear_app(
     )
     app.state.fuente = datos
     app.state.gestor = busquedas
+    app.state.planificador = planificador
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(hosts))
     app.add_middleware(MiddlewareSeguridad)
     app.mount("/estaticos", StaticFiles(directory=RAIZ / "estaticos"), name="estaticos")
@@ -445,7 +469,40 @@ def crear_app(
 
     @app.get("/alertas", response_class=HTMLResponse)
     async def alertas(request: Request) -> HTMLResponse:
-        return pagina(request, "alertas.html", {"alertas": datos.alertas()})
+        return pagina(
+            request,
+            "alertas.html",
+            {
+                "alertas": datos.alertas(),
+                "con_acciones": True,
+                "canales": datos.canales_aviso(),
+                "comprobando": planificador.en_curso,
+                "informe": planificador.ultimo,
+                "cada_h": planificador.cada_s / 3600,
+            },
+        )
+
+    @app.post("/alertas/comprobar", response_class=HTMLResponse)
+    async def comprobar_alertas(request: Request) -> Response:
+        """Lanza la comprobación en segundo plano (puede tardar minutos) y vuelve a la lista.
+        Si ya hay una en marcha no lanza otra."""
+        leer_formulario(await request.body())
+        planificador.lanzar()
+        return RedirectResponse("/alertas", status_code=303)
+
+    @app.post("/alertas/{id_alerta}/{accion}", response_class=HTMLResponse)
+    async def cambiar_alerta(request: Request, id_alerta: str, accion: str) -> Response:
+        if accion not in ACCIONES_ALERTA or not _ID_ALERTA.fullmatch(id_alerta):
+            raise HTTPException(404)
+        leer_formulario(await request.body())
+        try:
+            if accion == "borrar":
+                datos.borrar_alerta(int(id_alerta))
+            else:
+                datos.cambiar_alerta(int(id_alerta), activa=accion == "reanudar")
+        except AlertaNoExiste:
+            raise HTTPException(404) from None
+        return RedirectResponse("/alertas", status_code=303)
 
     @app.post("/alertas", response_class=HTMLResponse)
     async def crear_alerta(request: Request) -> Response:
@@ -526,7 +583,9 @@ def crear_app(
 def aplicacion_desde_config(config: Config) -> FastAPI:
     """La aplicación con la fuente que pide la configuración: la demo o los datos reales."""
     fuente: FuenteDatos = FuenteDemo() if config.demo else FuenteReal(config)
-    return crear_app(fuente)
+    # La demo no visita tiendas: su planificador no repite nada.
+    cada_s = 0.0 if config.demo else config.alertas_cada_h * 3600
+    return crear_app(fuente, cada_alertas_s=cada_s)
 
 
 def _ajustes_desde_formulario(formulario: Parametros, actuales: Ajustes) -> Ajustes:

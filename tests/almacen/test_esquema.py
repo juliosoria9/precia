@@ -306,7 +306,7 @@ def test_migra_los_hijos_pendientes_del_catalogo_desde_la_version_anterior(tmp_p
     with Almacen(ruta, migraciones=MIGRACIONES[:8]) as almacen:
         almacen.alta_tienda("tienda.example", "Tienda")
     with Almacen(ruta) as almacen:
-        assert almacen.pragma("user_version") == len(MIGRACIONES) == 12
+        assert almacen.pragma("user_version") == len(MIGRACIONES) == 13
         hijo = "https://tienda.example/sitemap-faros.xml"
         almacen.guardar_catalogo(
             "tienda.example", "https://tienda.example/s.xml", [], parcial=True, pendientes=[hijo]
@@ -339,6 +339,6 @@ def test_migra_el_prefijo_de_idioma_del_catalogo_desde_la_version_anterior(tmp_p
     finally:
         con.close()
     with Almacen(ruta) as almacen:
-        assert almacen.pragma("user_version") == len(MIGRACIONES) == 12
+        assert almacen.pragma("user_version") == len(MIGRACIONES) == 13
         info = almacen.catalogo("tienda.example")
         assert info is not None and info.idioma == ()

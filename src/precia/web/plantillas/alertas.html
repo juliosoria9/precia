@@ -1,12 +1,41 @@
 {% extends "base.html" %}
 {% block titulo %}Alertas{% endblock %}
 {% block contenido %}
-<section class="cabecera">
-  <h1>Alertas</h1>
-  <p class="sub">PrecIA vuelve a mirar los precios cada cierto tiempo y te avisa por email o Telegram cuando un producto baja del precio que fijes. Las alertas se crean desde la ficha de cada producto.</p>
+<section class="cabecera cabecera-fila">
+  <div>
+    <h1>Alertas</h1>
+    <p class="sub">PrecIA vuelve a mirar los precios cada cierto tiempo y te avisa por email o Telegram cuando un producto baja del precio que fijes. Las alertas se crean desde la ficha de cada producto.</p>
+  </div>
+  <form method="post" action="/alertas/comprobar">
+    <input type="hidden" name="ok" value="1">
+    <button class="boton boton-primario" type="submit"{% if comprobando %} disabled{% endif %}>{{ "Comprobando…" if comprobando else "Comprobar ahora" }}</button>
+  </form>
 </section>
 <section class="tarjeta">
+  {% if comprobando %}
+  <p class="mensaje mensaje-aviso" role="status">Comprobando los precios de los productos con alertas. Puede tardar unos minutos: recarga la página para ver el resultado.</p>
+  {% elif informe %}
+  <p class="mensaje {{ 'mensaje-error' if informe.errores else 'mensaje-ok' }}" role="status">Última comprobación, el {{ informe.fecha | fecha_hora }}: {{ informe.comprobadas }} {{ "alerta mirada" if informe.comprobadas == 1 else "alertas miradas" }} y {{ informe.avisos }} {{ "aviso enviado" if informe.avisos == 1 else "avisos enviados" }}.</p>
+  {% if informe.errores %}
+  <ul class="errores-alertas">
+    {% for e in informe.errores %}<li>{{ e }}</li>{% endfor %}
+  </ul>
+  {% endif %}
+  {% endif %}
   {% include "_lista_alertas.html" %}
+</section>
+<section class="tarjeta">
+  <h2>Canales de aviso</h2>
+  <dl class="datos">
+    {% for canal, etiqueta in (("email", "Email"), ("telegram", "Telegram")) %}
+    {% set falta = canales.get(canal, "Sin configurar.") %}
+    <div>
+      <dt>{{ etiqueta }}</dt>
+      <dd>{% if falta %}<span class="insignia insignia-aviso">Sin configurar</span> {{ falta }}{% else %}<span class="insignia insignia-ok">Configurado</span>{% endif %}</dd>
+    </div>
+    {% endfor %}
+  </dl>
+  <p class="tenue">Los datos de los canales (servidor de correo, token de Telegram) se ponen en el fichero <code>.env</code>, nunca en la web. El README explica cada variable.</p>
 </section>
 <section class="tarjeta nota">
   <h2>Cómo funciona</h2>
@@ -15,6 +44,6 @@
     <li>Cada precio se guarda en el histórico (SQLite).</li>
     <li>Si el mejor precio queda por debajo del objetivo, se envía el aviso una sola vez hasta que vuelva a subir.</li>
   </ol>
-  <p class="tenue">El planificador y los avisos llegan en el hito H7.{% if es_demo %} Ahora mismo son datos de ejemplo.{% else %} De momento las alertas se guardan, pero todavía no se envía ningún aviso.{% endif %}</p>
+  <p class="tenue">{% if cada_h > 0 %}Las alertas se comprueban solas cada {{ "hora" if cada_h == 1 else ("%d horas" % cada_h if cada_h == cada_h | int else (cada_h | decimal) ~ " horas") }}, mientras PrecIA esté abierto.{% else %}La comprobación automática está desactivada: solo se comprueban con «Comprobar ahora».{% endif %}{% if es_demo %} Ahora mismo son datos de ejemplo: no se envía ningún aviso.{% endif %}</p>
 </section>
 {% endblock %}
