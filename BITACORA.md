@@ -2094,3 +2094,14 @@ Alimenta la memoria §3 («método de validación del código generado»).
 - **Qué se hizo:** todas las cifras salen de comandos o registros (`pytest --collect-only`, `git diff --shortstat`, tabla de errores, nota 11).
 - **Lección:** la vista previa local encontró un texto cortado en la gráfica nueva y una tarjeta que se partía; sin verlas renderizadas no se habría notado.
 - **Para la memoria:** §3 (uso de IA en el desarrollo) · S06
+
+### 2026-11-26 12:10 · ✅ Avance · Todo el trabajo de la entrega final en `main`
+- **Qué pasó:** PR #2 (alertas, descubrimiento, banco, Docker) y PR #3 (arreglos salidos del banco) fusionadas en `main` con la CI en verde. Sin credenciales en los commits.
+- **Causa / contexto:** Julio pidió dejar GitHub actualizado.
+- **Para la memoria:** §7 (repositorio) · S06
+
+### 2026-11-26 12:10 · ❌ Fallo · Test de rendimiento inestable en la CI
+- **Qué pasó:** `test_miles_de_objetos_que_no_son_fichas_no_tardan[objeto0]` falló en una de las dos ejecuciones de la PR #3 con una proporción de 2,509 (tope 2,5); la otra pasó con el mismo código y al relanzarlo también.
+- **Causa / contexto:** compara dos tiempos de CPU. Medido en local, cinco veces: de 1,6 a 2,4 con el código nuevo y de 1,7 a 2,0 con el anterior a cambiar `dom.py`; el ruido es mayor que la diferencia.
+- **Qué se hizo:** relanzar el trabajo y anotarlo. No se ha subido el tope ni se ha cambiado el test: queda para decidir si se mide con más repeticiones.
+- **Para la memoria:** §2 (pruebas y validación) · S06
