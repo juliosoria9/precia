@@ -29,7 +29,7 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-precia = ["py.typed", "web/plantillas/*.html", "web/estaticos/*"]
+precia = ["py.typed", "web/plantillas/*.html", "web/estaticos/*", "evaluacion/casos/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
